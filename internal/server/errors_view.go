@@ -53,7 +53,7 @@ func errorsBody(failed []journal.FailedRun, recurring []journal.WorkflowFailureC
 		b.WriteString(`<p class="muted">No failed executions. Every failed run is collected here automatically with its error, so this is your debugging starting point.</p>`)
 		return b.String()
 	}
-	fmt.Fprintf(&b, `<p class="muted">%d most recent failed executions. Every failure is logged automatically with the failing step + error. Click a run to see the full timeline; permanent failures get an AI post-mortem on the <a href="/postmortems">Post-mortems</a> page.</p>`, len(failed))
+	fmt.Fprintf(&b, `<p class="muted">%d most recent failed executions. Every failure is logged automatically with the failing step + error. Click a run to see the full timeline; when explicitly enabled, permanent failures can produce an AI post-mortem on the <a href="/postmortems">Post-mortems</a> page.</p>`, len(failed))
 
 	// Recurring-failure summary: the workflows worth fixing first.
 	if len(recurring) > 1 || (len(recurring) == 1 && recurring[0].Count > 1) {

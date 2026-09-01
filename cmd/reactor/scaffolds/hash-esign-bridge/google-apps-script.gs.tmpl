@@ -1,0 +1,918 @@
+/**
+ * Optional Google Apps Script producer for {{.Slug}}.
+ *
+ * Set REACTOR_WEBHOOK_URL and REACTOR_WEBHOOK_SECRET in Script Properties.
+ * This adapter deliberately separates preparation from delivery. Persist the
+ * returned event_id + raw_body in a durable outbox BEFORE the first network
+ * call, then pass those exact persisted bytes to every retry. A Sheet is only
+ * suitable while the body fits its cell limit; use a larger durable store
+ * otherwise. Persist run_id and terminal reconciliation state alongside them.
+ */
+function prepareHashESignDelivery(customer, stableEventId, occurredAt) {
+  requireBoundedPlainString_(stableEventId, 'event_id', 200);
+
+  if (!isPlainObject_(customer)) {
+    throw new Error('customer must be a plain object');
+  }
+  const externalId = customer.externalId;
+  const customerName = customer.name;
+  const customerEmail = customer.email;
+  const tenantExternalId = customer.tenantExternalId;
+  requireBoundedPlainString_(externalId, 'customer.externalId', 200);
+  requireBoundedName_(customerName, 'customer.name');
+  requireEmail_(customerEmail, 'customer.email');
+  requireBoundedPlainString_(tenantExternalId, 'customer.tenantExternalId', 200);
+  const occurredAtInstant = requireRFC3339_(occurredAt, 'occurredAt');
+  const companyName = optionalBoundedPlainString_(customer.companyName, 'customer.companyName', 300);
+  const phone = optionalBoundedPlainString_(customer.phone, 'customer.phone', 64);
+  const locale = optionalBoundedPlainString_(customer.locale, 'customer.locale', 35);
+
+  let inputVariables = {};
+  const requestedVariables = customer.variables;
+  if (requestedVariables !== undefined) {
+    if (!isPlainObject_(requestedVariables)) {
+      throw new Error('customer.variables must be a plain object');
+    }
+    inputVariables = requestedVariables;
+  }
+  const variableKeys = Object.keys(inputVariables);
+  if (variableKeys.length > 200) {
+    throw new Error('customer.variables must contain at most 200 entries');
+  }
+  const variables = Object.create(null);
+  variableKeys.forEach(function(key) {
+    requireBoundedPlainString_(key, 'variable key', 200);
+    if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(key)) {
+      throw new Error('Every document variable key must use Hash template variable syntax');
+    }
+    const value = inputVariables[key];
+    requireBoundedString_(value, 'document variable value', 16 * 1024);
+    variables[key] = value;
+  });
+
+  let expiresAt = '';
+  const requestedExpiry = customer.expiresAt;
+  if (requestedExpiry !== undefined && requestedExpiry !== '') {
+    const expiresAtInstant = requireRFC3339_(requestedExpiry, 'customer.expiresAt');
+    if (!isAtLeastSecondsAfter_(expiresAtInstant, occurredAtInstant, 10 * 60)) {
+      throw new Error('customer.expiresAt must be at least 10 minutes after occurredAt');
+    }
+    expiresAt = requestedExpiry;
+  }
+
+  const event = {
+    spec_version: '1.0',
+    event_id: stableEventId,
+    event_type: 'esignature.document.requested.v1',
+    occurred_at: occurredAt,
+    source: {
+      provider: 'google-apps-script',
+      tenant_external_id: tenantExternalId,
+    },
+    customer: {
+      external_id: externalId,
+      name: customerName,
+      email: customerEmail,
+      company_name: companyName,
+      phone: phone,
+      locale: locale,
+    },
+    document: {
+      template_key: 'sales-partner-agreement-v1',
+      name: 'Partner agreement',
+      variables: variables,
+      recipients: [{
+        external_id: externalId,
+        role: 'signer',
+        name: customerName,
+        email: customerEmail,
+        locale: locale,
+        signing_order: 0,
+      }],
+    },
+  };
+  if (expiresAt) {
+    event.document.expires_at = expiresAt;
+  }
+
+  const rawBody = JSON.stringify(event);
+  if (utf8ByteLength_(rawBody) > 1024 * 1024) {
+    throw new Error('Prepared automation event exceeds 1 MiB');
+  }
+  return {event_id: stableEventId, raw_body: rawBody};
+}
+
+// delivery must be a record previously returned by
+// prepareHashESignDelivery and persisted by the caller. This function never
+// rebuilds the body from mutable customer data.
+function sendHashESignRequest(delivery) {
+  if (!delivery || typeof delivery.event_id !== 'string' ||
+      typeof delivery.raw_body !== 'string') {
+    throw new Error('A persisted {event_id, raw_body} delivery is required');
+  }
+  const stableEventId = delivery.event_id;
+  requireBoundedPlainString_(stableEventId, 'delivery.event_id', 200);
+  if (!delivery.raw_body || utf8ByteLength_(delivery.raw_body) > 1024 * 1024) {
+    throw new Error('Persisted raw_body must contain 1 byte to 1 MiB');
+  }
+  let persistedEvent;
+  try {
+    persistedEvent = parseStrictJSON_(delivery.raw_body);
+  } catch (err) {
+    throw new Error('Persisted raw_body is not valid JSON');
+  }
+  if (!persistedEvent || persistedEvent.event_id !== stableEventId) {
+    throw new Error('Persisted raw_body event_id does not match the delivery');
+  }
+
+  const config = reactorWebhookConfig_();
+  const webhookUrl = config.webhook_url;
+  const webhookSecret = config.webhook_secret;
+
+  const body = delivery.raw_body;
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signedPayload = timestamp + '.' + stableEventId + '.' + body;
+  const signatureHex = hmacSha256Hex(signedPayload, webhookSecret);
+
+  let response;
+  try {
+    response = UrlFetchApp.fetch(webhookUrl, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: body,
+      headers: {
+        'X-Webhook-Timestamp': timestamp,
+        'X-Webhook-Signature': 'sha256=' + signatureHex,
+        'X-Webhook-Delivery': stableEventId,
+      },
+      followRedirects: false,
+      validateHttpsCertificates: true,
+      muteHttpExceptions: true,
+    });
+  } catch (err) {
+    return {
+      accepted: false,
+      retryable: true,
+      retry_after_seconds: 1,
+      error: 'transport_failure',
+    };
+  }
+  const status = response.getResponseCode();
+  if (status !== 200 && status !== 202) {
+    if (status === 408 || status === 425 || status === 429 || status >= 500) {
+      return {
+        accepted: false,
+        retryable: true,
+        retry_after_seconds: retryAfterSeconds_(response),
+        http_status: status,
+      };
+    }
+    throw new Error('Reactor permanently rejected the request with HTTP ' + status);
+  }
+  if (!hasExactJSONContentType_(response)) {
+    return {accepted: false, retryable: true, retry_after_seconds: 1, error: 'invalid_receipt'};
+  }
+  const receiptText = response.getContentText();
+  if (utf8ByteLength_(receiptText) > 64 * 1024) {
+    return {accepted: false, retryable: true, retry_after_seconds: 1, error: 'oversized_receipt'};
+  }
+  let receipt;
+  try {
+    receipt = parseStrictJSON_(receiptText);
+  } catch (err) {
+    return {accepted: false, retryable: true, retry_after_seconds: 1, error: 'invalid_receipt'};
+  }
+  if (!hasOnlyKeys_(receipt, ['accepted', 'deduped', 'run_id']) ||
+      receipt.accepted !== true || typeof receipt.deduped !== 'boolean' ||
+      (status === 202 && receipt.deduped) ||
+      (status === 200 && !receipt.deduped)) {
+    return {accepted: false, retryable: true, retry_after_seconds: 1, error: 'incomplete_receipt'};
+  }
+  try {
+    requireBoundedPlainString_(receipt.run_id, 'receipt.run_id', 200);
+  } catch (err) {
+    return {accepted: false, retryable: true, retry_after_seconds: 1, error: 'incomplete_receipt'};
+  }
+
+  // 202 means the workflow run is durable and queued, not that Hash created a
+  // document. A 200 is a deduplicated delivery receipt with the same meaning.
+  // Persist run_id before acknowledging the outbox row, then use
+  // reconcileHashESignRequest for the signed, delivery-scoped GET.
+  return {
+    accepted: true,
+    deduped: receipt.deduped === true,
+    run_id: receipt.run_id,
+    http_status: status,
+  };
+}
+
+// delivery must be the same persisted outbox row used for delivery and must
+// now contain the accepted run_id. This GET never sends raw_body or customer
+// data. It authenticates the event ID with automation-v1 over an empty body:
+// <timestamp>.<event_id>.
+function reconcileHashESignRequest(delivery) {
+  if (!delivery || typeof delivery.event_id !== 'string' ||
+    typeof delivery.run_id !== 'string') {
+    throw new Error('A persisted {event_id, run_id} delivery receipt is required');
+  }
+  const stableEventId = delivery.event_id;
+  requireBoundedPlainString_(stableEventId, 'delivery.event_id', 200);
+  requireBoundedPlainString_(delivery.run_id, 'delivery.run_id', 200);
+
+  const config = reactorWebhookConfig_();
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signedPayload = timestamp + '.' + stableEventId + '.';
+  const signatureHex = hmacSha256Hex(signedPayload, config.webhook_secret);
+  const statusUrl = config.webhook_url + '/status?delivery_id=' +
+    encodeURIComponent(stableEventId);
+  if (utf8ByteLength_(statusUrl) > 4096) {
+    throw new Error('Reactor reconciliation URL exceeds 4096 bytes');
+  }
+
+  let response;
+  try {
+    response = UrlFetchApp.fetch(statusUrl, {
+      method: 'get',
+      headers: {
+        'X-Webhook-Timestamp': timestamp,
+        'X-Webhook-Signature': 'sha256=' + signatureHex,
+        'X-Webhook-Delivery': stableEventId,
+      },
+      followRedirects: false,
+      validateHttpsCertificates: true,
+      muteHttpExceptions: true,
+    });
+  } catch (err) {
+    return {
+      reconciled: false,
+      terminal: false,
+      retryable: true,
+      retry_after_seconds: 5,
+      error: 'transport_failure',
+    };
+  }
+
+  const httpStatus = response.getResponseCode();
+  if (httpStatus !== 200 && httpStatus !== 202) {
+    if (httpStatus === 408 || httpStatus === 425 || httpStatus === 429 ||
+        httpStatus >= 500) {
+      return {
+        reconciled: false,
+        terminal: false,
+        retryable: true,
+        retry_after_seconds: retryAfterSeconds_(response, 5),
+        http_status: httpStatus,
+      };
+    }
+    throw new Error('Reactor permanently rejected reconciliation with HTTP ' + httpStatus);
+  }
+  if (!hasExactJSONContentType_(response)) {
+    return invalidStatusResponse_(httpStatus);
+  }
+
+  const responseText = response.getContentText();
+  if (!responseText || utf8ByteLength_(responseText) > 64 * 1024) {
+    return invalidStatusResponse_(httpStatus);
+  }
+  let statusReceipt;
+  try {
+    statusReceipt = parseStrictJSON_(responseText);
+    validateStatusReceipt_(statusReceipt, delivery.run_id, httpStatus);
+  } catch (err) {
+    return invalidStatusResponse_(httpStatus);
+  }
+
+  if (!statusReceipt.terminal) {
+    return {
+      reconciled: false,
+      terminal: false,
+      retryable: true,
+      retry_after_seconds: retryAfterSeconds_(response, 5),
+      run_id: statusReceipt.run_id,
+      status: statusReceipt.status,
+      http_status: httpStatus,
+    };
+  }
+
+  const result = {
+    reconciled: true,
+    terminal: true,
+    retryable: false,
+    succeeded: statusReceipt.status === 'succeeded',
+    run_id: statusReceipt.run_id,
+    status: statusReceipt.status,
+    http_status: httpStatus,
+  };
+  if (statusReceipt.hash_result) {
+    result.hash_result = {
+      automation_request_id: statusReceipt.hash_result.automation_request_id,
+      document_id: statusReceipt.hash_result.document_id,
+      status: statusReceipt.hash_result.status,
+      replayed: statusReceipt.hash_result.replayed,
+    };
+  }
+  return result;
+}
+
+function validateStatusReceipt_(receipt, expectedRunId, httpStatus) {
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
+    !hasOnlyKeys_(receipt, ['run_id', 'status', 'terminal', 'hash_result']) ||
+    typeof receipt.terminal !== 'boolean') {
+    throw new Error('Invalid status receipt');
+  }
+  requireBoundedPlainString_(receipt.run_id, 'status.run_id', 200);
+  if (receipt.run_id !== expectedRunId) {
+    throw new Error('Status run_id does not match the persisted receipt');
+  }
+  const active = ['queued', 'running', 'suspended'].indexOf(receipt.status) !== -1;
+  const terminal = ['succeeded', 'failed', 'failed_dlq', 'cancelled'].indexOf(receipt.status) !== -1;
+  if ((httpStatus === 202 && (!active || receipt.terminal)) ||
+    (httpStatus === 200 && (!terminal || !receipt.terminal))) {
+    throw new Error('Status and HTTP response disagree');
+  }
+  if (httpStatus === 202 && receipt.hash_result !== undefined &&
+      receipt.hash_result !== null) {
+    throw new Error('Active status must not contain a Hash result');
+  }
+  if (receipt.hash_result !== undefined && receipt.hash_result !== null) {
+    validateHashResult_(receipt.hash_result);
+  }
+  if (receipt.status === 'succeeded' && !receipt.hash_result) {
+    throw new Error('Successful Hash workflow omitted its safe result');
+  }
+  if (receipt.status !== 'succeeded' && receipt.hash_result) {
+    throw new Error('Unsuccessful workflow must not publish a Hash result');
+  }
+}
+
+function validateHashResult_(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result) ||
+    !hasOnlyKeys_(result, ['automation_request_id', 'document_id', 'status', 'replayed']) ||
+    typeof result.replayed !== 'boolean') {
+    throw new Error('Invalid Hash result');
+  }
+  requireBoundedPlainString_(result.automation_request_id, 'hash_result.automation_request_id', 200);
+  requireBoundedPlainString_(result.document_id, 'hash_result.document_id', 200);
+  const statuses = [
+    'sent', 'in_progress', 'changes_requested', 'finalizing',
+    'completed', 'declined', 'voided', 'expired',
+  ];
+  if (statuses.indexOf(result.status) === -1) {
+    throw new Error('Invalid Hash result status');
+  }
+}
+
+function hasOnlyKeys_(value, allowed) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== allowed.length &&
+      !(allowed.indexOf('hash_result') !== -1 && keys.length === allowed.length - 1)) {
+    return false;
+  }
+  return keys.every(function(key) { return allowed.indexOf(key) !== -1; });
+}
+
+// Apps Script's JSON.parse silently keeps the last duplicate object member.
+// Pre-scan every object at every depth so signed input and Reactor receipts
+// have the same unambiguous member-name contract as the Go endpoints. Escaped
+// names are decoded before comparison, so "event_id" and "\u0065vent_id"
+// conflict as they should.
+function parseStrictJSON_(text) {
+  rejectDuplicateJSONNames_(text);
+  return JSON.parse(text);
+}
+
+function rejectDuplicateJSONNames_(text) {
+  if (typeof text !== 'string') {
+    throw new Error('JSON input must be text');
+  }
+  let index = 0;
+
+  function skipWhitespace() {
+    while (index < text.length && /[\u0009\u000a\u000d\u0020]/.test(text[index])) {
+      index++;
+    }
+  }
+
+  function parseString() {
+    if (text[index] !== '"') {
+      throw new Error('Invalid JSON string');
+    }
+    const start = index++;
+    while (index < text.length) {
+      const unit = text.charCodeAt(index);
+      if (unit <= 0x1f) {
+        throw new Error('Invalid control character in JSON string');
+      }
+      if (text[index] === '\\') {
+        index += 2;
+        if (index > text.length) {
+          throw new Error('Invalid JSON escape');
+        }
+        continue;
+      }
+      if (text[index] === '"') {
+        index++;
+        return JSON.parse(text.slice(start, index));
+      }
+      index++;
+    }
+    throw new Error('Unterminated JSON string');
+  }
+
+  function parseValue(depth) {
+    if (depth > 100) {
+      throw new Error('JSON nesting exceeds 100 levels');
+    }
+    skipWhitespace();
+    const token = text[index];
+    if (token === '{') {
+      index++;
+      skipWhitespace();
+      const names = Object.create(null);
+      if (text[index] === '}') {
+        index++;
+        return;
+      }
+      while (index < text.length) {
+        const name = parseString();
+        if (Object.prototype.hasOwnProperty.call(names, name)) {
+          throw new Error('Duplicate JSON object member');
+        }
+        names[name] = true;
+        skipWhitespace();
+        if (text[index++] !== ':') {
+          throw new Error('Invalid JSON object');
+        }
+        parseValue(depth + 1);
+        skipWhitespace();
+        if (text[index] === '}') {
+          index++;
+          return;
+        }
+        if (text[index++] !== ',') {
+          throw new Error('Invalid JSON object separator');
+        }
+        skipWhitespace();
+      }
+      throw new Error('Unterminated JSON object');
+    }
+    if (token === '[') {
+      index++;
+      skipWhitespace();
+      if (text[index] === ']') {
+        index++;
+        return;
+      }
+      while (index < text.length) {
+        parseValue(depth + 1);
+        skipWhitespace();
+        if (text[index] === ']') {
+          index++;
+          return;
+        }
+        if (text[index++] !== ',') {
+          throw new Error('Invalid JSON array separator');
+        }
+      }
+      throw new Error('Unterminated JSON array');
+    }
+    if (token === '"') {
+      parseString();
+      return;
+    }
+    const start = index;
+    while (index < text.length && !/[\u0009\u000a\u000d\u0020,\]}]/.test(text[index])) {
+      index++;
+    }
+    if (start === index) {
+      throw new Error('Invalid JSON value');
+    }
+  }
+
+  parseValue(0);
+  skipWhitespace();
+  if (index !== text.length) {
+    throw new Error('Trailing JSON value');
+  }
+}
+
+function invalidStatusResponse_(httpStatus) {
+  return {
+    reconciled: false,
+    terminal: false,
+    retryable: true,
+    retry_after_seconds: 5,
+    http_status: httpStatus,
+    error: 'invalid_status_response',
+  };
+}
+
+// Apps Script exposes duplicate response headers through getAllHeaders() as
+// arrays, while some intermediaries fold them into one comma-delimited value.
+// Accept exactly one application/json value with no parameter other than an
+// optional UTF-8 charset. Any array with multiple values, differently-cased
+// duplicate key, fold, extension parameter, or malformed value is ambiguous.
+function hasExactJSONContentType_(response) {
+  if (!response || typeof response.getAllHeaders !== 'function') {
+    return false;
+  }
+  let headers;
+  try {
+    headers = response.getAllHeaders();
+  } catch (err) {
+    return false;
+  }
+  if (!headers || typeof headers !== 'object' || Array.isArray(headers)) {
+    return false;
+  }
+  const values = [];
+  Object.keys(headers).forEach(function(key) {
+    if (key.toLowerCase() !== 'content-type') {
+      return;
+    }
+    const headerValue = headers[key];
+    if (Array.isArray(headerValue)) {
+      headerValue.forEach(function(value) { values.push(value); });
+    } else {
+      values.push(headerValue);
+    }
+  });
+  if (values.length !== 1 || typeof values[0] !== 'string' ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(values[0])) {
+    return false;
+  }
+  const parts = values[0].split(';');
+  if (parts.length < 1 || parts.length > 2 ||
+      parts[0].trim().toLowerCase() !== 'application/json') {
+    return false;
+  }
+  if (parts.length === 1) {
+    return true;
+  }
+  return /^charset\s*=\s*(?:utf-8|"utf-8")$/i.test(parts[1].trim());
+}
+
+function reactorWebhookConfig_() {
+  const properties = PropertiesService.getScriptProperties();
+  const webhookUrl = properties.getProperty('REACTOR_WEBHOOK_URL');
+  const webhookSecret = properties.getProperty('REACTOR_WEBHOOK_SECRET');
+  if (!webhookUrl || !webhookSecret) {
+    throw new Error('Configure Reactor webhook URL and secret in Script Properties');
+  }
+  if (webhookUrl !== webhookUrl.trim() || utf8ByteLength_(webhookUrl) > 2048 ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(webhookUrl) || !hasValidUnicode_(webhookUrl) ||
+    !/^https:\/\/[^/?#]+\//i.test(webhookUrl) || /^https:\/\/[^/]*@/i.test(webhookUrl) ||
+  /[?#]/.test(webhookUrl) || !/\/webhook\/[^/]+$/.test(webhookUrl)) {
+    throw new Error('REACTOR_WEBHOOK_URL must be a canonical HTTPS webhook URL without credentials, query, fragment, or trailing slash');
+  }
+  requireBoundedPlainString_(webhookSecret, 'REACTOR_WEBHOOK_SECRET', 4096);
+  if (utf8ByteLength_(webhookSecret) < 32) {
+    throw new Error('REACTOR_WEBHOOK_SECRET must contain 32 to 4096 UTF-8 bytes');
+  }
+  return {webhook_url: webhookUrl, webhook_secret: webhookSecret};
+}
+
+function isPlainObject_(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function requireBoundedString_(value, field, maxBytes) {
+  if (typeof value !== 'string' || !hasValidUnicode_(value) ||
+      utf8ByteLength_(value) > maxBytes) {
+    throw new Error(field + ' must be valid bounded text');
+  }
+}
+
+function requireBoundedPlainString_(value, field, maxBytes) {
+  if (typeof value !== 'string' || !value || value !== value.trim() ||
+    /[\u0000-\u001f\u007f-\u009f]/.test(value) ||
+    !hasValidUnicode_(value) ||
+    utf8ByteLength_(value) > maxBytes) {
+    throw new Error(field + ' must be non-empty plain text');
+  }
+}
+
+function optionalBoundedPlainString_(value, field, maxBytes) {
+  if (value === undefined || value === '') {
+    return '';
+  }
+  requireBoundedPlainString_(value, field, maxBytes);
+  return value;
+}
+
+function requireBoundedName_(value, field) {
+  requireBoundedPlainString_(value, field, 300);
+  if (unicodeCodePointLength_(value) > 200) {
+    throw new Error(field + ' must contain at most 200 Unicode code points');
+  }
+}
+
+function unicodeCodePointLength_(value) {
+  let count = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      index++;
+    }
+    count++;
+  }
+  return count;
+}
+
+function requireEmail_(value, field) {
+  requireBoundedPlainString_(value, field, 254);
+  const at = value.indexOf('@');
+  if (at <= 0 || at !== value.lastIndexOf('@') || at === value.length - 1) {
+    throw new Error(field + ' must be a simple email address');
+  }
+  const local = value.slice(0, at);
+  const domain = value.slice(at + 1);
+  if (!/^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+$/.test(local) ||
+      local[0] === '.' || local[local.length - 1] === '.' || local.indexOf('..') !== -1) {
+    throw new Error(field + ' must be a simple email address');
+  }
+  const labels = domain.split('.');
+  if (!labels.every(function(label) {
+    return label.length >= 1 && label.length <= 63 &&
+      /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label);
+  })) {
+    throw new Error(field + ' must be a simple email address');
+  }
+}
+
+function requireRFC3339_(value, field) {
+  requireBoundedPlainString_(value, field, 64);
+  const match = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d{1,9}))?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  if (!match) {
+    throw new Error(field + ' must be RFC3339');
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const fraction = match[7] || '';
+  const parseableFraction = fraction ? '.' + (fraction + '000').slice(0, 3) : '';
+  const parseable = match[1] + '-' + match[2] + '-' + match[3] + 'T' +
+    match[4] + ':' + match[5] + ':' + match[6] + parseableFraction + match[8];
+  const parsed = Date.parse(parseable);
+  if (day > days[month - 1] || !isFinite(parsed)) {
+    throw new Error(field + ' must be RFC3339');
+  }
+  return {epoch_second: Math.floor(parsed / 1000), fraction: fraction};
+}
+
+function isAtLeastSecondsAfter_(later, earlier, minimumSeconds) {
+  const wholeSeconds = later.epoch_second - earlier.epoch_second;
+  if (wholeSeconds !== minimumSeconds) {
+    return wholeSeconds > minimumSeconds;
+  }
+  const width = Math.max(later.fraction.length, earlier.fraction.length);
+  const laterFraction = (later.fraction + '0'.repeat(width)).slice(0, width);
+  const earlierFraction = (earlier.fraction + '0'.repeat(width)).slice(0, width);
+  return laterFraction >= earlierFraction;
+}
+
+function hasValidUnicode_(value) {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (++index >= value.length) {
+        return false;
+      }
+      const low = value.charCodeAt(index);
+      if (low < 0xdc00 || low > 0xdfff) {
+        return false;
+      }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function utf8ByteLength_(value) {
+  return Utilities.newBlob(value).getBytes().length;
+}
+
+function retryAfterSeconds_(response, fallbackSeconds) {
+  const headers = response.getHeaders();
+  let value = '';
+  Object.keys(headers).some(function(key) {
+    if (key.toLowerCase() === 'retry-after') {
+      value = String(headers[key]).trim();
+      return true;
+    }
+    return false;
+  });
+  if (!value) {
+    return Math.min(Math.max(fallbackSeconds || 1, 1), 300);
+  }
+  let delay = Number(value);
+  if (!/^\d+$/.test(value)) {
+    const when = Date.parse(value);
+    delay = isNaN(when) ? 1 : Math.ceil((when - Date.now()) / 1000);
+  }
+  if (!isFinite(delay) || delay < 1) {
+    delay = 1;
+  }
+  return Math.min(delay, 300);
+}
+
+function hmacSha256Hex(value, secret) {
+  return Utilities.computeHmacSha256Signature(
+    value,
+    secret,
+    Utilities.Charset.UTF_8
+  ).map(function(byte) {
+    const unsignedByte = (byte + 256) % 256;
+    return ('0' + unsignedByte.toString(16)).slice(-2);
+  }).join('');
+}
+
+// Run manually after editing the adapter to pin the automation-v1 byte
+// contract. It should return true without making a network request.
+function verifyAutomationV1HmacTestVector() {
+  const body = '{"event_id":"evt_123"}';
+  const postPayload = '1700000000.evt_123.' + body;
+  const postWant = 'b3a6d73ffec1e2bd10e702f4357d7d7f7069dea9c783c3e03be63b0b92fab3a9';
+  const statusPayload = '1700000000.evt_123.';
+  const statusWant = 'f6e89ca3873375b9fa59d935a6dbc7f92bedd1743b975ae05e47756845d765ab';
+  if (hmacSha256Hex(postPayload, 'test-secret') !== postWant ||
+  hmacSha256Hex(statusPayload, 'test-secret') !== statusWant) {
+    throw new Error('automation-v1 HMAC test vectors failed');
+  }
+  return true;
+}
+
+// Run manually after changing preparation validation. It proves the optional
+// Google edge refuses events that Reactor or Hash would reject before callers
+// persist the immutable outbox body.
+function verifyPreparationValidationTestVectors() {
+  const emailAtLimit = 'a'.repeat(64) + '@' + 'b'.repeat(61) + '.' +
+    'c'.repeat(61) + '.' + 'd'.repeat(61) + '.com';
+  function customer() {
+    return {
+      externalId: 'customer-1',
+      tenantExternalId: 'tenant-1',
+      name: 'a'.repeat(199) + String.fromCodePoint(0x1f4a1),
+      email: emailAtLimit,
+      locale: 'sv-SE',
+      variables: {'contract.value': '8000'},
+      expiresAt: '2026-09-01T12:10:00Z',
+    };
+  }
+  const prepared = prepareHashESignDelivery(
+    customer(), 'event-1', '2026-09-01T12:00:00Z');
+  const event = parseStrictJSON_(prepared.raw_body);
+  if (emailAtLimit.length !== 254 || event.occurred_at !== '2026-09-01T12:00:00Z' ||
+      event.document.expires_at !== '2026-09-01T12:10:00Z' ||
+      unicodeCodePointLength_(event.customer.name) !== 200) {
+    throw new Error('preparation validation rejected or changed a valid boundary vector');
+  }
+  const variableBoundary = customer();
+  variableBoundary.variables = {};
+  variableBoundary.variables['_' + 'a'.repeat(199)] = 'x'.repeat(16 * 1024);
+  prepareHashESignDelivery(variableBoundary, 'event-1', '2026-09-01T12:00:00Z');
+  const timestampBoundary = customer();
+  timestampBoundary.expiresAt = '2026-09-01T12:10:00.123456789+23:59';
+  prepareHashESignDelivery(
+    timestampBoundary, 'event-1', '2026-09-01T12:00:00.123456789+23:59');
+
+  const invalid = [
+    function() { const value = customer(); value.variables = []; return value; },
+    function() { const value = customer(); value.variables = 'text'; return value; },
+    function() { const value = customer(); value.variables = null; return value; },
+    function() { const value = customer(); value.variables = {amount: null}; return value; },
+    function() { const value = customer(); value.variables = {'contract-value': 'x'}; return value; },
+    function() {
+      const value = customer(); value.variables = {};
+      value.variables['_' + 'a'.repeat(200)] = 'x'; return value;
+    },
+    function() {
+      const value = customer(); value.variables = {amount: 'x'.repeat(16 * 1024 + 1)}; return value;
+    },
+    function() {
+      const value = customer();
+      value.variables = {};
+      for (let index = 0; index < 201; index++) value.variables['v' + index] = 'x';
+      return value;
+    },
+    function() { const value = customer(); value.name = 'a'.repeat(201); return value; },
+    function() { const value = customer(); value.email = emailAtLimit + 'a'; return value; },
+    function() { const value = customer(); value.locale = 'a'.repeat(36); return value; },
+    function() { const value = customer(); value.externalId = 'a'.repeat(201); return value; },
+    function() { const value = customer(); value.tenantExternalId = 'a'.repeat(201); return value; },
+    function() { const value = customer(); value.expiresAt = '2026-09-01T12:09:59Z'; return value; },
+  ];
+  invalid.forEach(function(makeCustomer) {
+    let rejected = false;
+    try {
+      prepareHashESignDelivery(makeCustomer(), 'event-1', '2026-09-01T12:00:00Z');
+    } catch (err) {
+      rejected = true;
+    }
+    if (!rejected) {
+      throw new Error('preparation validation accepted an incompatible customer vector');
+    }
+  });
+  let badOccurredAtRejected = false;
+  try {
+    prepareHashESignDelivery(customer(), 'event-1', '2026-02-30T12:00:00Z');
+  } catch (err) {
+    badOccurredAtRejected = true;
+  }
+  if (!badOccurredAtRejected) {
+    throw new Error('preparation validation accepted an invalid RFC3339 calendar date');
+  }
+  [
+    '2026-09-01T12:00:00.1234567890Z',
+    '2026-09-01T12:00:00,1Z',
+    '2026-09-01T12:00:00+24:00',
+  ].forEach(function(timestamp) {
+    let rejected = false;
+    try {
+      prepareHashESignDelivery(customer(), 'event-1', timestamp);
+    } catch (err) {
+      rejected = true;
+    }
+    if (!rejected) {
+      throw new Error('preparation validation accepted non-canonical RFC3339');
+    }
+  });
+  let subMillisecondLeadRejected = false;
+  try {
+    const value = customer();
+    value.expiresAt = '2026-09-01T12:10:00.0000Z';
+    prepareHashESignDelivery(value, 'event-1', '2026-09-01T12:00:00.0009Z');
+  } catch (err) {
+    subMillisecondLeadRejected = true;
+  }
+  if (!subMillisecondLeadRejected) {
+    throw new Error('preparation validation lost sub-millisecond expiry precision');
+  }
+  return true;
+}
+
+// Run manually after changing parseStrictJSON_. It must reject duplicates at
+// the root, in nested objects, and after JSON string escape decoding.
+function verifyStrictJSONParserTestVectors() {
+  const valid = parseStrictJSON_('{"accepted":true,"nested":{"event_id":"one"}}');
+  if (valid.accepted !== true || valid.nested.event_id !== 'one') {
+    throw new Error('strict JSON parser rejected a valid vector');
+  }
+  [
+    '{"accepted":true,"accepted":false}',
+    '{"nested":{"event_id":"one","event_id":"two"}}',
+    '{"event_id":"one","\\u0065vent_id":"two"}',
+  ].forEach(function(raw) {
+    let rejected = false;
+    try {
+      parseStrictJSON_(raw);
+    } catch (err) {
+      rejected = true;
+    }
+    if (!rejected) {
+      throw new Error('strict JSON parser accepted a duplicate member');
+    }
+  });
+  return true;
+}
+
+// Run manually after changing response-header handling. Apps Script may expose
+// repeated headers either as arrays or as folded values; both must fail closed.
+function verifyResponseContentTypeTestVectors() {
+  function response(headers) {
+    return {getAllHeaders: function() { return headers; }};
+  }
+  [
+    {'Content-Type': 'application/json'},
+    {'content-type': 'Application/JSON; Charset=UTF-8'},
+    {'CONTENT-TYPE': ['application/json; charset="utf-8"']},
+  ].forEach(function(headers) {
+    if (!hasExactJSONContentType_(response(headers))) {
+      throw new Error('strict response Content-Type rejected a valid vector');
+    }
+  });
+  [
+    {},
+    {'Content-Type': 'text/plain'},
+    {'Content-Type': 'application/json; profile=v1'},
+    {'Content-Type': 'application/json; charset=iso-8859-1'},
+    {'Content-Type': ['application/json', 'application/json']},
+    {'Content-Type': 'application/json', 'content-type': 'application/json'},
+    {'Content-Type': 'application/json, text/plain'},
+  ].forEach(function(headers) {
+    if (hasExactJSONContentType_(response(headers))) {
+      throw new Error('strict response Content-Type accepted an ambiguous vector');
+    }
+  });
+  return true;
+}

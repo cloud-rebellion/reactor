@@ -13,6 +13,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/bright-interaction/reactor/internal/migrate"
+	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/supervisor"
 )
@@ -148,8 +149,9 @@ func cmdDLQShow(ctx context.Context, _ *slog.Logger, args []string) error {
 //
 //	reactor dlq retry --db <url> --master-key-file <path> <dlq-id>
 //
-// Requires the workflow binary registry root because re-running needs
-// to look up the binary path.
+// SQLite/local mode resolves and executes the pinned binary synchronously.
+// PostgreSQL is distributed mode: the CLI only authorizes + queues the exact
+// redrive item so a leased worker performs execution.
 func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("dlq retry", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
@@ -166,12 +168,9 @@ func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 		return errors.New("dlq retry: missing <dlq-id>")
 	}
 	dlqID := fs.Arg(0)
-	if *root == "" {
-		return errors.New("dlq retry: missing --root (and HOME unset)")
-	}
-	masterHex, err := loadMasterKey(*masterKeyHex, *masterKeyFile, *root)
+	engine, err := migrate.EngineFromURL(*dbURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("dlq retry: database URL: %w", err)
 	}
 
 	j, closer, err := openJournal(*dbURL)
@@ -188,14 +187,6 @@ func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 		return err
 	}
 
-	// Open vault + binary registry the same way `serve` does so retries
-	// run against the same workflow binary the daemon would use.
-	store, vaultCloser, err := openVaultStore(*dbURL, masterHex)
-	if err != nil {
-		return err
-	}
-	defer vaultCloser()
-
 	run, err := j.GetRun(ctx, item.RunID)
 	if err != nil {
 		return fmt.Errorf("dlq retry: get run: %w", err)
@@ -204,16 +195,69 @@ func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("dlq retry: workflow lookup: %w", err)
 	}
-	binaryPath, err := workflowBinaryPath(*root, slug)
+	if _, err := j.ValidateRunWorkflowArtifact(ctx, run); err != nil {
+		_ = j.LogRunArtifactFence(context.WithoutCancel(ctx), run.ID)
+		return fmt.Errorf("dlq retry: refused by workflow artifact fence: %w", err)
+	}
+	if enabled, err := j.IsWorkflowEnabled(ctx, run.WorkflowID); err != nil {
+		return fmt.Errorf("dlq retry: workflow enabled gate: %w", err)
+	} else if !enabled {
+		return errors.New("dlq retry: workflow is disabled")
+	}
+	if err := j.CheckWorkflowEnqueueAllowed(ctx, run.WorkflowID); err != nil {
+		return fmt.Errorf("dlq retry: workflow quota gate: %w", err)
+	}
+	if allowed, limit, err := j.CheckWorkflowRateLimit(ctx, run.WorkflowID); err != nil {
+		return fmt.Errorf("dlq retry: workflow rate-limit gate: %w", err)
+	} else if !allowed {
+		return fmt.Errorf("dlq retry: workflow rate limit reached (%d/minute)", limit)
+	}
+
+	if engine == migrate.EnginePostgres {
+		// PostgreSQL is the serve/worker split. Never execute synchronously in
+		// this CLI process without a lease: a terminal disconnect would leave a
+		// running row no worker can reclaim. The worker resolves and verifies the
+		// immutable artifact again immediately before execution.
+		claimed, err := j.StartDeadLetterRetryQueuedItem(ctx, item.RunID, item.ID)
+		if err != nil {
+			return fmt.Errorf("dlq retry: enqueue run: %w", err)
+		}
+		if !claimed {
+			return errors.New("dlq retry: run is not in the current failed_dlq state")
+		}
+		fmt.Printf("retry %s -> run %s status=queued\n", dlqID, item.RunID)
+		return nil
+	}
+
+	if *root == "" {
+		return errors.New("dlq retry: missing --root (and HOME unset)")
+	}
+	masterHex, err := loadMasterKey(*masterKeyHex, *masterKeyFile, *root)
 	if err != nil {
 		return err
 	}
+	// Local mode opens the same vault + immutable binary registry as serve.
+	store, vaultCloser, err := openVaultStore(*dbURL, masterHex)
+	if err != nil {
+		return err
+	}
+	defer vaultCloser()
+	reg := registry.New(filepath.Join(*root, "workflows"))
+	binaryPath, err := reg.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	if err != nil {
+		_ = j.LogRunArtifactFence(context.WithoutCancel(ctx), run.ID)
+		return fmt.Errorf("dlq retry: refused by workflow artifact fence: immutable artifact failed verification")
+	}
 
-	// Restore the run to "running" so the supervisor's terminal-status
-	// flip writes the right value. The dead_letter row stays until the
-	// retry actually succeeds.
-	if err := j.SetRunStatus(ctx, item.RunID, "running"); err != nil {
-		return fmt.Errorf("dlq retry: reset run status: %w", err)
+	// Atomically claim the redrive and open a fresh bounded retry generation.
+	// Artifact validation above must happen first: an untrusted executable must
+	// not consume the operator's redrive claim/budget.
+	claimed, err := j.StartDeadLetterRetryItem(ctx, item.RunID, item.ID)
+	if err != nil {
+		return fmt.Errorf("dlq retry: claim run: %w", err)
+	}
+	if !claimed {
+		return errors.New("dlq retry: run is already executing or was cancelled")
 	}
 
 	signKey, _ := decodeMasterKey(masterHex)
@@ -225,43 +269,26 @@ func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 		Journal:          j,
 		Vault:            store,
 		Log:              log,
-		Input:            item.Payload,
+		Input:            run.TriggerMeta,
 		SignalSigningKey: signKey,
 	}
 	status, err := sup.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("dlq retry: %w", err)
 	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("dlq retry: %w", ctx.Err())
+	}
 	fmt.Printf("retry %s -> run %s status=%s\n", dlqID, item.RunID, status)
 	if status == "succeeded" {
-		if err := j.DeleteDeadLetter(ctx, dlqID); err != nil && !errors.Is(err, journal.ErrNotFound) {
+		cleared, err := j.DeleteDeadLettersByRun(context.WithoutCancel(ctx), item.RunID)
+		if err != nil {
 			log.Warn("dlq retry: cleanup failed", "err", err)
 		} else {
-			fmt.Printf("dead-letter %s cleared\n", dlqID)
+			fmt.Printf("cleared %d dead-letter item(s) for run %s\n", cleared, item.RunID)
 		}
 	}
 	return nil
-}
-
-// workflowBinaryPath resolves <root>/workflows/<slug>/workflow and
-// confirms the binary is executable. Mirrors registry.FileRegistry but
-// kept inline so dlq retry doesn't need to import the registry package.
-func workflowBinaryPath(root, slug string) (string, error) {
-	if slug == "" {
-		return "", errors.New("dlq retry: empty slug")
-	}
-	path := filepath.Join(root, "workflows", slug, "workflow")
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("dlq retry: stat %s: %w (run `reactor workflow build`?)", path, err)
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("dlq retry: %s is a directory", path)
-	}
-	if info.Mode()&0o111 == 0 {
-		return "", fmt.Errorf("dlq retry: %s is not executable", path)
-	}
-	return path, nil
 }
 
 // openJournal centralises the migrate.Open + journal.New wiring used by

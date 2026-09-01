@@ -519,7 +519,7 @@ func (s *Server) registerTools() {
 		s.tools["reactor_register_workflow"] = toolDef{
 			tool: Tool{
 				Name:        "reactor_register_workflow",
-				Description: "Register a workflow row. Idempotent: re-registering an existing slug returns its current id without changing it. Returns the workflow id. Requires --allow-write.",
+				Description: "Register metadata only (non-executable). Existing slugs return their current id. Use reactor_create_workflow to compile, publish an immutable artifact, and append an executable version; or use the CLI workflow build + register pair. Returns the workflow id. Requires --allow-write.",
 				InputSchema: map[string]any{
 					"type":     "object",
 					"required": []string{"slug"},
@@ -609,6 +609,9 @@ func (s *Server) registerTools() {
 						DAGJSON:    string(a.DAG),
 						StateRoot:  s.StateRoot,
 						SDKVersion: a.SDKVersion,
+						// Existing slugs append a new immutable artifact-bound version;
+						// they are not duplicate workflow rows.
+						SkipIfExists: true,
 					})
 					if err != nil {
 						return nil, err
@@ -930,7 +933,7 @@ func (s *Server) registerTools() {
 			s.tools["reactor_record_postmortem"] = toolDef{
 				tool: Tool{
 					Name:        "reactor_record_postmortem",
-					Description: "Generate a post-mortem knowledge entry from a failed run's journal. Auto-fired by the supervisor on DLQ; expose here so an operator-driven AI can backfill. Requires --allow-write.",
+					Description: "Generate a post-mortem knowledge entry from a failed run's journal. Available only when AI post-mortem egress is explicitly enabled; can backfill an old run. Requires --allow-write.",
 					InputSchema: map[string]any{
 						"type":     "object",
 						"required": []string{"run_id"},

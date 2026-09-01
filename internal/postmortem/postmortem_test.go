@@ -20,10 +20,12 @@ type fakeAnthropic struct {
 	failFirst int // return error N times before succeeding
 	calls     int
 	failErr   error
+	requests  []codegen.MessagesRequest
 }
 
-func (f *fakeAnthropic) SendMessages(_ context.Context, _ codegen.MessagesRequest) (*codegen.MessagesResponse, error) {
+func (f *fakeAnthropic) SendMessages(_ context.Context, req codegen.MessagesRequest) (*codegen.MessagesResponse, error) {
 	f.calls++
+	f.requests = append(f.requests, req)
 	if f.failFirst > 0 {
 		f.failFirst--
 		err := f.failErr
@@ -44,6 +46,98 @@ func (f *fakeAnthropic) SendMessages(_ context.Context, _ codegen.MessagesReques
 			Input: body,
 		}},
 	}, nil
+}
+
+func TestGenerateOmitsRawRunDiagnosticsBeforeAnthropicEgress(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j, store, closer := freshJournalAndKnowledge(t)
+	defer closer()
+
+	if err := j.CreateWorkflow(ctx, "wf_sensitive", "hash-esign-send", "", "0.1.0", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		runID       = "run_sensitive_dlq"
+		signerName  = "Ada Lovelace"
+		signerEmail = "ada@example.com"
+		companyName = "Northstar Fjord AB"
+		address     = "9 Birch Quay"
+		docTitle    = "Acquisition Mandate September"
+		stepName    = "hash-send-Ada Lovelace-ada@example.com-Northstar Fjord AB-9 Birch Quay-Acquisition Mandate September"
+	)
+	token := "tok_" + strings.Repeat("A7", 16)
+	trigger := json.RawMessage(`{"customer":{"name":"Ada Lovelace","company_name":"Northstar Fjord AB","email":"ada@example.com","address":"9 Birch Quay"},"document":{"title":"Acquisition Mandate September","recipients":[{"role":"signer","name":"Ada Lovelace","email":"ada@example.com"}]}}`)
+	if err := j.CreateRun(ctx, runID, "wf_sensitive", "webhook", trigger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.RecordStepStartSeq(ctx, runID, stepName, 1, 1, "idem", "input-hash"); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := "Hash upstream returned HTTP 502 for " + signerName + " (" + signerEmail + "); " + companyName + " " + address + " " + docTitle + "; access_token=" + token
+	if err := j.RecordStepEndSeq(ctx, runID, stepName, 1, 1, nil, diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MoveStepToDeadLetter(ctx, runID, stepName, diagnostic, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MarkRunFinished(ctx, runID, "failed_dlq"); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &fakeAnthropic{pm: Postmortem{
+		Title: "Treat upstream 502 as retryable", Lesson: "Retry transient upstream failures.",
+	}}
+	g := &Generator{Anthropic: client, Journal: j, Knowledge: store}
+	if _, err := g.Generate(ctx, runID); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("Anthropic requests = %d, want 1", len(client.requests))
+	}
+	wire, err := json.Marshal(client.requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(wire)
+	for _, forbidden := range []string{
+		diagnostic, signerName, signerEmail, token, companyName, address, docTitle,
+		"Hash upstream returned HTTP 502",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("Anthropic request contains raw sensitive value %q: %s", forbidden, got)
+		}
+	}
+	for _, summary := range []string{"error_present=true", "category=upstream", "http_status=502"} {
+		if !strings.Contains(got, summary) {
+			t.Fatalf("Anthropic request missing safe diagnostic %q: %s", summary, got)
+		}
+	}
+}
+
+func TestSummarizeStepErrorEmitsOnlyAllowlistedFields(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  string
+		want string
+	}{
+		{name: "labelled http", err: "provider HTTP 502 on confidential document", want: "error_present=true category=upstream http_status=502"},
+		{name: "unlabelled number", err: "document 502 Northstar Fjord AB", want: "error_present=true category=unknown"},
+		{name: "timeout", err: "private address timed out", want: "error_present=true category=timeout"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := summarizeStepError(tt.err); got != tt.want {
+				t.Fatalf("summarizeStepError() = %q, want %q", got, tt.want)
+			}
+			for _, forbidden := range []string{"confidential", "Northstar", "private address"} {
+				if strings.Contains(summarizeStepError(tt.err), forbidden) {
+					t.Fatalf("summary leaked raw text %q", forbidden)
+				}
+			}
+		})
+	}
 }
 
 // freshJournalAndKnowledge builds a sqlite-backed Journal with
@@ -197,8 +291,8 @@ func TestGenerateReturnsErrorOnEmptyToolUse(t *testing.T) {
 // TestGenerateStampsTheRunTenant is the linchpin of the knowledge corpus's
 // tenant boundary.
 //
-// A post-mortem body names the workflow slug, its step names and truncated step
-// error text. The corpus treats an UNTENANTED entry as shared material readable
+// A post-mortem body names the workflow slug, its step names and fixed diagnostic
+// summaries. The corpus treats an UNTENANTED entry as shared material readable
 // by every tenant (that is what keeps the seeded playbooks visible), so if the
 // generator does not stamp the run's tenant, every failure detail is global by
 // default and the scoping in /knowledge silently protects nothing.
@@ -224,8 +318,8 @@ func TestGenerateStampsTheRunTenant(t *testing.T) {
 
 	g := &Generator{
 		Anthropic: &fakeAnthropic{pm: Postmortem{
-			Title:          "Wrap 4xx as Permanent",
-			Summary:        "s", RootCause: "r", Lesson: "l", Recommendation: "rec",
+			Title:   "Wrap 4xx as Permanent",
+			Summary: "s", RootCause: "r", Lesson: "l", Recommendation: "rec",
 		}},
 		Journal:   j,
 		Knowledge: store,

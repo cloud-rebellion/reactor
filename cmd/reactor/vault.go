@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/bright-interaction/reactor/internal/credentials"
@@ -110,22 +111,24 @@ func cmdVaultList(ctx context.Context, _ *slog.Logger, args []string) error {
 //	--db        database URL
 //	--root      state dir (master.key location; defaults to $HOME/.reactor)
 //	--master-key  hex-encoded master key (overrides root/master.key)
-//	--name      credential name (required; what vault.MustGet looks up)
+//	--tenant    owning tenant (default "default")
+//	--name      credential display name (required; also the default id)
 //	--service   logical service tag (e.g. "stripe", "resend")
 //	--provider  rotator provider (default "manual")
 //	--auto-rotate  enable scheduler-driven rotation
 //	--interval-days  rotation interval when auto-rotate is on
 //	--value     literal secret value (or read from --value-file / stdin)
 //	--value-file  path to a file with the secret bytes
-//	--id        explicit credential id (default cred_<random hex>)
+//	--id        id passed to vault.MustGet (defaults to --name)
 func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("vault add", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
 	root := fs.String("root", defaultRoot(), "Reactor state directory (for master.key lookup)")
 	masterKeyFile := fs.String("master-key-file", "", "path to master key file")
 	masterKeyHex := fs.String("master-key", envFirst("REACTOR_MASTER_KEY", "ARACHNE_MASTER_KEY"), "hex-encoded master key (overrides --master-key-file)")
-	id := fs.String("id", "", "credential id (default cred_<8 random bytes hex>)")
-	name := fs.String("name", "", "credential name (required)")
+	tenantID := fs.String("tenant", journal.DefaultTenant, "owning tenant id")
+	id := fs.String("id", "", "credential id used by vault.MustGet (defaults to --name)")
+	name := fs.String("name", "", "credential display name (required)")
 	service := fs.String("service", "", "logical service tag (e.g. stripe, resend)")
 	provider := fs.String("provider", "manual", "rotator provider (manual, shared-secret, ...)")
 	autoRotate := fs.Bool("auto-rotate", false, "enable scheduled rotation")
@@ -140,6 +143,10 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 	}
 	if *name == "" {
 		return errors.New("missing --name")
+	}
+	*tenantID = strings.TrimSpace(*tenantID)
+	if *tenantID == "" {
+		return errors.New("missing --tenant")
 	}
 	if *autoRotate && *intervalDays <= 0 {
 		return errors.New("--auto-rotate requires --interval-days > 0")
@@ -178,6 +185,7 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 	if err := repo.Create(ctx, credentials.CreateParams{
 		ID:                   *id,
 		Name:                 *name,
+		TenantID:             *tenantID,
 		Service:              *service,
 		Provider:             *provider,
 		AutoRotate:           *autoRotate,
@@ -205,8 +213,8 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 		return rollback(err)
 	}
 	defer vaultCloser()
-	if err := store.Put(ctx, *name, plaintext); err != nil {
-		return rollback(fmt.Errorf("vault: put %s: %w", *name, err))
+	if err := store.Put(ctx, *id, plaintext); err != nil {
+		return rollback(fmt.Errorf("vault: put %s: %w", *id, err))
 	}
 	// docs/security.md lists `operator` / `reactor vault add` as an audited
 	// actor, and the CLI wrote no audit row at all: the "who touched which
@@ -214,7 +222,7 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 	// hand, while the dashboard path audited correctly.
 	auditCLI(ctx, repo, *id, "create.cli")
 
-	fmt.Printf("added %s (id=%s, auto_rotate=%t)\n", *name, *id, *autoRotate)
+	fmt.Printf("added %s (id=%s, tenant=%s, auto_rotate=%t)\n", *name, *id, *tenantID, *autoRotate)
 	return nil
 }
 
@@ -344,10 +352,11 @@ func cmdVaultAudit(ctx context.Context, _ *slog.Logger, args []string) error {
 // supervisor's handleSecretFetch checks this table at every Vault.Get
 // boundary; without a matching grant the workflow gets NotFound.
 //
-//	reactor vault grant --db <url> <workflow-slug> <credential-id> [--note <note>]
+//	reactor vault grant --db <url> --tenant <tenant> <workflow-slug> <credential-id> [--note <note>]
 func cmdVaultGrant(ctx context.Context, _ *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("vault grant", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
+	tenantID := fs.String("tenant", journal.DefaultTenant, "tenant that owns the workflow and credential")
 	by := fs.String("by", os.Getenv("USER"), "actor identifier (defaults to $USER)")
 	note := fs.String("note", "", "free-form note attached to the grant")
 	if err := fs.Parse(reorderArgs(args)); err != nil {
@@ -355,6 +364,10 @@ func cmdVaultGrant(ctx context.Context, _ *slog.Logger, args []string) error {
 	}
 	if *dbURL == "" {
 		return errors.New("vault grant: missing --db (or $REACTOR_DB_URL)")
+	}
+	*tenantID = strings.TrimSpace(*tenantID)
+	if *tenantID == "" {
+		return errors.New("vault grant: missing --tenant")
 	}
 	if fs.NArg() != 2 {
 		return errors.New("vault grant: usage: <workflow-slug> <credential-id>")
@@ -367,12 +380,12 @@ func cmdVaultGrant(ctx context.Context, _ *slog.Logger, args []string) error {
 	}
 	defer closer()
 
-	wfID, err := j.WorkflowIDBySlug(ctx, slug)
+	wfID, err := j.WorkflowIDBySlugInTenant(ctx, slug, *tenantID)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
-			return fmt.Errorf("vault grant: workflow %q not registered", slug)
+			return fmt.Errorf("vault grant: workflow %q not registered in tenant %q", slug, *tenantID)
 		}
-		return fmt.Errorf("vault grant: resolve workflow %q: %w", slug, err)
+		return fmt.Errorf("vault grant: resolve workflow %q in tenant %q: %w", slug, *tenantID, err)
 	}
 	if err := j.GrantSecret(ctx, wfID, credID, *by, *note); err != nil {
 		return err
@@ -381,7 +394,7 @@ func cmdVaultGrant(ctx context.Context, _ *slog.Logger, args []string) error {
 		defer repoCloser()
 		auditCLI(ctx, repo, credID, "grant.cli")
 	}
-	fmt.Printf("granted %s -> %s (workflow_id=%s)\n", slug, credID, wfID)
+	fmt.Printf("granted %s -> %s (workflow_id=%s, tenant=%s)\n", slug, credID, wfID, *tenantID)
 	return nil
 }
 

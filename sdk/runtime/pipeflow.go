@@ -133,15 +133,18 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 	// journal key is (run_id, seq, step_name, attempt), so each attempt gets its
 	// own auditable row and the replay lookup still finds the succeeded one.
 	seq := p.nextSeq.Add(1)
+	maxAttempts := durableRetryMax(opts.RetryPolicy)
 
-	for attempt := 1; ; attempt++ {
+	for localAttempt := 1; ; localAttempt++ {
 		startID := p.id()
 		startBody := wire.StepStart{
-			StepName:       name,
-			IdempotencyKey: opts.IdempotencyKey,
-			InputHash:      hashOpts(opts),
-			Attempt:        attempt,
-			Seq:            seq,
+			StepName:        name,
+			IdempotencyKey:  opts.IdempotencyKey,
+			InputHash:       hashOpts(opts),
+			Attempt:         localAttempt,
+			Seq:             seq,
+			DurableAttempts: true,
+			MaxAttempts:     maxAttempts,
 		}
 		startFrame, err := wire.Wrap(startID, 0, wire.KindStepStart, startBody)
 		if err != nil {
@@ -174,6 +177,50 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 		if sr.Replay {
 			return decodeOutput(sr.Output)
 		}
+		if sr.RetryExhausted {
+			return nil, ErrRetryBudgetExhausted
+		}
+
+		// A wire.v1 host predating durable attempts leaves Attempt at zero;
+		// retain the old local counter for rolling compatibility. New hosts own
+		// the number and may advance it past one after a worker restart/reap.
+		attempt := localAttempt
+		if sr.Attempt > 0 {
+			attempt = sr.Attempt
+		}
+		budgetAttempt := localAttempt
+		if sr.BudgetAttempt > 0 {
+			budgetAttempt = sr.BudgetAttempt
+		} else if sr.Attempt > 0 {
+			// A transitional host may assign a durable absolute attempt without
+			// understanding redrive generations. Initial runs use the same number.
+			budgetAttempt = sr.Attempt
+		}
+		if maxAttempts > 0 && budgetAttempt > maxAttempts {
+			// Defense in depth for a mismatched/buggy host: never call the user
+			// closure beyond the finite budget advertised in step_start.
+			return nil, ErrRetryBudgetExhausted
+		}
+
+		// A freshly spawned process has not performed the delay that normally
+		// follows the prior attempt's step_end. Recompute that delay before the
+		// resumed closure. Stateful observations (for example a provider's
+		// Retry-After value) live only in the crashed process, so a custom
+		// policy should fall back to its deterministic/base schedule here.
+		if localAttempt == 1 && budgetAttempt > 1 && opts.RetryPolicy != nil {
+			delay, allowed := opts.RetryPolicy.NextDelay(budgetAttempt - 1)
+			if !allowed {
+				return nil, ErrRetryBudgetExhausted
+			}
+			p.log.Warn("step retry after resume",
+				"step", name, "attempt", attempt, "budget_attempt", budgetAttempt,
+				"delay_ms", delay.Milliseconds())
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 
 		// Not replay: actually run the user closure.
 		out, fnErr := safeCall(ctx, fn, opts.Timeout)
@@ -184,13 +231,14 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 		// mere classification there (as this used to) dead-lettered a plain
 		// error on its first failure while the configured RetryPolicy was never
 		// consulted at all.
-		delay, willRetry := retryDecision(opts.RetryPolicy, fnErr, attempt)
+		delay, willRetry := retryDecision(opts.RetryPolicy, fnErr, budgetAttempt)
 
 		endBody := wire.StepEnd{
-			StepName: name,
-			Attempt:  attempt,
-			Seq:      seq,
-			Output:   marshalOutput(out, fnErr),
+			StepName:        name,
+			Attempt:         attempt,
+			Seq:             seq,
+			DurableAttempts: true,
+			Output:          marshalOutput(out, fnErr),
 		}
 		if fnErr != nil {
 			endBody.ErrorText = fnErr.Error()
@@ -222,7 +270,7 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 			return nil, fnErr
 		}
 		p.log.Warn("step retry",
-			"step", name, "attempt", attempt,
+			"step", name, "attempt", attempt, "budget_attempt", budgetAttempt,
 			"err", fnErr.Error(), "delay_ms", delay.Milliseconds())
 		select {
 		case <-ctx.Done():
@@ -257,6 +305,30 @@ func retryDecision(policy reactor.RetryPolicy, err error, attempt int) (time.Dur
 // up so Serve exits cleanly; the host's `suspended` override on the
 // supervisor side keeps the run state correct regardless.
 var ErrPipeClosed = errors.New("reactor: host pipe closed")
+
+// ErrRetryBudgetExhausted is returned without invoking the step closure when
+// the host's durable journal says no attempt remains. The host has already
+// terminalized/dead-lettered the interrupted step before sending this verdict.
+var ErrRetryBudgetExhausted = errors.New("reactor: durable step retry budget exhausted")
+
+// durableRetryMax returns the total finite budget the host may allocate. A nil
+// policy is the default single-attempt contract. A custom unbounded/legacy
+// policy returns zero; normal in-process retries still work, but an interrupted
+// running attempt fails closed because the host cannot prove another attempt is
+// permitted.
+func durableRetryMax(policy reactor.RetryPolicy) int {
+	if policy == nil {
+		return 1
+	}
+	bounded, ok := policy.(reactor.BoundedRetryPolicy)
+	if !ok {
+		return 0
+	}
+	if max := bounded.MaxAttempts(); max > 0 {
+		return max
+	}
+	return 1
+}
 
 // Sleep yields to the host. Short sleeps wait synchronously; long sleeps
 // are upgraded to suspend-and-resume in week 4 (the host kills the process
@@ -498,6 +570,9 @@ func retryHash(p reactor.RetryPolicy) int64 {
 	}
 	if eb, ok := p.(reactor.ExpBackoff); ok {
 		return int64(eb.Max)*1_000_000 + int64(eb.Base/time.Millisecond)
+	}
+	if bounded, ok := p.(reactor.BoundedRetryPolicy); ok {
+		return int64(bounded.MaxAttempts())
 	}
 	return -1
 }

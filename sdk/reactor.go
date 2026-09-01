@@ -124,6 +124,20 @@ type RetryPolicy interface {
 	NextDelay(attempt int) (time.Duration, bool)
 }
 
+// BoundedRetryPolicy is the crash-safe extension to RetryPolicy. The compiled
+// workflow runtime sends this total-attempt ceiling to the host, which owns the
+// durable attempt counter. That lets the host reject a resumed attempt before
+// invoking the step closure once the budget has been consumed.
+//
+// Custom policies should implement this interface whenever they have a finite
+// budget. Policies that only implement RetryPolicy keep their existing
+// in-process retry behaviour, but after a hard crash Reactor fails the
+// interrupted step closed because it cannot prove another attempt is allowed.
+type BoundedRetryPolicy interface {
+	RetryPolicy
+	MaxAttempts() int
+}
+
 // ExpBackoff is the default policy: full-jitter exponential.
 //
 //	delay = rand_in [0, min(Cap, Base * 2^(attempt-1)))]
@@ -151,6 +165,16 @@ func (b ExpBackoff) NextDelay(attempt int) (time.Duration, bool) {
 		}
 	}
 	return time.Duration(rand.Int64N(int64(max) + 1)), true
+}
+
+// MaxAttempts reports the total durable attempt budget, including the first
+// call. ExpBackoff with an unset/invalid Max still executes its initial call,
+// so its effective ceiling is one.
+func (b ExpBackoff) MaxAttempts() int {
+	if b.Max <= 0 {
+		return 1
+	}
+	return b.Max
 }
 
 // Retryable wraps an error to mark it as transient. The runtime applies the

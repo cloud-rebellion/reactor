@@ -1,3 +1,10 @@
+# DEVELOPMENT / SINGLE-NODE EXAMPLE ONLY.
+#
+# This file intentionally uses SQLite and starts no distributed worker. It is
+# suitable for a local evaluation, not for the Hash e-signature bridge or any
+# production deployment. Production operators must supply their own reviewed
+# Postgres-backed serve + worker topology; see docs/scaling.md and
+# docs/hash-esign-bridge.md.
 services:
   reactor:
     image: reactor:latest

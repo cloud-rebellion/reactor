@@ -29,7 +29,7 @@ reactor serve
  +-- cron driver            polling reconcile + (postgres) LISTEN/NOTIFY
  +-- scheduler              fires due Sleep/AwaitSignal schedules
  +-- rotation runner        hourly tick + manual rotate via dashboard
- +-- post-mortem gen        auto-fires on failed_dlq when ANTHROPIC_API_KEY set
+ +-- post-mortem gen        optional failed_dlq AI egress; explicit opt-in + key
  +-- notifier               fires Slack + webhook + email alerts on terminal
  +-- per-run subprocs       spawned by supervisor; one per dispatched run
 ```
@@ -39,8 +39,8 @@ Every long-running goroutine runs under `runDaemonComponent` with a deferred pan
 ## Per-run lifecycle
 
 1. **Trigger arrives.** Webhook receiver (`POST /webhook/{token}`), cron driver tick, manual dispatch via `POST /workflows/{slug}/run`, or chain trigger fired from another workflow's terminal event.
-2. **Dispatch.** `dispatcher.Dispatch` creates a runs row, snapshots the workflow_version via `SetRunWorkflowVersion`, spawns a `supervisor.Supervisor` in its own goroutine. The dispatch fires `IncRunsStarted` on the metrics counter.
-3. **Supervise.** `supervisor.Run` exec's the workflow binary at `<root>/workflows/<slug>/workflow`. On Linux it applies cgroup v2 limits + prlimit before the child gets to user code; on macOS it uses prlimit only.
+2. **Dispatch.** `dispatcher.Dispatch` resolves the current workflow version to its immutable SHA-256 artifact, verifies the bytes, and creates the run with `workflow_version` plus `workflow_artifact_sha256` in the same INSERT. It then spawns a `supervisor.Supervisor` (or leaves the row queued in distributed mode). The dispatch fires `IncRunsStarted` on the metrics counter.
+3. **Supervise.** `supervisor.Run` exec's the verified content-addressed binary at `<root>/workflows/<slug>/artifacts/sha256/<digest>/workflow`; the mutable `<slug>/workflow` path is compatibility/status state and is never selected for a pinned run. On Linux it applies cgroup v2 limits + prlimit before the child gets to user code; on macOS it uses prlimit only.
 4. **Pipe.** The supervisor talks to the child over a JSON-lines pipe. Frames: `Hello`, `StepStart/End/Reply`, `Sleep`, `AwaitSignal`, `SignalDeliver`, `SecretFetch/Reply`, `Log`, `Cancel`, `Error`. Sleep up to `SuspendThreshold` (default 30s) blocks; longer sleeps suspend the run + write a schedules row, the scheduler re-spawns at wake using the recorded `wake_at` (not the workflow body's recomputed value).
 5. **Journal.** Every Step boundary writes to the steps table. A restart-mid-run replays `Run()` from the top; the journal's `FindCachedOutputForInput` short-circuits previously-succeeded steps so closures don't re-execute. The `input_hash` filter catches workflow-author changes to a Step's input shape (input drift triggers re-execution in live mode and `ErrReplayDivergence` in replay mode).
 6. **Terminal.** `supervisor.Run` returns `succeeded`, `failed`, `failed_dlq`, or `suspended`. The dispatcher's `OnTerminal` hook fires three things in order: (a) `runlogs.Buffer.Close(runID)` so the SSE tail finishes, (b) `notifier.Notify(event)` for failure/success alerts, (c) `fireChainedWorkflows(event)` for run-after-another-workflow chain triggers. The metrics `IncRunsTerminal` bumps the right gauge.
@@ -61,11 +61,36 @@ reactor.db                # sqlite (or use a postgres URL via REACTOR_DB_URL)
 reactor.env               # operator-generated; sourceable env vars
 workflows/                # one subdir per registered workflow
   <slug>/
-    workflow              # compiled binary
+    workflow              # mutable compatibility pointer; never used for pinned execution
+    candidate.sha256      # atomic pointer to the latest split CLI build candidate
+    artifacts/sha256/
+      <digest>/workflow   # immutable exact bytes retained for queued/resumed/DLQ runs
 knowledge/                # markdown corpus, frontmatter at the top
   <topic>/<id>.md
 graph.json                # serialised runtime graph (cache only)
 ```
+
+Artifact publication copies to a private staging file, fsyncs it, atomically
+links the completed bytes at the digest path without overwriting, verifies an
+already-present winner, and fsyncs the full freshly-created directory hierarchy
+plus both publication levels. Registration appends the version transactionally;
+compatibility activation then re-locks the workflow row and proceeds only if
+that exact version+digest is still current. Split `workflow register` reads the
+immutable `candidate.sha256` reference (or an explicit `--artifact-sha256`),
+never the mutable compatibility copy. Run
+execution re-hashes the artifact on every resolution. Artifact cleanup must not
+remove any digest referenced by a queued, running, suspended, or DLQ run; the
+current release performs no automatic artifact garbage collection.
+
+### Migration 0031 cutover
+
+Pre-0031 `workflow_versions` and runs intentionally receive NULL artifact pins:
+a migration cannot prove which bytes a mutable historical path represented.
+Before reopening ingress, rebuild and re-register every enabled workflow so its
+current version owns a full artifact digest. Drain and review every old queued,
+running, or suspended run; resume/redrive fails closed instead of guessing the
+current binary. Use a stop-ingress → drain → migrate → rebuild/register → smoke
+test → reopen sequence for this compatibility boundary.
 
 ## Auth + session flow
 

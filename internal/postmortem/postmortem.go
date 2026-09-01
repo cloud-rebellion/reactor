@@ -112,7 +112,7 @@ func (g *Generator) Generate(ctx context.Context, runID string) (string, error) 
 		Frontmatter: knowledge.Frontmatter{
 			Topic: "post-mortems",
 			// Scope the entry to the run's tenant. The body names the workflow
-			// slug, its step names and truncated step error text, so an
+			// slug and may describe its step metadata, so an
 			// unstamped post-mortem is readable by every tenant on /knowledge.
 			// Empty stays global, which is right for a single-tenant install.
 			Tenant:    run.TenantID,
@@ -185,15 +185,16 @@ func extractPostmortem(resp *codegen.MessagesResponse) (Postmortem, error) {
 // the lesson should take so future codegen prompts can pull it
 // usefully via BM25.
 func buildPrompt(run journal.RunInfo, steps []journal.StepRow, slug string) string {
+	sanitizer := newPromptSanitizer(run, steps)
 	var b strings.Builder
 	b.WriteString("A workflow run failed terminally and landed in the dead-letter queue. ")
 	b.WriteString("Your job: write a post-mortem in the structured shape so the lesson lands in the Reactor knowledge corpus and benefits every future generated workflow.\n\n")
 
 	b.WriteString("## Run\n\n")
-	fmt.Fprintf(&b, "- workflow: %s\n", slug)
-	fmt.Fprintf(&b, "- run_id: %s\n", run.ID)
-	fmt.Fprintf(&b, "- trigger_kind: %s\n", run.TriggerKind)
-	fmt.Fprintf(&b, "- status: %s\n", run.Status)
+	fmt.Fprintf(&b, "- workflow: %s\n", sanitizer.scrub(slug))
+	fmt.Fprintf(&b, "- run_id: %s\n", sanitizer.scrub(run.ID))
+	fmt.Fprintf(&b, "- trigger_kind: %s\n", sanitizer.scrub(run.TriggerKind))
+	fmt.Fprintf(&b, "- status: %s\n", sanitizer.scrub(run.Status))
 	if !run.StartedAt.IsZero() {
 		fmt.Fprintf(&b, "- started_at: %s\n", run.StartedAt.UTC().Format(time.RFC3339))
 	}
@@ -205,9 +206,12 @@ func buildPrompt(run journal.RunInfo, steps []journal.StepRow, slug string) stri
 		b.WriteString("(no steps recorded; the workflow likely failed before its first Step)\n")
 	}
 	for _, s := range steps {
-		fmt.Fprintf(&b, "- step %s attempt=%d status=%s", s.StepName, s.Attempt, s.Status)
+		fmt.Fprintf(&b, "- step %s attempt=%d status=%s", sanitizer.scrub(s.StepName), s.Attempt, sanitizer.scrub(s.Status))
 		if s.ErrorText != "" {
-			fmt.Fprintf(&b, " err=%q", truncate(s.ErrorText, 240))
+			// Never place raw or transformed error text on the external request.
+			// Provider errors may contain arbitrary customer/document metadata
+			// that no heuristic redactor can prove safe.
+			fmt.Fprintf(&b, " %s", summarizeStepError(s.ErrorText))
 		}
 		b.WriteString("\n")
 	}
@@ -250,11 +254,4 @@ func renderBody(pm Postmortem, run journal.RunInfo, slug string) string {
 		b.WriteString("\n\n")
 	}
 	return b.String()
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

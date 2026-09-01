@@ -48,6 +48,11 @@ func NewRedactor() *Redactor {
 			example: "sk_live_abc...",
 		},
 		{
+			name:    "keyed-credential",
+			re:      regexp.MustCompile(`(?i)\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|password|secret)\s*[:=]\s*["']?[A-Za-z0-9_\-.~+/=]{8,}["']?`),
+			example: "access_token=abc123...",
+		},
+		{
 			name:    "long-hex-key",
 			re:      regexp.MustCompile(`\b[a-fA-F0-9]{40,}\b`),
 			example: "deadbeef... (40+ hex chars)",
@@ -63,6 +68,21 @@ func NewRedactor() *Redactor {
 			example: "GB82WEST12345698765432",
 		},
 	}}
+}
+
+// Scrub replaces every likely PII / secret match with a rule-labelled marker.
+// Unlike Scan, this is intended for data that must cross an external boundary:
+// callers can preserve the surrounding operational diagnostic without sending
+// the matched value. Rules are applied sequentially, so overlapping matches
+// cannot re-introduce text removed by an earlier rule.
+func (r *Redactor) Scrub(body string) string {
+	if r == nil {
+		return body
+	}
+	for _, rule := range r.rules {
+		body = rule.re.ReplaceAllString(body, "[redacted:"+rule.name+"]")
+	}
+	return body
 }
 
 // RedactionFinding describes one rule hit. Sample is a small slice of

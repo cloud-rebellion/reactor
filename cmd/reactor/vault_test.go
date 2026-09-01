@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -199,6 +200,98 @@ func TestCmdVaultAddSeedsRotatableCredential(t *testing.T) {
 	}
 	if string(sec.Reveal()) != "demo-secret" {
 		t.Fatalf("plaintext mismatch: %q", sec.Reveal())
+	}
+}
+
+func TestCmdVaultAddAssignsTenantAndStoresByCredentialID(t *testing.T) {
+	t.Parallel()
+	dbURL, repo, _, masterHex := newCmdEnv(t)
+	ctx := context.Background()
+
+	if err := cmdVault(ctx, discardLogger(), []string{
+		"add",
+		"--db", dbURL,
+		"--master-key", masterHex,
+		"--tenant", "acme",
+		"--id", "cred_crm",
+		"--name", "crm-api-key",
+		"--value", "tenant-secret",
+	}); err != nil {
+		t.Fatalf("vault add: %v", err)
+	}
+	credential, err := repo.Get(ctx, "cred_crm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.TenantID != "acme" {
+		t.Fatalf("tenant = %q, want acme", credential.TenantID)
+	}
+	store, closer, err := openVaultStore(dbURL, masterHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closer()
+	secret, err := store.Get(ctx, "cred_crm")
+	if err != nil {
+		t.Fatalf("get by credential id: %v", err)
+	}
+	if string(secret.Reveal()) != "tenant-secret" {
+		t.Fatalf("secret = %q", secret.Reveal())
+	}
+	if _, err := repo.Get(ctx, "crm-api-key"); !errors.Is(err, credentials.ErrNotFound) {
+		t.Fatalf("vault add created an unintended name-keyed credential: %v", err)
+	}
+}
+
+func TestCmdVaultGrantScopesDuplicateSlugByTenant(t *testing.T) {
+	t.Parallel()
+	dbURL, repo, _, _ := newCmdEnv(t)
+	ctx := context.Background()
+	j, closer, err := openJournal(dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closer()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_acme", "shared", "h", "1", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateWorkflowInTenant(ctx, "wf_globex", "shared", "h", "1", json.RawMessage(`{}`), "globex"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []credentials.CreateParams{
+		{ID: "cred_acme", Name: "cred_acme", TenantID: "acme"},
+		{ID: "cred_globex", Name: "cred_globex", TenantID: "globex"},
+	} {
+		if err := repo.Create(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := cmdVaultGrant(ctx, discardLogger(), []string{
+		"--db", dbURL, "--tenant", "acme", "shared", "cred_acme",
+	}); err != nil {
+		t.Fatalf("tenant-scoped grant: %v", err)
+	}
+	if ok, err := j.HasGrant(ctx, "wf_acme", "cred_acme"); err != nil || !ok {
+		t.Fatalf("acme grant = %t, %v", ok, err)
+	}
+	if ok, err := j.HasGrant(ctx, "wf_globex", "cred_acme"); err != nil || ok {
+		t.Fatalf("globex unexpectedly received acme grant = %t, %v", ok, err)
+	}
+
+	err = cmdVaultGrant(ctx, discardLogger(), []string{
+		"--db", dbURL, "--tenant", "globex", "shared", "cred_acme",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cross-tenant") {
+		t.Fatalf("cross-tenant grant error = %v", err)
+	}
+	// The default is deliberately scoped to the default tenant rather than
+	// falling back to whichever duplicate slug was registered most recently.
+	err = cmdVaultGrant(ctx, discardLogger(), []string{
+		"--db", dbURL, "shared", "cred_globex",
+	})
+	if err == nil || !strings.Contains(err.Error(), `tenant "default"`) {
+		t.Fatalf("default tenant grant error = %v", err)
 	}
 }
 

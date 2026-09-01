@@ -20,6 +20,12 @@ reactor mcp install --client continue-dev
 reactor mcp install --client all
 ```
 
+With `--allow-write`, PostgreSQL deployments persist an immutable-artifact-
+pinned **queued** run and return its id; the normal leased worker owns execution.
+This avoids an MCP client disconnect or stdio process crash stranding an
+unleased running row. SQLite is the explicit single-process development path:
+it executes synchronously and therefore requires the vault master key.
+
 ### Streamable HTTP
 
 Mounted at `POST /mcp` on the dashboard server. Same BasicAuth + RateLimit middleware applies; CSRF is exempt by design (the request body carries the auth contract).
@@ -182,7 +188,12 @@ Every write tool emits a row in the audit log keyed by `actor_kind="mcp"`.
 
 #### `reactor_register_workflow`
 
-Register a workflow row. Idempotent: re-registering an existing slug returns its current id.
+Register workflow metadata only. An existing slug returns its current id and is
+not activated. This tool cannot safely bind executable bytes; use
+`reactor_create_workflow` (or the CLI build + register pair) for production.
+Re-running `reactor_create_workflow` for an existing slug compiles and publishes
+a new immutable artifact, appends the next workflow version, and returns the
+same workflow id.
 
 **Input:**
 
@@ -217,13 +228,18 @@ Inverse of grant. Errors if no grant exists.
 
 #### `reactor_dispatch_workflow`
 
-Trigger a workflow run with an operator-supplied JSON payload. Returns the new run_id.
+Trigger a default-tenant workflow run by slug with an operator-supplied JSON
+payload. Workflow enabled state, tenant queue/monthly quotas, and per-workflow
+rate limits are enforced exactly as on daemon dispatch. Returns the new run_id.
+For the stdio transport on PostgreSQL, this means the pinned run is durably
+queued for a leased worker, not that execution has already completed. The HTTP
+transport follows the hosting daemon's configured local/distributed mode.
 
 **Input:**
 
 ```json
 {
-  "workflow_id": "wf_demo",
+  "slug": "hourly-report",
   "payload": { "any": "JSON" }
 }
 ```
@@ -270,7 +286,14 @@ Supersede an existing entry with new body. The old entry stays on disk; the supe
 
 #### `reactor_record_postmortem`
 
-Append a post-mortem for a failed run. The dispatcher auto-fires this for `failed_dlq` runs when an Anthropic API key is configured; operators can also call it directly for an old run.
+Append a post-mortem for a failed run. The tool is registered only when the
+knowledge store is available and both `REACTOR_AI_POSTMORTEM_ENABLED=true` and
+`ANTHROPIC_API_KEY` are set. The same gate controls automatic generation for
+new `failed_dlq` runs. Reactor redacts stable identifiers and replaces each
+Step error with fixed allowlisted summary fields before the Anthropic call; it
+does not send raw error, trigger, or Step-output bodies. Enabling the tool still
+constitutes external diagnostic egress and must follow the deployment's privacy
+approval.
 
 **Input:** `{"run_id": "run_..."}`
 

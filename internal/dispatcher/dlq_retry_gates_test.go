@@ -18,14 +18,17 @@ func dlqFixture(t *testing.T) (*Dispatcher, *journal.Journal, string) {
 	ctx := context.Background()
 	j := newJournal(t)
 
-	if err := j.CreateWorkflow(ctx, "wf_1", "billing", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
+	if err := j.CreateWorkflowWithArtifact(ctx, "wf_1", "billing", "h", "0.1.0", testArtifactSHA256, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.CreateRun(ctx, "run_1", "wf_1", "webhook", json.RawMessage(`{}`)); err != nil {
+	if err := j.CreateRunPinned(ctx, "run_1", "wf_1", "webhook", json.RawMessage(`{}`), 1, testArtifactSHA256); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.MoveStepToDeadLetter(ctx, "run_1", "charge", "boom", json.RawMessage(`{}`)); err != nil {
+	if _, err := j.RecordStepStartSeq(ctx, "run_1", "charge", 1, 1, "charge-key", "charge-hash"); err != nil {
 		t.Fatal(err)
+	}
+	if deadLettered, err := j.FinalizeStepAttemptSeq(ctx, "run_1", "charge", 1, 1, json.RawMessage(`{}`), "boom", false); err != nil || !deadLettered {
+		t.Fatalf("seed exact dead letter = %v, %v", deadLettered, err)
 	}
 	if err := j.MarkRunFinished(ctx, "run_1", "failed_dlq"); err != nil {
 		t.Fatal(err)
@@ -40,8 +43,8 @@ func dlqFixture(t *testing.T) (*Dispatcher, *journal.Journal, string) {
 		Resolver: &fakeResolver{idByslug: map[string]string{"billing": "wf_1"}},
 		// A path that cannot exist: every test here must refuse BEFORE it would
 		// spawn anything, so reaching the spawn is itself the failure signal.
-		BinaryPath: func(string) (string, error) { return "/nonexistent/workflow", nil },
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ArtifactPath: func(string, string) (string, error) { return "/nonexistent/workflow", nil },
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return d, j, item.ID
 }
@@ -88,6 +91,37 @@ func TestRetryDeadLetterRespectsCapacity(t *testing.T) {
 
 	if _, err := d.RetryDeadLetter(ctx, dlqID); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("RetryDeadLetter at capacity returned err=%v, want ErrCapacity; the retry path must shed load like every other dispatch", err)
+	}
+}
+
+func TestRetryDeadLetterArtifactAvailabilityFailsBeforeClaimOrSpawn(t *testing.T) {
+	ctx := context.Background()
+	d, j, dlqID := dlqFixture(t)
+	resolved := false
+	d.ArtifactPath = func(string, string) (string, error) {
+		resolved = true
+		return "", errors.New("tampered immutable bytes")
+	}
+	status, err := d.RetryDeadLetter(ctx, dlqID)
+	if status != "" || err == nil || errors.Is(err, journal.ErrWorkflowArtifactFence) {
+		t.Fatalf("artifact-unavailable DLQ retry = status %q err %v", status, err)
+	}
+	if !resolved {
+		t.Fatal("DLQ retry did not verify the immutable artifact")
+	}
+	run, getErr := j.GetRun(ctx, "run_1")
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if run.Status != "failed_dlq" {
+		t.Fatalf("artifact refusal consumed retry claim: run status %q", run.Status)
+	}
+	if _, findErr := j.GetDeadLetterItem(ctx, dlqID); findErr != nil {
+		t.Fatalf("artifact refusal removed DLQ item: %v", findErr)
+	}
+	logs, logErr := j.GetRunLogs(ctx, "run_1")
+	if logErr != nil || len(logs) == 0 || logs[len(logs)-1] != journal.WorkflowArtifactFenceRunLog {
+		t.Fatalf("artifact refusal operator log = %v, %v", logs, logErr)
 	}
 }
 

@@ -256,12 +256,33 @@ func (j *Journal) AttemptCount(ctx context.Context, runID, stepName string) (int
 func (j *Journal) CreateRun(ctx context.Context, runID, workflowID, triggerKind string, triggerMeta json.RawMessage) error {
 	now := j.now()
 	tm := outputArg(triggerMeta, j.engine)
-	// tenant_id is denormalized from the workflow (the $N rewriter does not
-	// dedupe, so workflowID is passed again rather than reusing $2).
 	const q = `INSERT INTO runs (id, workflow_id, trigger_kind, trigger_meta, status, started_at, created_at, tenant_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE((SELECT tenant_id FROM workflows WHERE id = $8), 'default'))`
 	_, err := j.db.ExecContext(ctx, j.bind(q),
 		runID, workflowID, triggerKind, tm, "running", now, now, workflowID,
+	)
+	if err != nil {
+		return fmt.Errorf("journal: create run: %w", err)
+	}
+	return nil
+}
+
+// CreateRunPinned atomically records the executable identity with the run. The
+// dispatcher uses this for every new local execution; the legacy wrapper above
+// remains for fixtures/imports and deliberately creates an unpinned row that
+// resume/redrive paths will refuse to execute.
+func (j *Journal) CreateRunPinned(ctx context.Context, runID, workflowID, triggerKind string, triggerMeta json.RawMessage, workflowVersion int, artifactSHA256 string) error {
+	if workflowVersion <= 0 || !validArtifactSHA256(artifactSHA256) {
+		return fmt.Errorf("journal: create pinned run: %w", ErrWorkflowArtifactFence)
+	}
+	now := j.now()
+	tm := outputArg(triggerMeta, j.engine)
+	// tenant_id is denormalized from the workflow (the $N rewriter does not
+	// dedupe, so workflowID is passed again rather than reusing $2).
+	const q = `INSERT INTO runs (id, workflow_id, trigger_kind, trigger_meta, status, started_at, created_at, tenant_id, workflow_version, workflow_artifact_sha256)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE((SELECT tenant_id FROM workflows WHERE id = $8), 'default'), $9, $10)`
+	_, err := j.db.ExecContext(ctx, j.bind(q),
+		runID, workflowID, triggerKind, tm, "running", now, now, workflowID, workflowVersion, artifactSHA256,
 	)
 	if err != nil {
 		return fmt.Errorf("journal: create run: %w", err)
@@ -288,49 +309,82 @@ func (j *Journal) MarkRunFinished(ctx context.Context, runID, status string) err
 	return nil
 }
 
-// ReapOrphanedRuns marks every run still in "running" as failed and is
-// called once at daemon startup. A fresh process has no in-flight
-// supervisors, so any "running" row is the residue of a crash or a
-// SQLITE_BUSY collision that dropped MarkRunFinished. Without this such
-// runs hang "running" forever and never alert. Suspended runs are left
-// untouched (they own a schedules row the scheduler will resume).
-// Returns the number of runs reaped.
+// ReapOrphanedRuns classifies every unleased local run still in "running" at
+// daemon startup. Durable in-flight attempts become suspended behind one due
+// recovery schedule, unused exact redrives return to failed_dlq, accepted
+// cancellation becomes terminal, and unknown crashes fail closed. Suspended
+// runs are left untouched because they already own scheduler work. Distributed
+// deployments must use lease reaping instead. Returns the number classified.
 func (j *Journal) ReapOrphanedRuns(ctx context.Context) (int64, error) {
-	const q = `UPDATE runs SET status = $1, finished_at = $2 WHERE status = $3`
-	res, err := j.db.ExecContext(ctx, j.bind(q), "failed", j.now(), "running")
+	rows, err := j.db.QueryContext(ctx, `SELECT id FROM runs WHERE status = 'running'`)
 	if err != nil {
-		return 0, fmt.Errorf("journal: reap orphaned runs: %w", err)
+		return 0, fmt.Errorf("journal: list orphaned runs: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	var runIDs []string
+	for rows.Next() {
+		var runID string
+		if err := rows.Scan(&runID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("journal: scan orphaned run: %w", err)
+		}
+		runIDs = append(runIDs, runID)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("journal: close orphaned runs: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("journal: iterate orphaned runs: %w", err)
+	}
+
+	var (
+		classified int64
+		reapErr    error
+	)
+	for _, runID := range runIDs {
+		// A fresh local daemon proves that no prior in-process supervisor is
+		// alive. Resume from the journal even when the last durable row already
+		// succeeded: the daemon may have died after committing StepEnd but before
+		// terminal run persistence. This force is intentionally startup-only;
+		// live deterministic workflow errors after a cached step stay terminal.
+		if _, err := j.RecoverLocalInterruptedRun(ctx, runID, true); err != nil {
+			reapErr = errors.Join(reapErr, fmt.Errorf("run %s: %w", runID, err))
+			continue
+		}
+		classified++
+	}
+	return classified, reapErr
 }
 
 // RunInfo is the read-only summary the replay CLI + dashboard need.
 // JSON tags use snake_case so the eventual dashboard surface and CLI
 // --json output share one shape.
 type RunInfo struct {
-	ID          string          `json:"id"`
-	WorkflowID  string          `json:"workflow_id"`
-	TenantID    string          `json:"tenant_id"`
-	TriggerKind string          `json:"trigger_kind"`
-	Status      string          `json:"status"`
-	TriggerMeta json.RawMessage `json:"trigger_meta,omitempty"`
-	StartedAt   time.Time       `json:"started_at"`
-	FinishedAt  time.Time       `json:"finished_at"`
+	ID                     string          `json:"id"`
+	WorkflowID             string          `json:"workflow_id"`
+	TenantID               string          `json:"tenant_id"`
+	TriggerKind            string          `json:"trigger_kind"`
+	Status                 string          `json:"status"`
+	TriggerMeta            json.RawMessage `json:"trigger_meta,omitempty"`
+	WorkflowVersion        int             `json:"workflow_version,omitempty"`
+	WorkflowArtifactSHA256 string          `json:"workflow_artifact_sha256,omitempty"`
+	StartedAt              time.Time       `json:"started_at"`
+	FinishedAt             time.Time       `json:"finished_at"`
 }
 
 // GetRun returns the runs row by id. Returns ErrNotFound if no row exists.
 func (j *Journal) GetRun(ctx context.Context, runID string) (RunInfo, error) {
-	const q = `SELECT id, workflow_id, tenant_id, trigger_kind, status, trigger_meta, started_at, finished_at
+	const q = `SELECT id, workflow_id, tenant_id, trigger_kind, status, trigger_meta, workflow_version, workflow_artifact_sha256, started_at, finished_at
 		FROM runs WHERE id = $1`
 	row := j.db.QueryRowContext(ctx, j.bind(q), runID)
 	var (
 		info     RunInfo
 		meta     []byte
+		version  sql.NullInt64
+		artifact sql.NullString
 		started  sql.NullString
 		finished sql.NullString
 	)
-	if err := row.Scan(&info.ID, &info.WorkflowID, &info.TenantID, &info.TriggerKind, &info.Status, &meta, &started, &finished); err != nil {
+	if err := row.Scan(&info.ID, &info.WorkflowID, &info.TenantID, &info.TriggerKind, &info.Status, &meta, &version, &artifact, &started, &finished); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return RunInfo{}, ErrNotFound
 		}
@@ -339,6 +393,10 @@ func (j *Journal) GetRun(ctx context.Context, runID string) (RunInfo, error) {
 	if len(meta) > 0 {
 		info.TriggerMeta = json.RawMessage(meta)
 	}
+	if version.Valid {
+		info.WorkflowVersion = int(version.Int64)
+	}
+	info.WorkflowArtifactSHA256 = artifact.String
 	if started.Valid {
 		if t, err := j.parseTime(started.String); err == nil {
 			info.StartedAt = t
@@ -753,6 +811,12 @@ func (j *Journal) CreateWorkflow(ctx context.Context, id, slug, codeHash, sdkVer
 	return j.CreateWorkflowInTenant(ctx, id, slug, codeHash, sdkVer, dag, DefaultTenant)
 }
 
+// CreateWorkflowWithArtifact creates a default-tenant workflow whose first
+// version is immediately executable through the immutable artifact registry.
+func (j *Journal) CreateWorkflowWithArtifact(ctx context.Context, id, slug, codeHash, sdkVer, artifactSHA256 string, dag json.RawMessage) error {
+	return j.CreateWorkflowInTenantWithArtifact(ctx, id, slug, codeHash, sdkVer, artifactSHA256, dag, DefaultTenant)
+}
+
 // CreateWorkflowInTenant is CreateWorkflow with an explicit owner.
 //
 // CreateWorkflow's INSERT omitted tenant_id entirely, so every workflow took the
@@ -762,27 +826,42 @@ func (j *Journal) CreateWorkflow(ctx context.Context, id, slug, codeHash, sdkVer
 // never fire because both sides were always equal. Empty tenantID means
 // DefaultTenant so unscoped callers keep their existing behaviour.
 func (j *Journal) CreateWorkflowInTenant(ctx context.Context, id, slug, codeHash, sdkVer string, dag json.RawMessage, tenantID string) error {
+	return j.CreateWorkflowInTenantWithArtifact(ctx, id, slug, codeHash, sdkVer, "", dag, tenantID)
+}
+
+// CreateWorkflowInTenantWithArtifact is the production registration path for
+// compiled workflows. Metadata-only callers may use CreateWorkflowInTenant,
+// but the resulting empty artifact pin intentionally cannot execute.
+func (j *Journal) CreateWorkflowInTenantWithArtifact(ctx context.Context, id, slug, codeHash, sdkVer, artifactSHA256 string, dag json.RawMessage, tenantID string) error {
 	if tenantID == "" {
 		tenantID = DefaultTenant
 	}
+	if artifactSHA256 != "" && !validArtifactSHA256(artifactSHA256) {
+		return errors.New("journal: create workflow: invalid artifact sha256")
+	}
 	now := j.now()
 	dg := outputArg(dag, j.engine)
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("journal: create workflow: begin: %w", err)
+	}
+	defer tx.Rollback()
 	const q = `INSERT INTO workflows (id, tenant_id, slug, code_hash, sdk_version, dag_json, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
-	_, err := j.db.ExecContext(ctx, j.bind(q),
+	_, err = tx.ExecContext(ctx, j.bind(q),
 		id, tenantID, slug, codeHash, sdkVer, dg, now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("journal: create workflow: %w", err)
 	}
-	// Best-effort version row; failure here is logged at the caller
-	// via journal-level error but doesn't fail the workflow insert.
-	// Returning silently keeps pre-0008 tests (which don't expect a
-	// version table) passing on engines that hit a transient schema
-	// state, and the dashboard's auto-register tolerates missing
-	// version rows via CurrentWorkflowVersion's "0, nil" fallback.
-	if _, vErr := j.RecordWorkflowVersion(ctx, id, sdkVer, codeHash, dag); vErr != nil {
-		return fmt.Errorf("journal: create workflow: version row: %w", vErr)
+	const versionQ = `INSERT INTO workflow_versions
+		(workflow_id, version, sdk_version, code_hash, artifact_sha256, dag_json, created_at)
+		VALUES ($1, 1, $2, $3, $4, $5, $6)`
+	if _, err := tx.ExecContext(ctx, j.bind(versionQ), id, sdkVer, codeHash, nullIfEmpty(artifactSHA256), dg, now); err != nil {
+		return fmt.Errorf("journal: create workflow: version row: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("journal: create workflow: commit: %w", err)
 	}
 	return nil
 }

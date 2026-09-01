@@ -32,8 +32,20 @@ func (j *Journal) RequestRunCancel(ctx context.Context, runID string) (string, e
 	}
 	defer tx.Rollback()
 
+	// Serialize cancellation with queue claims/finalization. Without this lock a
+	// queued row could be selected here, claimed by a worker, then overwritten
+	// to cancelled while its child was already starting.
+	if j.engine == EngineSQLite {
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE runs SET id = id WHERE id = $1`), runID); err != nil {
+			return "", fmt.Errorf("journal: request cancel: lock run: %w", err)
+		}
+	}
+	selectStatus := `SELECT status FROM runs WHERE id = $1`
+	if j.engine == EnginePostgres {
+		selectStatus += ` FOR UPDATE`
+	}
 	var status string
-	err = tx.QueryRowContext(ctx, j.bind(`SELECT status FROM runs WHERE id = $1`), runID).Scan(&status)
+	err = tx.QueryRowContext(ctx, j.bind(selectStatus), runID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CancelNotPossible, ErrNotFound
 	}
@@ -42,10 +54,10 @@ func (j *Journal) RequestRunCancel(ctx context.Context, runID string) (string, e
 	}
 
 	switch status {
-	case "suspended":
+	case "queued", "suspended":
 		if _, err := tx.ExecContext(ctx,
-			j.bind(`UPDATE runs SET status = 'cancelled', finished_at = $1, cancel_requested = $2 WHERE id = $3`),
-			j.now(), j.boolValue(true), runID); err != nil {
+			j.bind(`UPDATE runs SET status = 'cancelled', finished_at = $1, cancel_requested = $2 WHERE id = $3 AND status = $4`),
+			j.now(), j.boolValue(true), runID, status); err != nil {
 			return "", fmt.Errorf("journal: request cancel: mark cancelled: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -122,6 +134,44 @@ func (j *Journal) FinalizeCancel(ctx context.Context, runID string) error {
 	// Cancellation is terminal: meter it like any other run end (best-effort).
 	j.recordUsageBestEffort(ctx, runID, "cancelled")
 	return nil
+}
+
+// FinalizeCancelIfUnleased is the cross-process watcher fallback. It may
+// finalize a suspended/local/orphaned run, but never a run currently owned by
+// a distributed worker. The owner must observe the cancel request, stop its
+// child, and commit cancellation through FinalizeOwnedRun; a different worker
+// is not allowed to race that lease generation.
+func (j *Journal) FinalizeCancelIfUnleased(ctx context.Context, runID string) (bool, error) {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
+		j.bind(`UPDATE runs SET status = 'cancelled', finished_at = $1
+			WHERE id = $2 AND status IN ('running','suspended')
+			AND NOT EXISTS (SELECT 1 FROM leases WHERE run_id = $3)`),
+		j.now(), runID, runID)
+	if err != nil {
+		return false, fmt.Errorf("journal: finalize unleased cancel: %w", err)
+	}
+	moved, _ := res.RowsAffected()
+	if moved == 0 {
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		j.bind(`UPDATE schedules SET fired = $1 WHERE run_id = $2 AND fired = $3`),
+		j.boolValue(true), runID, j.boolValue(false)); err != nil {
+		return false, fmt.Errorf("journal: finalize unleased cancel schedules: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	j.recordUsageBestEffort(ctx, runID, "cancelled")
+	return true, nil
 }
 
 // SaveRunLogs persists a run's buffered log lines. Called once when a run

@@ -165,10 +165,10 @@ type Server struct {
 	// from the users table.
 	Auth AuthAdmin
 
-	// flash is the single-use server-side store for one-time payloads
-	// surfaced on the next page load (e.g. a freshly-minted webhook
-	// HMAC secret). Lazily initialised by Mount so callers don't need
-	// to set it explicitly.
+	// flash is the single-use encrypted store for one-time payloads surfaced
+	// on the next page load (e.g. a freshly-minted webhook HMAC secret). When
+	// Journal is wired, the ciphertext is shared across replicas while the
+	// decryption capability remains only in the browser cookie.
 	flash *flashStore
 
 	// loginLimiter throttles failed logins (brute-force lockout). Lazily
@@ -319,8 +319,13 @@ func (s *Server) Mount(r chi.Router) {
 		s.Log = slog.Default()
 	}
 	if s.flash == nil {
-		s.flash = newFlashStore()
+		if s.Journal != nil {
+			s.flash = newFlashStore(s.Journal)
+		} else {
+			s.flash = newFlashStore()
+		}
 	}
+	s.flash.secureCookies = s.SecureCookies
 	s.mountMiddleware(r)
 	// Member-accessible surfaces: read views, running existing workflows,
 	// the knowledge/graph reads, MCP, public webhook + docs, and the auth
@@ -1509,7 +1514,7 @@ func credentialDetailBody(c credentials.Credential, rows []credentials.AuditEntr
   <span class="muted">refused while any workflow still holds a grant.</span>
 </form>`, template.URLQueryEscaper(c.ID))
 
-	fmt.Fprintf(&b, `<form method="POST" action="/credentials/%s/value" class="form-inline" data-confirm="Overwrite the stored value? Any in-flight workflows holding the old value continue with it; new fetches see the new value.">
+	fmt.Fprintf(&b, `<form id="manual-update" method="POST" action="/credentials/%s/value" class="form-inline" data-confirm="Overwrite the stored value? Any in-flight workflows holding the old value continue with it; new fetches see the new value.">
   <label>Manual update <input type="password" name="value" required placeholder="new plaintext, encrypted on write" autocomplete="new-password"></label>
   <button type="submit">Update value</button>
 </form>

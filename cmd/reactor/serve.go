@@ -250,9 +250,10 @@ func openServeDeps(ctx context.Context, log *slog.Logger, cfg *serveConfig) (*se
 	// (ReapExpiredLeases) instead, which resumes them rather than failing.
 	if !cfg.distributed() {
 		if n, rErr := j.ReapOrphanedRuns(ctx); rErr != nil {
-			log.Warn("serve: reap orphaned runs failed", "err", rErr)
+			db.Close()
+			return nil, fmt.Errorf("serve: recover local orphaned runs: %w", rErr)
 		} else if n > 0 {
-			log.Info("serve: reaped orphaned runs stuck in running", "count", n)
+			log.Info("serve: classified orphaned local runs", "count", n)
 		}
 	}
 	credRepo := credentials.New(db, credEngine)
@@ -345,11 +346,14 @@ func openServeDeps(ctx context.Context, log *slog.Logger, cfg *serveConfig) (*se
 		Vault:              vaultStore,
 		Log:                log,
 		BinaryPath:         reg.BinaryPath,
+		ArtifactPath:       reg.ArtifactPath,
 		TickInterval:       cfg.tickInterval,
 		SupervisorTemplate: schedTemplate,
 		Cancels:            cancels,
 		Enqueue:            cfg.distributed(),
 		OnTerminal: func(ctx context.Context, ti supervisor.TerminalInfo) {
+			releaseAdmission := disp.HoldTerminalAdmission()
+			defer releaseAdmission()
 			handleRunTerminal(ctx, log, notif, j, disp, logBuffer, dispatcher.TerminalEvent{
 				RunID:        ti.RunID,
 				WorkflowID:   ti.WorkflowID,
@@ -480,8 +484,10 @@ func runCancelWatcher(ctx context.Context, log *slog.Logger, deps *serveDeps) {
 				log.Info("serve: cancelled live run on request", "run_id", id)
 				continue
 			}
-			// Not executing here (suspended, or already gone): finalize.
-			if err := deps.journal.FinalizeCancel(ctx, id); err != nil {
+			// Not executing here. Only finalize when no distributed lease is
+			// present; another worker's live claim must persist cancellation
+			// with its exact owner token.
+			if _, err := deps.journal.FinalizeCancelIfUnleased(ctx, id); err != nil {
 				log.Warn("serve: finalize cancel failed", "run_id", id, "err", err)
 			}
 		}
@@ -517,15 +523,20 @@ func (c runCanceller) Cancel(ctx context.Context, runID string) (string, error) 
 	return outcome, nil
 }
 
-// buildPostMortemGenerator returns nil when ANTHROPIC_API_KEY is unset;
-// the dispatcher gracefully skips post-mortem generation in that path.
+// buildPostMortemGenerator requires explicit diagnostic-egress opt-in as well
+// as an Anthropic credential. The dispatcher gracefully skips generation when
+// either condition is absent.
 func buildPostMortemGenerator(log *slog.Logger, j *journal.Journal, knowStore *knowledge.Store) *postmortem.Generator {
+	if !aiPostmortemEnabled() {
+		log.Info("serve: post-mortem auto-generation disabled (explicit AI egress opt-in not set)")
+		return nil
+	}
 	anth, err := codegen.NewAnthropicFromEnv()
 	if err != nil {
 		log.Info("serve: post-mortem auto-generation disabled (ANTHROPIC_API_KEY not set)")
 		return nil
 	}
-	log.Info("serve: post-mortem auto-generation enabled")
+	log.Info("serve: post-mortem auto-generation enabled (identifiers are redacted and Step errors synthesized before egress)")
 	return &postmortem.Generator{
 		Anthropic: anth,
 		Journal:   j,
@@ -558,6 +569,7 @@ func buildDispatcher(
 		Journal:       j,
 		Resolver:      &dispatcher.SQLResolver{Journal: j},
 		BinaryPath:    reg.BinaryPath,
+		ArtifactPath:  reg.ArtifactPath,
 		Log:           log,
 		Counters:      metrics,
 		MaxConcurrent: envIntFirst("REACTOR_MAX_CONCURRENT_RUNS", "", 32),
@@ -574,6 +586,8 @@ func buildDispatcher(
 		},
 	}
 	disp.OnTerminal = func(ctx context.Context, ev dispatcher.TerminalEvent) {
+		releaseAdmission := disp.HoldTerminalAdmission()
+		defer releaseAdmission()
 		handleRunTerminal(ctx, log, notif, j, disp, logBuffer, ev)
 	}
 	if pmGen != nil {
@@ -793,19 +807,30 @@ func runServeLoop(ctx context.Context, log *slog.Logger, cfg *serveConfig, deps 
 	}
 
 	<-runCtx.Done()
-	// cron/scheduler/rotation are stopped inside runLeaderTasks (only the
-	// leader started them). Drain the dispatcher's in-flight runs here.
-	if n := deps.dispatcher.InFlight(); n > 0 {
-		log.Info("serve: draining in-flight runs", "count", n, "timeout", cfg.drainTimeout.String())
-		if err := deps.dispatcher.Drain(cfg.drainTimeout); err != nil {
+	// Close scheduler admission before observing counts. Stop is idempotent and
+	// runLeaderTasks also invokes it; the mutex gate makes this serialize with a
+	// dispatch whose context check passed just before shutdown.
+	deps.scheduler.Stop()
+	deps.dispatcher.Stop()
+	// Sample scheduler first: its terminal hook hands off to dispatcher before
+	// decrementing its own count. Once scheduler is zero, the subsequent
+	// dispatcher sample sees every child admitted by that handoff.
+	scheduled, dispatched := deps.scheduler.InFlight(), deps.dispatcher.InFlight()
+	if dispatched+scheduled > 0 {
+		log.Info("serve: draining in-flight runs",
+			"dispatcher_count", dispatched, "scheduler_count", scheduled,
+			"timeout", cfg.drainTimeout.String())
+		if err := drainServeExecutions(deps, cfg.drainTimeout); err != nil {
 			// Drain timed out: kill the remaining subprocesses so they
 			// don't orphan and so they stop touching the DB we are about
 			// to close (deps.db.Close runs after this returns). Then give
-			// them a short bounded window to record their terminal status.
-			killed := deps.cancels.CancelAll()
-			log.Warn("serve: drain timed out; killed in-flight runs", "killed", killed, "err", err)
-			if killed > 0 {
-				_ = deps.dispatcher.Drain(5 * time.Second)
+			// them a short bounded window to persist a recoverable
+			// infrastructure stop.
+			admissions := deps.dispatcher.CancelAdmissions(cancelreg.ErrInfrastructureShutdown)
+			killed := deps.cancels.CancelAllWithCause(cancelreg.ErrInfrastructureShutdown)
+			log.Warn("serve: drain timed out; interrupted in-flight runs", "killed", killed, "admissions", admissions, "err", err)
+			if killed+admissions > 0 {
+				_ = drainServeExecutions(deps, 5*time.Second)
 			}
 		} else {
 			log.Info("serve: drain complete")
@@ -814,6 +839,26 @@ func runServeLoop(ctx context.Context, log *slog.Logger, cfg *serveConfig, deps 
 	wg.Wait()
 	log.Info("serve: shutdown complete")
 	return nil
+}
+
+// drainServeExecutions waits on both entry paths that can own a workflow
+// subprocess. Scheduler admission must be closed before calling it; otherwise a
+// zero observation could race a due dispatch entering immediately afterward.
+func drainServeExecutions(deps *serveDeps, timeout time.Duration) error {
+	started := time.Now()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		scheduled, dispatched := deps.scheduler.InFlight(), deps.dispatcher.InFlight()
+		if dispatched+scheduled == 0 {
+			return nil
+		}
+		if timeout > 0 && time.Since(started) >= timeout {
+			return fmt.Errorf("serve: drain timed out after %s with dispatcher=%d scheduler=%d in flight",
+				timeout, dispatched, scheduled)
+		}
+		<-ticker.C
+	}
 }
 
 // runAutoscaler builds + runs the worker autoscaler. The substrate is chosen

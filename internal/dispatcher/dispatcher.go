@@ -7,8 +7,8 @@
 //
 //  1. Receive a journal.Trigger + payload from webhook or cron.
 //  2. Resolve the workflow_slug via the workflows table.
-//  3. Look up the workflow binary path through BinaryPath(slug).
-//  4. Generate a fresh run_id, persist a runs row.
+//  3. Resolve the current workflow version to its verified immutable artifact.
+//  4. Generate a fresh run_id and atomically persist the version + artifact pins.
 //  5. Spawn a supervisor.Supervisor in its own goroutine. Run() returns
 //     either "succeeded", "failed", "failed_dlq", or "suspended"; the
 //     supervisor itself records the terminal status, this dispatcher
@@ -36,10 +36,14 @@ import (
 	"github.com/bright-interaction/reactor/internal/runtime/supervisor"
 )
 
-// BinaryLookup maps a workflow slug to the compiled binary path the
-// supervisor should exec. Production deployments store binaries under
-// ~/.reactor/workflows/<slug>/workflow; tests inject a fake.
+// BinaryLookup maps a workflow slug to the mutable compatibility path. It is
+// retained for status/legacy wiring; pinned execution uses ArtifactLookup.
 type BinaryLookup func(slug string) (string, error)
+
+// ArtifactLookup resolves one immutable executable by workflow slug and full
+// SHA-256. Production execution must use this rather than the mutable current
+// BinaryPath compatibility pointer.
+type ArtifactLookup func(slug, artifactSHA256 string) (string, error)
 
 // WorkflowResolver returns a workflow's slug + id given a trigger. The
 // production impl reads the workflows table; tests inject a fake.
@@ -50,20 +54,28 @@ type WorkflowResolver interface {
 
 // Dispatcher implements both webhook.Dispatcher and cron.Dispatcher.
 type Dispatcher struct {
-	Journal    *journal.Journal
-	Resolver   WorkflowResolver
-	BinaryPath BinaryLookup
-	Sup        supervisor.Supervisor // template; RunID + BinaryPath set per dispatch
-	Log        *slog.Logger
+	Journal      *journal.Journal
+	Resolver     WorkflowResolver
+	BinaryPath   BinaryLookup // compatibility/status only; never used for a pinned run
+	ArtifactPath ArtifactLookup
+	Sup          supervisor.Supervisor // template; RunID + BinaryPath set per dispatch
+	Log          *slog.Logger
 
-	// OnDeadLetter fires asynchronously after a run terminates with
+	// OnDeadLetter fires after a run durably terminates with
 	// status="failed_dlq". Wired by the daemon to a postmortem.Generator
 	// so every DLQ failure compounds into the knowledge corpus
 	// automatically. Optional: nil disables the hook.
 	//
-	// Tracked through the inFlight WaitGroup so graceful shutdown still
-	// waits for the post-mortem to land before draining.
+	// The essential OnTerminal publication always runs first. This optional
+	// hook receives an admission-scoped, bounded context and MUST honor its
+	// cancellation so a slow AI provider cannot suppress notifications/chains
+	// or outlive the database during forced shutdown.
 	OnDeadLetter func(ctx context.Context, runID string)
+
+	// DeadLetterHookTimeout bounds optional postmortem work. Zero uses two
+	// minutes, matching the provider's normal request envelope; infrastructure
+	// shutdown cancels it earlier through the admission lifetime.
+	DeadLetterHookTimeout time.Duration
 
 	// OnLog optionally receives per-run timeline lines (dispatch
 	// "spawning", "run finished status=succeeded", etc.) so the
@@ -102,12 +114,19 @@ type Dispatcher struct {
 	// provider retries later, shedding load instead of melting the box.
 	MaxConcurrent int
 
-	// inFlight tracks supervisor goroutines so the daemon can drain
-	// them gracefully on SIGINT. Drain blocks until every dispatched
-	// run reaches a terminal state OR the timeout elapses.
-	inFlight sync.WaitGroup
-	mu       sync.Mutex
-	count    int
+	// count tracks both dispatch resolution and supervisor execution so the
+	// daemon can drain without an Add-after-Wait admission race.
+	mu      sync.Mutex
+	count   int
+	stopped bool
+	// terminalAdmissions are short-lived trusted reservations held by the
+	// daemon while a counted dispatcher/scheduler parent publishes terminal
+	// hooks. They let that hook hand off downstream workflow-complete work after
+	// external admission closes without making trigger kind itself a capability.
+	terminalAdmissions int
+	admissions         map[uint64]context.CancelCauseFunc
+	nextAdmission      uint64
+	shutdownCause      error
 
 	sem     chan struct{}
 	semOnce sync.Once
@@ -116,6 +135,12 @@ type Dispatcher struct {
 // ErrCapacity is returned by Dispatch when MaxConcurrent in-flight runs
 // are already executing. Callers shed load rather than queue unbounded.
 var ErrCapacity = errors.New("dispatcher: at capacity; run not started")
+
+// ErrShuttingDown is returned after the daemon closes external admission.
+// Already-running terminal hooks may still admit workflow-complete chains while
+// their parent remains counted, allowing a graceful drain to include the whole
+// fan-out without accepting a late HTTP/cron run after an observed zero.
+var ErrShuttingDown = errors.New("dispatcher: shutting down; run not started")
 
 // ErrRetryInFlight is returned when a dead-letter retry loses the claim race:
 // the run is already executing (a concurrent retry won) or was cancelled.
@@ -150,6 +175,111 @@ func (d *Dispatcher) release() {
 	select {
 	case <-d.sem:
 	default:
+	}
+}
+
+// beginAdmission registers the whole dispatch operation before it performs
+// resolution or creates a run. Stop serializes with this method, so Drain can
+// never observe zero and then race an accepted HTTP/cron call that adds to the
+// active counter afterward. A workflow-complete chain may enter after Stop because
+// its terminal parent is synchronously counted by either this dispatcher or
+// the scheduler; the daemon's joint count drain therefore has no zero gap.
+func (d *Dispatcher) beginAdmission(terminalChain bool) (context.Context, func(), error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.shutdownCause != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrShuttingDown, d.shutdownCause)
+	}
+	if d.stopped && (!terminalChain || d.terminalAdmissions == 0) {
+		return nil, nil, ErrShuttingDown
+	}
+	lifetime, cancel := context.WithCancelCause(context.Background())
+	if d.admissions == nil {
+		d.admissions = make(map[uint64]context.CancelCauseFunc)
+	}
+	d.nextAdmission++
+	id := d.nextAdmission
+	d.admissions[id] = cancel
+	d.count++
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			cancel(context.Canceled)
+			d.mu.Lock()
+			delete(d.admissions, id)
+			d.count--
+			d.mu.Unlock()
+		})
+	}
+	return lifetime, release, nil
+}
+
+// Stop closes external admission. It is idempotent. Existing executions and
+// their terminal workflow-complete fan-out remain drainable.
+func (d *Dispatcher) Stop() {
+	d.mu.Lock()
+	d.stopped = true
+	d.mu.Unlock()
+}
+
+// CancelAdmissions interrupts resolver/artifact/DB work admitted before Stop
+// and records a cause that every pre-spawn safety check observes. It closes the
+// shutdown hole where the one-shot process registry cancellation ran while an
+// admission was still resolving, then that admission spawned an unregistered
+// child after the timeout. Returns the number of admitted operations signaled.
+func (d *Dispatcher) CancelAdmissions(cause error) int {
+	if cause == nil {
+		cause = cancelreg.ErrInfrastructureShutdown
+	}
+	d.mu.Lock()
+	d.shutdownCause = cause
+	cancels := make([]context.CancelCauseFunc, 0, len(d.admissions))
+	for _, cancel := range d.admissions {
+		cancels = append(cancels, cancel)
+	}
+	d.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel(cause)
+	}
+	return len(cancels)
+}
+
+func bindAdmissionContext(parent, lifetime context.Context) (context.Context, func()) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	stop := context.AfterFunc(lifetime, func() { cancel(context.Cause(lifetime)) })
+	return ctx, func() {
+		stop()
+		cancel(context.Canceled)
+	}
+}
+
+func admissionSafe(lifetime context.Context) error {
+	if cause := context.Cause(lifetime); cause != nil {
+		return fmt.Errorf("%w: %v", ErrShuttingDown, cause)
+	}
+	return nil
+}
+
+// HoldTerminalAdmission reserves drain ownership for one trusted terminal-hook
+// call and returns an idempotent release. The serve wiring acquires it while
+// the dispatcher or scheduler parent is still counted, so the joint shutdown
+// drain cannot observe a zero between parent completion and chain admission.
+func (d *Dispatcher) HoldTerminalAdmission() func() {
+	d.mu.Lock()
+	d.terminalAdmissions++
+	d.count++
+	d.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			d.mu.Lock()
+			d.terminalAdmissions--
+			d.count--
+			d.mu.Unlock()
+		})
 	}
 }
 
@@ -198,6 +328,13 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
+	lifetime, releaseAdmission, err := d.beginAdmission(false)
+	if err != nil {
+		return "", err
+	}
+	defer releaseAdmission()
+	ctx, releaseOperation := bindAdmissionContext(ctx, lifetime)
+	defer releaseOperation()
 	item, err := d.Journal.GetDeadLetterItem(ctx, dlqID)
 	if err != nil {
 		return "", fmt.Errorf("dispatcher: get dlq item: %w", err)
@@ -209,7 +346,7 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	// A retry is a run, so it goes through the SAME gates dispatch() applies.
 	// This path used to call sup.Run directly and skipped all of them: the
 	// enabled flag (so "disable" was not a kill switch), the tenant quota, the
-	// per-workflow rate limit, the concurrency slot, the inFlight WaitGroup
+	// per-workflow rate limit, the concurrency slot, the drain admission
 	// (graceful drain did not wait for it), the cancel registry (the run could
 	// not be stopped), and execute()'s panic recovery (a panic left the run
 	// stuck in "running" because the status had already been flipped).
@@ -237,9 +374,24 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	if err != nil {
 		return "", fmt.Errorf("dispatcher: resolve workflow: %w", err)
 	}
-	binary, err := d.BinaryPath(slug)
+	binary, err := d.resolvePinnedBinary(ctx, run, slug)
 	if err != nil {
-		return "", fmt.Errorf("dispatcher: binary lookup: %w", err)
+		_ = d.Journal.LogRunArtifactFence(context.WithoutCancel(ctx), run.ID)
+		return "", fmt.Errorf("dispatcher: dlq retry refused by workflow artifact fence: %w", err)
+	}
+	if d.Enqueue {
+		if err := admissionSafe(lifetime); err != nil {
+			return "", err
+		}
+		claimed, cErr := d.Journal.StartDeadLetterRetryQueuedItem(ctx, item.RunID, item.ID)
+		if cErr != nil {
+			return "", fmt.Errorf("dispatcher: queue run for retry: %w", cErr)
+		}
+		if !claimed {
+			return "", ErrRetryInFlight
+		}
+		d.Log.Info("dispatcher: queued dlq retry", "run_id", item.RunID, "dlq_id", item.ID)
+		return "queued", nil
 	}
 
 	// Take the slot before mutating any state, so a full pool sheds the retry
@@ -249,12 +401,15 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 		return "", ErrCapacity
 	}
 	defer d.release()
+	if err := admissionSafe(lifetime); err != nil {
+		return "", err
+	}
 
 	// Single-flight claim. The old unguarded SetRunStatus meant two operators
 	// clicking Retry on the same row both flipped it to running and both
 	// spawned a supervisor against the same run id, duplicating side effects.
 	// The CAS also refuses a cancelled run, matching MarkRunFinished.
-	claimed, cErr := d.Journal.StartDeadLetterRetry(ctx, item.RunID)
+	claimed, cErr := d.Journal.StartDeadLetterRetryItem(ctx, item.RunID, item.ID)
 	if cErr != nil {
 		return "", fmt.Errorf("dispatcher: claim run for retry: %w", cErr)
 	}
@@ -262,23 +417,15 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 		return "", ErrRetryInFlight
 	}
 
-	d.inFlight.Add(1)
-	defer d.inFlight.Done()
-	d.mu.Lock()
-	d.count++
-	d.mu.Unlock()
-	defer func() {
-		d.mu.Lock()
-		d.count--
-		d.mu.Unlock()
-	}()
-
 	sup := d.Sup
 	sup.BinaryPath = binary
 	sup.WorkflowSlug = slug
 	sup.RunID = item.RunID
 	sup.Journal = d.Journal
-	sup.Input = item.Payload
+	// Re-spawn the workflow with its original trigger input. dead_letter.payload
+	// is the failed Step payload and may not even match the workflow's input
+	// schema (the Hash bridge expects the original signed event envelope).
+	sup.Input = run.TriggerMeta
 	if sup.Log == nil {
 		sup.Log = d.Log
 	}
@@ -289,13 +436,13 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	// execute() owns the cancellable+registered context, the panic recovery and
 	// the terminal hooks. It also decouples the run from the caller's context,
 	// so a browser disconnect no longer kills the workflow mid-step.
-	status := d.execute(item.RunID, slug, run.WorkflowID, run.TriggerKind, sup)
+	status, execErr := d.execute(lifetime, item.RunID, slug, run.WorkflowID, run.TriggerKind, sup)
 	if status == "succeeded" {
-		if err := d.Journal.DeleteDeadLetter(context.WithoutCancel(ctx), dlqID); err != nil && !errors.Is(err, journal.ErrNotFound) {
+		if _, err := d.Journal.DeleteDeadLettersByRun(context.WithoutCancel(ctx), item.RunID); err != nil {
 			d.Log.Warn("dispatcher: dlq cleanup failed", "err", err)
 		}
 	}
-	return status, nil
+	return status, execErr
 }
 
 // Dispatch creates a run + spawns a supervisor goroutine. Returns once
@@ -305,6 +452,38 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 func (d *Dispatcher) Dispatch(ctx context.Context, t journal.Trigger, payload []byte) error {
 	_, err := d.dispatch(ctx, t, payload, "live")
 	return err
+}
+
+// DispatchTerminalChain is the trusted terminal-hook entry point. External
+// HTTP/cron/manual surfaces use Dispatch and cannot bypass Stop merely by
+// supplying kind=workflow_complete. During shutdown this succeeds only while
+// the daemon holds a terminal admission reservation.
+func (d *Dispatcher) DispatchTerminalChain(ctx context.Context, t journal.Trigger, payload []byte) error {
+	if t.Kind != journal.TriggerWorkflowComplete {
+		return errors.New("dispatcher: terminal-chain admission requires workflow_complete trigger")
+	}
+	_, err := d.dispatchWithAdmission(ctx, t, payload, "live", true)
+	return err
+}
+
+// DispatchWebhook is the webhook-specific async surface. It has the same
+// execution semantics as Dispatch but returns the run id once the run row is
+// durable. The receiver stores that id while completing its delivery lease,
+// which distinguishes a genuinely dispatched replay from a receipt that was
+// only claimed before a host crash.
+//
+// Keep Dispatch for cron/chain callers whose interface intentionally returns
+// only an error; adding this method avoids a broad API break.
+func (d *Dispatcher) DispatchWebhook(ctx context.Context, t journal.Trigger, payload []byte) (string, error) {
+	runID, err := d.dispatch(ctx, t, payload, "live")
+	if err == nil && runID == "" {
+		// Automatic dispatch historically treats a disabled workflow as a
+		// successful no-op. A webhook receipt must not call that completed: no
+		// durable run exists, and acknowledging it would permanently discard the
+		// provider event. Let the receiver release its lease and ask for retry.
+		return "", ErrWorkflowDisabled
+	}
+	return runID, err
 }
 
 // DispatchTest runs a workflow as a DRY RUN: it executes in-process with
@@ -326,9 +505,25 @@ func (d *Dispatcher) DispatchManual(ctx context.Context, t journal.Trigger, payl
 // ("" when the dispatch was skipped or refused). mode is the supervisor run
 // mode ("live" or "dry_run"); a dry run always executes in-process.
 func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []byte, mode string) (string, error) {
+	return d.dispatchWithAdmission(ctx, t, payload, mode, false)
+}
+
+func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigger, payload []byte, mode string, trustedTerminalChain bool) (string, error) {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
+	lifetime, releaseAdmission, err := d.beginAdmission(trustedTerminalChain)
+	if err != nil {
+		return "", err
+	}
+	ctx, releaseOperation := bindAdmissionContext(ctx, lifetime)
+	defer releaseOperation()
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseAdmission()
+		}
+	}()
 	// Respect the enabled flag on every dispatch path (webhook, cron,
 	// chain, manual). A disabled workflow stays in the table for history
 	// but accepts no new runs; skip silently so a paused workflow doesn't
@@ -376,12 +571,27 @@ func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []
 		return "", ErrRateLimited
 	}
 
+	// Resolve the current version to its immutable artifact before creating a
+	// run. If a deployment activates a newer version after this read, this run
+	// still owns these exact bytes; it never follows the mutable canonical path.
+	slug, err := d.Resolver.WorkflowSlugByID(ctx, t.WorkflowID)
+	if err != nil {
+		return "", fmt.Errorf("dispatcher: resolve workflow: %w", err)
+	}
+	version, binary, err := d.resolveCurrentBinary(ctx, t.WorkflowID, slug)
+	if err != nil {
+		return "", fmt.Errorf("dispatcher: workflow artifact unavailable: %w", err)
+	}
+
 	// Distributed mode: persist the run as "queued" and return. A worker
 	// claims + executes it (ExecuteRun). No slot is taken and no subprocess
 	// is spawned here -- the queue absorbs the burst, so this never sheds
 	// load the way the in-process path does. A dry run skips the queue and
 	// runs in-process so its mode + effect-suppression apply on this node.
 	if d.Enqueue && mode != "dry_run" {
+		if err := admissionSafe(lifetime); err != nil {
+			return "", err
+		}
 		runID, err := newRunID()
 		if err != nil {
 			return "", err
@@ -390,14 +600,11 @@ func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []
 		if len(meta) == 0 {
 			meta = json.RawMessage(`{}`)
 		}
-		if err := d.Journal.CreateQueuedRun(ctx, runID, t.WorkflowID, string(t.Kind), meta); err != nil {
+		if err := d.Journal.CreateQueuedRunPinned(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256); err != nil {
 			return "", fmt.Errorf("dispatcher: enqueue run: %w", err)
 		}
 		if d.Counters != nil {
 			d.Counters.IncRunsStarted()
-		}
-		if ver, vErr := d.Journal.CurrentWorkflowVersion(ctx, t.WorkflowID); vErr == nil {
-			_ = d.Journal.SetRunWorkflowVersion(ctx, runID, ver)
 		}
 		d.Log.Info("dispatcher: enqueued run", "run_id", runID, "workflow_id", t.WorkflowID, "trigger_kind", t.Kind)
 		return runID, nil
@@ -411,16 +618,9 @@ func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []
 			"workflow_id", t.WorkflowID, "max", d.MaxConcurrent)
 		return "", ErrCapacity
 	}
-
-	slug, err := d.Resolver.WorkflowSlugByID(ctx, t.WorkflowID)
-	if err != nil {
+	if err := admissionSafe(lifetime); err != nil {
 		d.release()
-		return "", fmt.Errorf("dispatcher: resolve workflow: %w", err)
-	}
-	binary, err := d.BinaryPath(slug)
-	if err != nil {
-		d.release()
-		return "", fmt.Errorf("dispatcher: binary lookup: %w", err)
+		return "", err
 	}
 
 	runID, err := newRunID()
@@ -432,24 +632,13 @@ func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []
 	if len(meta) == 0 {
 		meta = json.RawMessage(`{}`)
 	}
-	if err := d.Journal.CreateRun(ctx, runID, t.WorkflowID, string(t.Kind), meta); err != nil {
+	if err := d.Journal.CreateRunPinned(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256); err != nil {
 		d.release()
 		return "", fmt.Errorf("dispatcher: create run: %w", err)
 	}
 	if d.Counters != nil {
 		d.Counters.IncRunsStarted()
 	}
-	// Pin the run to the workflow version current at dispatch time so
-	// the audit trail tells the truth even after the workflow gets
-	// re-registered with new code. CurrentWorkflowVersion returns 0
-	// for pre-0008 workflows; we still record 0 to disambiguate "ran
-	// before versioning" from "ran against unspecified version".
-	if ver, vErr := d.Journal.CurrentWorkflowVersion(ctx, t.WorkflowID); vErr == nil {
-		if setErr := d.Journal.SetRunWorkflowVersion(ctx, runID, ver); setErr != nil {
-			d.Log.Warn("dispatcher: set run version failed", "run_id", runID, "err", setErr)
-		}
-	}
-
 	sup := d.Sup
 	sup.BinaryPath = binary
 	sup.RunID = runID
@@ -476,19 +665,11 @@ func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []
 		sup.LogSink = d.OnLog
 	}
 
-	d.inFlight.Add(1)
-	d.mu.Lock()
-	d.count++
-	d.mu.Unlock()
+	transferred = true
 	go func() {
-		defer d.inFlight.Done()
+		defer releaseAdmission()
 		defer d.release()
-		defer func() {
-			d.mu.Lock()
-			d.count--
-			d.mu.Unlock()
-		}()
-		d.execute(runID, slug, t.WorkflowID, string(t.Kind), sup)
+		_, _ = d.execute(lifetime, runID, slug, t.WorkflowID, string(t.Kind), sup)
 	}()
 	return runID, nil
 }
@@ -556,44 +737,56 @@ func (d *Dispatcher) lastStepOutput(ctx context.Context, runID string) json.RawM
 // execute runs one supervisor to terminal and fires the lifecycle hooks
 // (cancellation, panic recovery, OnLog, OnDeadLetter, OnTerminal, metrics).
 // Shared by the local-mode dispatch goroutine and the distributed-mode
-// worker (ExecuteRun). It does NOT own the concurrency slot, the inFlight
-// WaitGroup, or the count gauge -- the caller wraps those so single-node
-// drain semantics stay exactly as before.
+// worker (ExecuteRun). Admission/drain tracking is owned by each public entry
+// point; execute only owns the process lifecycle shared by those paths.
 // Returns the terminal status so the synchronous caller (the dashboard's
 // dead-letter retry) can report it without a second journal read.
-func (d *Dispatcher) execute(runID, slug, workflowID, triggerKind string, sup supervisor.Supervisor) (terminal string) {
+func (d *Dispatcher) execute(parent context.Context, runID, slug, workflowID, triggerKind string, sup supervisor.Supervisor) (terminal string, runErr error) {
+	supervisorReturned := false
 	// Recover so a panicking workflow supervisor (or any callback) fails
 	// just this run instead of taking down the daemon/worker and every
 	// other in-flight run with it.
 	defer func() {
 		if rec := recover(); rec != nil {
-			d.Log.Error("dispatcher: run goroutine panicked; marking run failed",
+			runErr = errors.Join(runErr, fmt.Errorf("dispatcher: panic: %v", rec))
+			d.Log.Error("dispatcher: run goroutine panicked",
 				"run_id", runID, "workflow", slug, "panic", rec)
-			if d.Journal != nil {
-				_ = d.Journal.MarkRunFinished(context.Background(), runID, "failed")
+			// Supervisor.Run catches and persists its own panics. A callback can
+			// panic before Run begins, though; persist that early failure through
+			// the same owner-fenced path before exposing a terminal status.
+			if terminal == "" && !supervisorReturned && sup.Mode != "replay" {
+				unsafeLease := sup.LeaseOwner != "" && context.Cause(parent) != nil && !errors.Is(context.Cause(parent), context.Canceled)
+				if !unsafeLease {
+					durableCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+					persistedStatus, persistErr := sup.PersistOutcomeStatus(durableCtx, "failed")
+					cancel()
+					if persistErr != nil {
+						runErr = errors.Join(runErr, persistErr)
+						return
+					}
+					terminal = persistedStatus
+				}
 			}
-			terminal = "failed"
 		}
 	}()
 	// Fresh, cancellable, registered context so an operator can stop the
 	// run (exec.CommandContext kills the subprocess on cancel) and a closed
 	// HTTP connection doesn't.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Cancels.Register(runID, cancel)
-	defer d.Cancels.Deregister(runID)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(context.Canceled)
+	if d.Cancels != nil {
+		registration := d.Cancels.RegisterCause(runID, cancel)
+		defer d.Cancels.DeregisterRegistration(runID, registration)
+	}
 	if d.OnLog != nil {
 		d.OnLog(runID, fmt.Sprintf("dispatcher: spawning run_id=%s workflow=%s", runID, slug))
 	}
 	status, err := sup.Run(ctx)
-	// Operator cancellation: FinalizeCancel (not MarkRunFinished) so a
-	// schedule row the run wrote on its way to suspending is fired too.
-	if ctx.Err() == context.Canceled {
-		status = "cancelled"
-		if d.Journal != nil {
-			_ = d.Journal.FinalizeCancel(context.Background(), runID)
-		}
-	}
+	supervisorReturned = true
+	terminal, runErr = status, err
 	if err != nil {
 		line := fmt.Sprintf("dispatcher: run errored run_id=%s workflow=%s status=%s err=%v", runID, slug, status, err)
 		d.Log.Error("dispatcher: run errored", "run_id", runID, "workflow", slug, "status", status, "err", err)
@@ -607,33 +800,44 @@ func (d *Dispatcher) execute(runID, slug, workflowID, triggerKind string, sup su
 			d.OnLog(runID, line)
 		}
 	}
-	if status == "failed_dlq" && d.OnDeadLetter != nil {
-		d.OnDeadLetter(ctx, runID)
+	// An empty status means durable persistence failed or distributed
+	// execution deliberately remained recoverable. Never publish hooks or
+	// metrics before the state transition commits.
+	if status == "" {
+		return terminal, runErr
 	}
-	if d.OnTerminal != nil {
-		d.OnTerminal(ctx, TerminalEvent{
-			RunID:        runID,
-			WorkflowID:   workflowID,
-			WorkflowSlug: slug,
-			Status:       status,
-			TriggerKind:  triggerKind,
-			ErrorText:    terminalErrText(err),
-			DryRun:       sup.Mode == "dry_run",
-		})
-	}
-	if d.Counters != nil && status != "" && status != "suspended" {
-		d.Counters.IncRunsTerminal(status)
-	}
-	return status
+	d.publishTerminal(ctx, TerminalEvent{
+		RunID:        runID,
+		WorkflowID:   workflowID,
+		WorkflowSlug: slug,
+		Status:       status,
+		TriggerKind:  triggerKind,
+		ErrorText:    terminalErrText(err),
+		DryRun:       sup.Mode == "dry_run",
+	})
+	return terminal, runErr
 }
 
 // ExecuteRun is the distributed-mode worker entry point: it reconstructs a
 // claimed run from the journal (slug, binary, input), executes it through
 // the shared lifecycle, and releases the lease when it reaches terminal.
 // Synchronous -- the worker spawns goroutines + bounds its own concurrency.
-func (d *Dispatcher) ExecuteRun(ctx context.Context, runID string) error {
+func (d *Dispatcher) ExecuteRun(ctx context.Context, runID, leaseOwner string) error {
 	if d.Log == nil {
 		d.Log = slog.Default()
+	}
+	lifetime, releaseAdmission, err := d.beginAdmission(false)
+	if err != nil {
+		return err
+	}
+	defer releaseAdmission()
+	ctx, releaseOperation := bindAdmissionContext(ctx, lifetime)
+	defer releaseOperation()
+	if leaseOwner == "" {
+		return errors.New("dispatcher: execute claimed run: empty lease owner")
+	}
+	if err := d.Journal.VerifyLeaseOwner(ctx, runID, leaseOwner); err != nil {
+		return fmt.Errorf("dispatcher: execute claimed run: %w", err)
 	}
 	run, err := d.Journal.GetRun(ctx, runID)
 	if err != nil {
@@ -641,11 +845,27 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID string) error {
 	}
 	slug, err := d.Resolver.WorkflowSlugByID(ctx, run.WorkflowID)
 	if err != nil {
-		return fmt.Errorf("dispatcher: resolve workflow: %w", err)
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		// A slug lookup/query failure is operational, not proof that the
+		// persisted run/version binding is invalid. Leave the exact lease and
+		// running row recoverable for expiry/reap.
+		return fmt.Errorf("dispatcher: resolve claimed workflow: %w", err)
 	}
-	binary, err := d.BinaryPath(slug)
+	binary, err := d.resolvePinnedBinary(ctx, run, slug)
 	if err != nil {
-		return fmt.Errorf("dispatcher: binary lookup: %w", err)
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		var fence *journal.WorkflowArtifactFenceError
+		if errors.As(err, &fence) {
+			return d.failArtifactFencedRun(ctx, run, slug, leaseOwner, err)
+		}
+		// Validator database errors and node-local artifact lookup/config/hash/
+		// permission failures are transient. Only the validator's typed durable
+		// identity fence authorizes terminal failure and owned lease release.
+		return fmt.Errorf("dispatcher: validate claimed workflow artifact: %w", err)
 	}
 
 	sup := d.Sup
@@ -654,6 +874,7 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID string) error {
 	sup.WorkflowSlug = slug
 	sup.Journal = d.Journal
 	sup.Input = run.TriggerMeta
+	sup.LeaseOwner = leaseOwner
 	if sup.Log == nil {
 		sup.Log = d.Log
 	}
@@ -663,25 +884,112 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID string) error {
 	if d.OnLog != nil {
 		sup.LogSink = d.OnLog
 	}
-
-	d.inFlight.Add(1)
-	d.mu.Lock()
-	d.count++
-	d.mu.Unlock()
-	defer func() {
-		d.mu.Lock()
-		d.count--
-		d.mu.Unlock()
-		d.inFlight.Done()
-	}()
-
-	d.execute(runID, slug, run.WorkflowID, run.TriggerKind, sup)
-	// Drop the lease so the run no longer counts as in-flight for the
-	// reaper (status is already terminal via the supervisor).
-	if err := d.Journal.ReleaseLease(context.Background(), runID); err != nil {
-		d.Log.Warn("dispatcher: release lease failed", "run_id", runID, "err", err)
+	if err := admissionSafe(lifetime); err != nil {
+		return err
 	}
-	return nil
+
+	_, err = d.execute(ctx, runID, slug, run.WorkflowID, run.TriggerKind, sup)
+	return err
+}
+
+func (d *Dispatcher) resolveCurrentBinary(ctx context.Context, workflowID, slug string) (journal.WorkflowVersion, string, error) {
+	v, err := d.Journal.CurrentWorkflowVersionRecord(ctx, workflowID)
+	if err != nil {
+		return journal.WorkflowVersion{}, "", err
+	}
+	run := journal.RunInfo{
+		WorkflowID: workflowID, WorkflowVersion: v.Version, WorkflowArtifactSHA256: v.ArtifactSHA256,
+	}
+	if _, err := d.Journal.ValidateRunWorkflowArtifact(ctx, run); err != nil {
+		return journal.WorkflowVersion{}, "", err
+	}
+	if d.ArtifactPath == nil {
+		return journal.WorkflowVersion{}, "", fmt.Errorf("%w: immutable artifact lookup is not configured", journal.ErrWorkflowArtifactFence)
+	}
+	binary, err := d.ArtifactPath(slug, v.ArtifactSHA256)
+	if err != nil {
+		return journal.WorkflowVersion{}, "", fmt.Errorf("%w: immutable artifact failed verification", journal.ErrWorkflowArtifactFence)
+	}
+	return v, binary, nil
+}
+
+func (d *Dispatcher) resolvePinnedBinary(ctx context.Context, run journal.RunInfo, slug string) (string, error) {
+	if _, err := d.Journal.ValidateRunWorkflowArtifact(ctx, run); err != nil {
+		return "", err
+	}
+	if d.ArtifactPath == nil {
+		return "", errors.New("dispatcher: immutable artifact lookup is not configured")
+	}
+	binary, err := d.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	if err != nil {
+		// The journal validation above is the authority for the durable
+		// workflow/version/digest identity. Failure to read or verify the
+		// content-addressed bytes on this node is an availability/deployment
+		// problem, not proof that the durable run is invalid. The caller keeps
+		// the exact run and lease recoverable so another healthy worker (or the
+		// same worker after restoration) can execute it.
+		return "", fmt.Errorf("dispatcher: immutable artifact is unavailable: %w", err)
+	}
+	return binary, nil
+}
+
+func (d *Dispatcher) failArtifactFencedRun(ctx context.Context, run journal.RunInfo, slug, leaseOwner string, cause error) error {
+	durableCtx := context.WithoutCancel(ctx)
+	var (
+		committedStatus string
+		persistErr      error
+	)
+	if leaseOwner == "" {
+		committedStatus, persistErr = d.Journal.FailRunArtifactFenceStatus(durableCtx, run.ID)
+	} else {
+		committedStatus, persistErr = d.Journal.FailLeasedRunArtifactFenceStatus(durableCtx, run.ID, leaseOwner)
+	}
+	if persistErr != nil {
+		return errors.Join(fmt.Errorf("dispatcher: workflow artifact fence: %w", cause), persistErr)
+	}
+	d.Log.Error("dispatcher: run blocked by workflow artifact fence",
+		"run_id", run.ID, "workflow_id", run.WorkflowID, "workflow_version", run.WorkflowVersion, "err", cause)
+	d.publishTerminal(ctx, TerminalEvent{
+		RunID: run.ID, WorkflowID: run.WorkflowID, WorkflowSlug: slug,
+		Status: committedStatus, TriggerKind: run.TriggerKind, ErrorText: journal.WorkflowArtifactFenceRunLog,
+	})
+	return fmt.Errorf("dispatcher: workflow artifact fence: %w", cause)
+}
+
+const defaultDeadLetterHookTimeout = 2 * time.Minute
+
+// publishTerminal performs essential lifecycle publication before optional AI
+// postmortem work. OnTerminal deliberately survives execution-context
+// cancellation: the business state is already committed, so notifications and
+// workflow-complete chains must be emitted exactly once. OnDeadLetter instead
+// inherits the admission cancellation and a hard deadline; the concrete hook
+// performs network/DB work and must return when that context is done.
+func (d *Dispatcher) publishTerminal(ctx context.Context, event TerminalEvent) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if d.OnTerminal != nil {
+		d.OnTerminal(context.WithoutCancel(ctx), event)
+	}
+	if d.Counters != nil && event.Status != "" && event.Status != "suspended" {
+		d.Counters.IncRunsTerminal(event.Status)
+	}
+	if event.Status != "failed_dlq" || d.OnDeadLetter == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		// Shutdown/operator cancellation already won. Essential publication above
+		// is durable; do not start new optional network/DB work with a dead
+		// admission context.
+		return
+	}
+	timeout := d.DeadLetterHookTimeout
+	if timeout <= 0 {
+		timeout = defaultDeadLetterHookTimeout
+	}
+	hookCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	d.OnDeadLetter(hookCtx, event.RunID)
 }
 
 // InFlight returns the current count of dispatched supervisor
@@ -693,7 +1001,7 @@ func (d *Dispatcher) InFlight() int {
 	return d.count
 }
 
-// Drain waits for every in-flight supervisor goroutine to finish OR
+// Drain waits for every admitted dispatch/supervisor to finish OR
 // for the timeout to elapse. Returns nil on clean drain, non-nil
 // when the timer wins; the caller treats timeout as "force shutdown
 // imminent" and proceeds with parent ctx cancellation.
@@ -701,20 +1009,17 @@ func (d *Dispatcher) InFlight() int {
 // Production deploys configure this via REACTOR_DRAIN_TIMEOUT (default 30s)
 // in cmd/reactor/serve.go.
 func (d *Dispatcher) Drain(timeout time.Duration) error {
-	done := make(chan struct{})
-	go func() {
-		d.inFlight.Wait()
-		close(done)
-	}()
-	if timeout <= 0 {
-		<-done
-		return nil
-	}
-	select {
-	case <-done:
-		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("dispatcher: drain timed out after %s with %d run(s) in flight", timeout, d.InFlight())
+	started := time.Now()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if d.InFlight() == 0 {
+			return nil
+		}
+		if timeout > 0 && time.Since(started) >= timeout {
+			return fmt.Errorf("dispatcher: drain timed out after %s with %d run(s) in flight", timeout, d.InFlight())
+		}
+		<-ticker.C
 	}
 }
 

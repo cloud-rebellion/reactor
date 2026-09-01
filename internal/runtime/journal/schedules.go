@@ -28,9 +28,10 @@ type Schedule struct {
 
 // ScheduleKind values.
 const (
-	KindSleep  = "sleep"
-	KindSignal = "signal"
-	KindCron   = "cron"
+	KindSleep    = "sleep"
+	KindSignal   = "signal"
+	KindCron     = "cron"
+	KindRecovery = "recovery"
 )
 
 // ErrAlreadyFired is returned by FireSignal when the token's schedule row
@@ -220,6 +221,108 @@ func (j *Journal) ClaimSchedule(ctx context.Context, id string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n == 1, nil
+}
+
+// ClaimScheduleResume atomically claims an unfired schedule and moves its run
+// from suspended to the execution state required by the scheduler mode:
+// running for local execution, queued for distributed workers. A DB error or
+// context cancellation rolls both mutations back, so a run can never be left
+// suspended behind a fired schedule. If the run is no longer suspended (for
+// example cancellation won first), a terminal state's obsolete schedule is
+// retired but claimed=false and the terminal state is never overwritten. A
+// running/queued run is different: it can be in the crash window after the
+// schedule INSERT committed but before the supervisor persisted suspended.
+// That exact checkpoint must remain unfired so recovery can reuse it.
+func (j *Journal) ClaimScheduleResume(ctx context.Context, id string, enqueue bool) (bool, error) {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("journal: begin schedule resume claim: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Lock the schedule, its run, and workflow before deciding eligibility.
+	// Besides making competing scheduler claims single-flight, the workflow
+	// lock closes the disable-between-query-and-claim race: SetWorkflowEnabled
+	// cannot commit false immediately after FindDueSchedules and still allow
+	// this suspended run to execute.
+	if j.engine == EngineSQLite {
+		res, err := tx.ExecContext(ctx, j.bind(`UPDATE schedules SET id = id WHERE id = $1`), id)
+		if err != nil {
+			return false, fmt.Errorf("journal: lock schedule for resume: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return false, tx.Commit()
+		}
+	}
+	lockQ := `SELECT r.status, w.enabled, s.fired
+		FROM schedules s
+		JOIN runs r ON r.id = s.run_id
+		JOIN workflows w ON w.id = r.workflow_id
+		WHERE s.id = $1`
+	if j.engine == EnginePostgres {
+		lockQ += ` FOR UPDATE OF s, r, w`
+	}
+	var (
+		runStatus string
+		enabled   any
+		fired     any
+	)
+	if err := tx.QueryRowContext(ctx, j.bind(lockQ), id).Scan(&runStatus, &enabled, &fired); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, tx.Commit()
+		}
+		return false, fmt.Errorf("journal: read locked schedule resume state: %w", err)
+	}
+	if parseBool(fired) {
+		return false, tx.Commit()
+	}
+	if runStatus != "suspended" {
+		if runStatus == "running" || runStatus == "queued" {
+			// Schedule INSERT precedes the supervisor's suspended transition. Do
+			// not destroy the only continuation if a scheduler observes that small
+			// window (a delivered signal makes it due immediately). The next normal
+			// status write or orphan/lease recovery moves the run to suspended/queued
+			// and a later scheduler/worker safely consumes this exact row.
+			return false, tx.Commit()
+		}
+		// Cancellation/finalization wins and permanently retires obsolete work.
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE schedules SET fired = $1 WHERE id = $2 AND fired = $3`),
+			j.boolValue(true), id, j.boolValue(false)); err != nil {
+			return false, fmt.Errorf("journal: retire obsolete schedule: %w", err)
+		}
+		return false, tx.Commit()
+	}
+	if !parseBool(enabled) {
+		// A disabled workflow is paused, not discarded. Keep the due schedule
+		// pending so a later re-enable can resume the same suspended run.
+		return false, tx.Commit()
+	}
+
+	target := "running"
+	if enqueue {
+		target = "queued"
+	}
+	const claim = `UPDATE schedules SET fired = $1 WHERE id = $2 AND fired = $3`
+	res, err := tx.ExecContext(ctx, j.bind(claim), j.boolValue(true), id, j.boolValue(false))
+	if err != nil {
+		return false, fmt.Errorf("journal: claim schedule for resume: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, fmt.Errorf("journal: locked schedule changed before resume: %s", id)
+	}
+	const resume = `UPDATE runs SET status = $1
+		WHERE id = (SELECT run_id FROM schedules WHERE id = $2) AND status = 'suspended'`
+	res, err = tx.ExecContext(ctx, j.bind(resume), target, id)
+	if err != nil {
+		return false, fmt.Errorf("journal: transition scheduled run to %s: %w", target, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, fmt.Errorf("journal: locked scheduled run changed before resume: %s", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("journal: commit schedule resume claim: %w", err)
+	}
+	return true, nil
 }
 
 // FindLatestSleepSchedule returns the most recent sleep schedule for a
@@ -431,9 +534,12 @@ func NewSignalToken() (string, error) {
 // tenant's side the workflow has simply hung with no error anywhere.
 //
 // This mirrors fairCandidateQuery in queue.go, which already solved the same
-// problem for run admission, and adds the two tenant gates that resumption was
+// problem for run admission, and adds the admission gates that resumption was
 // bypassing entirely because it never went through CheckWorkflowEnqueueAllowed:
 //
+//   - disabled workflows are skipped. Disabling a workflow is a kill switch for
+//     both fresh dispatch and suspended continuations; its schedule remains pending
+//     and becomes due again if the workflow is re-enabled.
 //   - disabled tenants are skipped. Disabling a tenant stopped new runs while its
 //     suspended ones kept waking up and executing.
 //   - max_concurrent_runs is honoured, so a tenant cannot exceed its cap simply by
@@ -459,11 +565,18 @@ func NewSignalToken() (string, error) {
 // schedules has no tenant_id of its own; the tenant comes from the run. The join
 // is inner on purpose: a schedule whose run row is gone can never dispatch
 // successfully, and previously it was returned every tick to fail in the
-// scheduler loop.
+// scheduler loop. Only suspended runs enter the due set. A sleep/signal INSERT
+// commits before the supervisor's suspended status write, so a due row observed
+// while its run is still running/queued is a continuation checkpoint in a small
+// crash window, not permission for the scheduler to consume it. Once the status
+// commits (or local orphan recovery restores it), the same unfired row becomes
+// eligible normally.
 func (j *Journal) fairDueScheduleQuery() string {
 	falseLit := "false"
+	trueLit := "true"
 	if j.engine == EngineSQLite {
 		falseLit = "0"
+		trueLit = "1"
 	}
 	return `WITH running AS (
 		SELECT tenant_id, COUNT(*) AS n FROM runs WHERE status = 'running' GROUP BY tenant_id
@@ -474,7 +587,10 @@ func (j *Journal) fairDueScheduleQuery() string {
 			ROW_NUMBER() OVER (PARTITION BY r.tenant_id ORDER BY s.wake_at, s.id) AS rn
 		FROM schedules s
 		JOIN runs r ON r.id = s.run_id
+		JOIN workflows w ON w.id = r.workflow_id
 		WHERE s.fired = $1 AND s.wake_at IS NOT NULL AND s.wake_at <= $2
+			AND r.status = 'suspended'
+			AND w.enabled = ` + trueLit + `
 	)
 	SELECT k.id, k.run_id, k.step_name, k.kind, k.wake_at, k.signal_name,
 		k.signal_token, k.signal_payload, k.fired, k.created_at
@@ -488,9 +604,31 @@ func (j *Journal) fairDueScheduleQuery() string {
 	LIMIT $3`
 }
 
-// StartDeadLetterRetry claims a run for a dead-letter retry, moving it to
+// ErrDeadLetterNotCurrent is returned when an operator selects an older DLQ
+// item after the run has produced a newer failure. Authorizing the older item
+// could open a retry window for the wrong step.
+var ErrDeadLetterNotCurrent = errors.New("journal: dead-letter item is not the current run failure")
+
+// ErrLegacyDeadLetterIdentity is returned when a pre-0032 nullable DLQ row
+// cannot be bound to exactly one failed durable attempt. Guessing would grant a
+// fresh execution window to an unknown closure, so authorization fails closed.
+var ErrLegacyDeadLetterIdentity = errors.New("journal: legacy dead-letter identity is not unambiguous")
+
+// StartDeadLetterRetry claims the run's current dead-letter item. Retained for
+// internal callers/tests that only hold a run id; interactive paths should use
+// StartDeadLetterRetryItem so authorization is bound to the selected item.
+func (j *Journal) StartDeadLetterRetry(ctx context.Context, runID string) (bool, error) {
+	item, err := j.FindDeadLetterByRun(ctx, runID)
+	if err != nil {
+		return false, err
+	}
+	return j.StartDeadLetterRetryItem(ctx, runID, item.ID)
+}
+
+// StartDeadLetterRetryItem claims a run for a dead-letter retry, moving it to
 // "running" only when it is not already executing and was not cancelled.
-// Reports whether the claim was won.
+// The selected DLQ id must still be the run's latest item. Reports whether the
+// claim was won.
 //
 // The retry path used the unguarded SetRunStatus, so two operators clicking
 // "Retry from DLQ" on the same row (or one double-click) both flipped the run
@@ -499,12 +637,158 @@ func (j *Journal) fairDueScheduleQuery() string {
 // makes the retry single-flight, and excluding "cancelled" keeps the
 // resurrect-a-cancelled-run guard that MarkRunFinished and ResumeSuspendedRun
 // already enforce on their own paths.
-func (j *Journal) StartDeadLetterRetry(ctx context.Context, runID string) (bool, error) {
-	const q = `UPDATE runs SET status = 'running' WHERE id = $1 AND status NOT IN ('running', 'cancelled')`
-	res, err := j.db.ExecContext(ctx, j.bind(q), runID)
+func (j *Journal) StartDeadLetterRetryItem(ctx context.Context, runID, dlqID string) (bool, error) {
+	return j.startDeadLetterRetryItem(ctx, runID, dlqID, false)
+}
+
+// StartDeadLetterRetryQueuedItem is the distributed-mode form: authorization
+// is identical, but the run becomes queued so only a leased worker executes it.
+func (j *Journal) StartDeadLetterRetryQueuedItem(ctx context.Context, runID, dlqID string) (bool, error) {
+	return j.startDeadLetterRetryItem(ctx, runID, dlqID, true)
+}
+
+func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID string, enqueue bool) (bool, error) {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("journal: begin dead-letter retry: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Serialize authorization on the parent run before resolving a nullable
+	// legacy item. ClaimStepAttemptSeq uses the same lock, so the identity we
+	// promote cannot change between proof and the run-state CAS.
+	var runStatus string
+	if j.engine == EnginePostgres {
+		if err := tx.QueryRowContext(ctx, j.bind(`SELECT status FROM runs WHERE id = $1 FOR UPDATE`), runID).Scan(&runStatus); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, ErrNotFound
+			}
+			return false, fmt.Errorf("journal: lock dead-letter retry run: %w", err)
+		}
+	} else {
+		res, err := tx.ExecContext(ctx, j.bind(`UPDATE runs SET id = id WHERE id = $1`), runID)
+		if err != nil {
+			return false, fmt.Errorf("journal: lock dead-letter retry run: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return false, ErrNotFound
+		}
+		if err := tx.QueryRowContext(ctx, j.bind(`SELECT status FROM runs WHERE id = $1`), runID).Scan(&runStatus); err != nil {
+			return false, fmt.Errorf("journal: read dead-letter retry run: %w", err)
+		}
+	}
+	if runStatus != "failed_dlq" {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("journal: commit rejected dead-letter retry: %w", err)
+		}
+		return false, nil
+	}
+
+	var (
+		currentDLQID string
+		stepName     string
+		stepSeq      sql.NullInt64
+		stepAttempt  sql.NullInt64
+	)
+	currentDLQ := `SELECT id, step_name, step_seq, step_attempt FROM dead_letter
+		WHERE run_id = $1
+		ORDER BY CASE WHEN failure_order IS NULL THEN 1 ELSE 0 END, failure_order DESC, moved_at DESC, id DESC LIMIT 1`
+	if j.engine == EnginePostgres {
+		currentDLQ += ` FOR UPDATE`
+	}
+	if err := tx.QueryRowContext(ctx, j.bind(currentDLQ), runID).Scan(&currentDLQID, &stepName, &stepSeq, &stepAttempt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, fmt.Errorf("journal: find current dead-letter retry item: %w", err)
+	}
+	if currentDLQID != dlqID {
+		return false, ErrDeadLetterNotCurrent
+	}
+
+	// A manual redrive owns a fresh bounded retry window, but it keeps the same
+	// run and all prior step rows for cache replay/audit. Mark the exact latest
+	// failed attempt behind the selected/current DLQ item as the generation baseline
+	// in the SAME transaction as the single-flight run claim. A normal crash
+	// after terminal step_end cannot create this marker, so restart recovery
+	// cannot be confused with explicit operator authorization.
+	if !stepSeq.Valid || !stepAttempt.Valid {
+		// Nullable migrated items contain no execution authority. Promote only
+		// when exactly one matching failed attempt exists; zero or repeated-name
+		// matches are ambiguous and leave both the item and run untouched.
+		const legacyMatches = `SELECT seq, attempt FROM steps
+			WHERE run_id = $1 AND step_name = $2 AND status = $3
+			ORDER BY seq, attempt LIMIT 2`
+		rows, err := tx.QueryContext(ctx, j.bind(legacyMatches), runID, stepName, StatusFailed)
+		if err != nil {
+			return false, fmt.Errorf("journal: resolve legacy dead-letter identity: %w", err)
+		}
+		var matches [][2]int64
+		for rows.Next() {
+			var seq, attempt int64
+			if err := rows.Scan(&seq, &attempt); err != nil {
+				rows.Close()
+				return false, fmt.Errorf("journal: scan legacy dead-letter identity: %w", err)
+			}
+			matches = append(matches, [2]int64{seq, attempt})
+		}
+		if err := rows.Close(); err != nil {
+			return false, fmt.Errorf("journal: close legacy dead-letter identity: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return false, fmt.Errorf("journal: iterate legacy dead-letter identity: %w", err)
+		}
+		if len(matches) != 1 {
+			return false, fmt.Errorf("%w: run=%s step=%s matches=%d", ErrLegacyDeadLetterIdentity, runID, stepName, len(matches))
+		}
+		stepSeq = sql.NullInt64{Int64: matches[0][0], Valid: true}
+		stepAttempt = sql.NullInt64{Int64: matches[0][1], Valid: true}
+		const promote = `UPDATE dead_letter SET step_seq = $1, step_attempt = $2
+			WHERE id = $3 AND run_id = $4 AND (step_seq IS NULL OR step_attempt IS NULL)`
+		res, err := tx.ExecContext(ctx, j.bind(promote), stepSeq.Int64, stepAttempt.Int64, dlqID, runID)
+		if err != nil {
+			return false, fmt.Errorf("journal: promote legacy dead-letter identity: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return false, fmt.Errorf("journal: legacy dead-letter identity changed concurrently")
+		}
+	}
+
+	const authorizeExact = `UPDATE steps SET status = $1
+		WHERE run_id = $2 AND step_name = $3 AND seq = $4 AND attempt = $5 AND status = $6`
+	res, err := tx.ExecContext(ctx, j.bind(authorizeExact),
+		StatusRedrive, runID, stepName, stepSeq.Int64, stepAttempt.Int64, StatusFailed,
+	)
+	if err != nil {
+		return false, fmt.Errorf("journal: authorize exact dead-letter retry window: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, fmt.Errorf("journal: selected dead-letter attempt is no longer terminal")
+	}
+
+	// Keep started_at as the beginning of the original run lifecycle, but clear
+	// finished_at atomically: a claimed redrive is nonterminal until its new
+	// supervisor finishes. This runs only after exact authority is proven.
+	target := "running"
+	if enqueue {
+		target = "queued"
+	}
+	// An earlier cancel can race terminal DLQ persistence and leave the now
+	// operator-visible failed_dlq row flagged. This explicit redrive is fresh
+	// operator authority: clear that stale flag in the same CAS that reopens the
+	// run, otherwise the local watcher kills it immediately and the distributed
+	// queue refuses to claim it.
+	const q = `UPDATE runs SET status = $1, finished_at = NULL, cancel_requested = $2
+		WHERE id = $3 AND status = 'failed_dlq'`
+	res, err = tx.ExecContext(ctx, j.bind(q), target, j.boolValue(false), runID)
 	if err != nil {
 		return false, fmt.Errorf("journal: start dead-letter retry: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, fmt.Errorf("journal: locked dead-letter retry run changed concurrently")
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("journal: commit dead-letter retry: %w", err)
+	}
+	return true, nil
 }

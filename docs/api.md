@@ -107,7 +107,7 @@ curl -u "$YOUR_USER:$YOUR_PASSWORD" https://reactor.example.com/runs
 
 | `kind` | Required fields | What |
 |---|---|---|
-| `webhook` | `provider` | Mints token + 32-byte HMAC secret. Secret shown once via flash cookie on the redirect target. |
+| `webhook` | `provider` | Mints token + 32-byte HMAC secret. Secret shown once through the encrypted flash handoff on the redirect target. |
 | `cron` | `spec`, optional `timezone` | 5-field standard cron with optional IANA tz prefix. |
 | `chain` | `source_slug`, optional `on_statuses` (default `succeeded`) | Fires this workflow whenever `source_slug` terminates with a matching status. |
 
@@ -119,6 +119,19 @@ Trigger management:
 | POST | `/workflows/{slug}/triggers/{trigger_id}/pause` | Sets state to `disabled`. |
 | POST | `/workflows/{slug}/triggers/{trigger_id}/resume` | Sets state to `active`. |
 | POST | `/workflows/{slug}/triggers/{trigger_id}/edit` | Cron only: form `spec`, `timezone`. |
+
+Public trigger ingress is outside dashboard authentication and is protected by
+the trigger-specific HMAC capability:
+
+| Method | Path | What |
+|---|---|---|
+| POST | `/webhook/{token_id}` | Verifies the configured provider envelope and durably dispatches or deduplicates one run. `automation-v1` and `hash-v1` are always asynchronous. |
+| GET | `/webhook/{token_id}/status?delivery_id=...` | `automation-v1` only. Verifies an empty-body automation signature and returns the run state bound to that trigger and delivery. Active runs return 202; terminal runs return 200; absent or incomplete receipts return 404. Responses are `no-store`. |
+
+The status signature covers `<timestamp>.<delivery_id>.` (including the final
+dot), and the sole query value must equal `X-Webhook-Delivery`. See the
+[Hash e-signature bridge](./hash-esign-bridge.md#least-privilege-reconciliation)
+for the complete envelope and response contract.
 
 ### Credentials
 
@@ -172,7 +185,7 @@ See [Notifications](/docs/notifications) for the per-kind config shapes.
 | POST | `/login` | form: `username`, `password`, `next` | 303 + `Set-Cookie: reactor_sess=...` |
 | POST | `/logout` | - | 303 + cookie clear |
 | GET | `/tokens` | - | 200 HTML list (callers own tokens only) |
-| POST | `/tokens` | form: `name` | 303 + flash cookie carrying raw token |
+| POST | `/tokens` | form: `name` | 303 + one-time capability cookie; the raw token stays in encrypted flash storage until the redirect GET consumes it |
 | POST | `/tokens/{id}/revoke` | - | 303 |
 | GET | `/users` | - | 200 HTML, admin-only |
 | POST | `/users` | form: `username`, `password`, `role` | 303 or 422 |
@@ -189,11 +202,16 @@ When the daemon was started with `ANTHROPIC_API_KEY` set:
 |---|---|---|---|
 | POST | `/generate` | form: `brief` (plain-English description) | 303 to `/workflows/{slug}` after 15-45s, or 500 with validator output |
 
+This key-only gate applies to operator-requested code generation, not AI
+post-mortems. Failed-run diagnostic egress remains off unless
+`REACTOR_AI_POSTMORTEM_ENABLED=true` is also set; see
+[Operations](/docs/operations#ai-post-mortem-egress).
+
 ### Webhook delivery + signal callbacks (public)
 
 | Method | Path | What |
 |---|---|---|
-| POST | `/webhook/{token}` | Provider-specific HMAC verification (Stripe `Stripe-Signature`, GitHub `X-Hub-Signature-256`, generic `X-Webhook-Signature: sha256=hex`). |
+| POST | `/webhook/{token}` | Provider-specific HMAC verification for Stripe (`Stripe-Signature`), GitHub (`X-Hub-Signature-256`), generic (`X-Webhook-Signature: sha256=hex`), signed `automation-v1`, and Hash lifecycle `hash-v1`. See [Triggers](#triggers) and the [Hash bridge contract](/docs/hash-esign-bridge). |
 | POST | `/signal/{token}` | 128-bit capability token; body becomes the resumed workflow's `AwaitSignal` payload. |
 
 ### MCP transport

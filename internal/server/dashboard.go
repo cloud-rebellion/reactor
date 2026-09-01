@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,9 +84,14 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 	// member-facing while /notifications is admin-gated, so an unscoped list
 	// here handed any member the id, name and kind of every alert channel in
 	// the install (and post-tenancy, every other tenant's).
-	channelScope := ""
-	if owner, oerr := s.Journal.WorkflowTenant(ctx, wfID); oerr == nil {
-		channelScope = owner
+	channelScope, err := s.Journal.WorkflowTenant(ctx, wfID)
+	if err != nil {
+		s.errorPage(w, "resolve workflow tenant", err)
+		return
+	}
+	triggerActionQuery := ""
+	if viewerScope(r) == "" && channelScope != "" {
+		triggerActionQuery = "?tenant=" + url.QueryEscape(channelScope)
 	}
 	allChannels, _ := s.Journal.ListNotificationChannelsByTenant(ctx, channelScope)
 	downstream, _ := s.Journal.ChainTriggersDownstreamOf(ctx, wfID)
@@ -105,8 +111,11 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 			EditEnabled:                 s.CodeValidator != nil,
 			Triggers:                    triggers,
 			TriggerWritesEnabled:        triggerWritesEnabled,
+			TriggerActionQuery:          triggerActionQuery,
 			NewWebhookToken:             flash["new_webhook_token"],
 			NewWebhookSecret:            flash["new_webhook_secret"],
+			NewWebhookProvider:          flash["new_webhook_provider"],
+			NewWebhookCredentialID:      flash["new_webhook_credential_id"],
 			EstimatedMinutesSavedPerRun: wf.EstimatedMinutesSavedPerRun,
 			RateLimitPerMin:             rateLimit,
 			NotificationRoutes:          routes,
@@ -124,8 +133,11 @@ type workflowDetailData struct {
 	EditEnabled                 bool
 	Triggers                    []journal.Trigger
 	TriggerWritesEnabled        bool
+	TriggerActionQuery          string
 	NewWebhookToken             string
 	NewWebhookSecret            string
+	NewWebhookProvider          string
+	NewWebhookCredentialID      string
 	EstimatedMinutesSavedPerRun int
 	RateLimitPerMin             int
 	NotificationRoutes          []journal.NotificationRouteWithChannel
@@ -769,13 +781,13 @@ func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant
 
 	// REBUILD. Validation above compiled the source in a throwaway temp dir,
 	// which proves it builds but changes nothing the runtime executes: the
-	// supervisor execs the already-compiled binary at
-	// <State>/workflows/<slug>/workflow, and no route, watcher or dispatch path
-	// ever recompiled it. So the drawer's "Apply + rebuild" button validated,
+	// supervisor execs an artifact published by the rebuild pipeline, and no
+	// route, watcher or dispatch path recompiles source on demand. So the
+	// drawer's "Apply + rebuild" button previously validated,
 	// wrote, git-committed and returned ok:true while the OLD binary kept
 	// serving every trigger. An admin patching a vulnerable step got a green
 	// save and no fix. RegisterFromDir rebuilds even for an existing slug
-	// (SkipIfExists only skips re-inserting the journal row, not the build).
+	// (SkipIfExists reuses the workflow id and appends an artifact-bound version).
 	if s.WorkflowRegister == nil {
 		restore()
 		return http.StatusServiceUnavailable, errors.New("this build cannot recompile workflows, so the save would not change what runs; use the reactor CLI on a host with the Go toolchain")

@@ -7,6 +7,13 @@
 //	FF_TEST_AWAIT_SIGNAL=1      -> AwaitSignal("approval", 1h) between fetch and send;
 //	                                 SignalToken is recorded to FF_TEST_RECORD
 //	FF_TEST_PERMANENT_AT=send   -> wrap the send step's error with reactor.Permanent
+//	FF_TEST_FETCH_RETRY_MAX=2   -> bounded retry attempts for fetch
+//	FF_TEST_RETRY_AT=send       -> return a transient error from send
+//	FF_TEST_RETRY_MAX=3         -> bounded retry attempts for send
+//	FF_TEST_RETRY_WIRE_MAX=1    -> advertise a hostile/mismatched lower host budget
+//	FF_TEST_CRASH_SEND_CALL=2   -> os.Exit after the Nth recorded send closure
+//	FF_TEST_BLOCK_SEND=1        -> keep send alive until the host kills the child
+//	FF_TEST_SECOND_SLEEP=2h     -> sleep again after send (stale-schedule tests)
 //
 // The test compiles this once with `go build`, then exec's it multiple
 // times for each scenario.
@@ -17,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bright-interaction/reactor/sdk"
@@ -40,16 +49,57 @@ func recordCall(name string) {
 	}
 }
 
+func recordedCallCount(name string) int {
+	path := os.Getenv("FF_TEST_RECORD")
+	if path == "" {
+		return 0
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == name {
+			count++
+		}
+	}
+	return count
+}
+
 type empty struct{}
+
+// mismatchedRetryPolicy models an old/buggy/malicious wire client that asks
+// for another retry in NextDelay while advertising a smaller durable Max to
+// the host. Reactor must enforce the host-owned ceiling before closure #2.
+type mismatchedRetryPolicy struct {
+	fallback   reactor.ExpBackoff
+	advertised int
+}
+
+func (p mismatchedRetryPolicy) NextDelay(attempt int) (time.Duration, bool) {
+	return p.fallback.NextDelay(attempt)
+}
+
+func (p mismatchedRetryPolicy) MaxAttempts() int { return p.advertised }
 
 func main() {
 	runtime.Serve(Workflow, Trigger, func(ctx context.Context, flow reactor.Flow, _ empty) error {
+		var fetchRetryPolicy reactor.RetryPolicy
+		if raw := os.Getenv("FF_TEST_FETCH_RETRY_MAX"); raw != "" {
+			maxAttempts, parseErr := strconv.Atoi(raw)
+			if parseErr != nil {
+				return fmt.Errorf("FF_TEST_FETCH_RETRY_MAX: %w", parseErr)
+			}
+			fetchRetryPolicy = reactor.ExpBackoff{Max: maxAttempts, Base: time.Millisecond, Cap: time.Millisecond}
+		}
 		// Step 1: fetch. Always increments the record file. If FF_TEST_FAIL_AT=fetch
 		// AND this is the first run (record file has 1 line after this call),
 		// crash before sending step_end so the journal has a started-but-not-ended
 		// row. The supervisor closes its end on EOF; we never reach the second step.
 		_, err := reactor.Step(flow, ctx, "fetch", reactor.StepOpts{
 			IdempotencyKey: "k",
+			RetryPolicy:    fetchRetryPolicy,
 		}, func(ctx context.Context) (string, error) {
 			recordCall("fetch")
 			if os.Getenv("FF_TEST_FAIL_AT") == "fetch" {
@@ -102,17 +152,68 @@ func main() {
 
 		// Step 2: send. Should NOT be recorded twice across runs because step 1
 		// is replayed from the journal; only the not-yet-succeeded steps execute.
+		var retryPolicy reactor.RetryPolicy
+		if os.Getenv("FF_TEST_RETRY_AT") == "send" {
+			maxAttempts := 3
+			if raw := os.Getenv("FF_TEST_RETRY_MAX"); raw != "" {
+				parsed, parseErr := strconv.Atoi(raw)
+				if parseErr != nil {
+					return fmt.Errorf("FF_TEST_RETRY_MAX: %w", parseErr)
+				}
+				maxAttempts = parsed
+			}
+			retryPolicy = reactor.ExpBackoff{Max: maxAttempts, Base: time.Millisecond, Cap: time.Millisecond}
+			if raw := os.Getenv("FF_TEST_RETRY_WIRE_MAX"); raw != "" {
+				advertised, parseErr := strconv.Atoi(raw)
+				if parseErr != nil {
+					return fmt.Errorf("FF_TEST_RETRY_WIRE_MAX: %w", parseErr)
+				}
+				retryPolicy = mismatchedRetryPolicy{
+					fallback:   reactor.ExpBackoff{Max: maxAttempts, Base: time.Millisecond, Cap: time.Millisecond},
+					advertised: advertised,
+				}
+			}
+		}
 		_, err = reactor.Step(flow, ctx, "send", reactor.StepOpts{
 			IdempotencyKey: "k",
+			RetryPolicy:    retryPolicy,
 		}, func(ctx context.Context) (string, error) {
 			recordCall("send")
+			if os.Getenv("FF_TEST_BLOCK_SEND") == "1" {
+				for {
+					time.Sleep(time.Second)
+				}
+			}
+			if raw := os.Getenv("FF_TEST_CRASH_SEND_CALL"); raw != "" {
+				crashAt, parseErr := strconv.Atoi(raw)
+				if parseErr != nil {
+					return "", reactor.Permanent(fmt.Errorf("FF_TEST_CRASH_SEND_CALL: %w", parseErr))
+				}
+				if recordedCallCount("send") == crashAt {
+					os.Exit(8)
+				}
+			}
 			if os.Getenv("FF_TEST_PERMANENT_AT") == "send" {
 				return "", reactor.Permanent(errors.New("smtp permanent error"))
+			}
+			if os.Getenv("FF_TEST_RETRY_AT") == "send" {
+				return "", errors.New("smtp transient error")
 			}
 			return "sent", nil
 		})
 		if err != nil {
 			return err
+		}
+
+		if raw := os.Getenv("FF_TEST_SECOND_SLEEP"); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil {
+				return fmt.Errorf("FF_TEST_SECOND_SLEEP: %w", err)
+			}
+			recordCall("sleep2")
+			if err := flow.Sleep(ctx, "wait-two", d); err != nil {
+				return err
+			}
 		}
 
 		if os.Getenv("FF_TEST_FAIL_AFTER_SEND") == "1" {

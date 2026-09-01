@@ -87,6 +87,14 @@ type StepStart struct {
 	InputHash      string `json:"input_hash,omitempty"`
 	Attempt        int    `json:"attempt"`
 
+	// DurableAttempts opts a rebuilt workflow into host-owned attempt
+	// allocation. MaxAttempts is the total budget including the first call;
+	// zero means the custom RetryPolicy did not expose a durable bound. These
+	// fields are additive so old wire.v1 hosts ignore them and old workflow
+	// binaries retain their legacy client-owned numbering.
+	DurableAttempts bool `json:"durable_attempts,omitempty"`
+	MaxAttempts     int  `json:"max_attempts,omitempty"`
+
 	// Seq is the 1-based per-run CALL ORDINAL: the count of Step calls this
 	// workflow has made, in program order. It is what makes a loop durable.
 	// Without it the replay key was (run_id, step_name), so a Step reused
@@ -105,6 +113,15 @@ type StepStart struct {
 type StepReply struct {
 	Replay bool            `json:"replay"`
 	Output json.RawMessage `json:"output,omitempty"` // present when Replay=true
+
+	// Attempt is the host-assigned durable attempt number. Zero means the host
+	// predates durable attempt allocation and the SDK falls back to its local
+	// number. BudgetAttempt is relative to the current automatic/manual-redrive
+	// window, while Attempt remains globally monotonic for the journal primary
+	// key. RetryExhausted tells the SDK not to invoke the closure.
+	Attempt        int  `json:"attempt,omitempty"`
+	BudgetAttempt  int  `json:"budget_attempt,omitempty"`
+	RetryExhausted bool `json:"retry_exhausted,omitempty"`
 }
 
 // StepEnd carries the result of a step the workflow actually executed.
@@ -113,6 +130,9 @@ type StepReply struct {
 type StepEnd struct {
 	StepName string `json:"step_name"`
 	Attempt  int    `json:"attempt"`
+	// DurableAttempts lets a new host persist Retryable outcomes as an
+	// explicit continuation checkpoint without changing legacy step rows.
+	DurableAttempts bool `json:"durable_attempts,omitempty"`
 	// Seq must match the StepStart that opened this step, so the host updates
 	// the right journal row. Keyed on name alone, a loop's third iteration
 	// overwrote the first iteration's row. Zero = pre-ordinal SDK.

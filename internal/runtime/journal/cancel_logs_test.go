@@ -58,6 +58,20 @@ func TestRequestRunCancelOutcomes(t *testing.T) {
 		t.Fatalf("cancelled run's schedule should be fired, got %d due", len(due))
 	}
 
+	// Queued run -> cancelled before any worker can claim it.
+	if err := j.CreateQueuedRun(ctx, "run_queued", "wf_c", "webhook", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := j.RequestRunCancel(ctx, "run_queued"); err != nil || out != CancelDone {
+		t.Fatalf("queued cancel = %q, %v; want cancelled", out, err)
+	}
+	if info, _ := j.GetRun(ctx, "run_queued"); info.Status != "cancelled" || info.FinishedAt.IsZero() {
+		t.Fatalf("queued run cancellation not durable: %+v", info)
+	}
+	if claims, err := j.ClaimQueuedRuns(ctx, "worker", 10, time.Minute); err != nil || len(claims) != 0 {
+		t.Fatalf("cancelled queued run was claimable: %v, %v", claims, err)
+	}
+
 	// Terminal run -> nothing to do.
 	seedRun(t, j, "run_done", "running")
 	if err := j.MarkRunFinished(ctx, "run_done", "succeeded"); err != nil {

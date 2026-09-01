@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -34,6 +35,8 @@ func buildTestWorkflow(t *testing.T) string {
 	return out
 }
 
+const supervisorTestArtifactSHA256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 func newTestSupervisorEnv(t *testing.T, runID string) (*Supervisor, *journal.Journal, func()) {
 	t.Helper()
 	dir := t.TempDir()
@@ -49,10 +52,10 @@ func newTestSupervisorEnv(t *testing.T, runID string) (*Supervisor, *journal.Jou
 		t.Fatalf("open: %v", err)
 	}
 	j := journal.New(db, journal.EngineSQLite)
-	if err := j.CreateWorkflow(context.Background(), "wf_test", "test-replay", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
+	if err := j.CreateWorkflowWithArtifact(context.Background(), "wf_test", "test-replay", "h", "0.1.0", supervisorTestArtifactSHA256, json.RawMessage(`{}`)); err != nil {
 		t.Fatalf("create wf: %v", err)
 	}
-	if err := j.CreateRun(context.Background(), runID, "wf_test", "manual", json.RawMessage(`{}`)); err != nil {
+	if err := j.CreateRunPinned(context.Background(), runID, "wf_test", "manual", json.RawMessage(`{}`), 1, supervisorTestArtifactSHA256); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 
@@ -92,6 +95,84 @@ func newTestSupervisorEnv(t *testing.T, runID string) (*Supervisor, *journal.Jou
 		ACLPermissive: true,
 	}
 	return sup, j, func() { db.Close() }
+}
+
+func TestSupervisorStartFailurePersistsTerminal(t *testing.T) {
+	sup, j, cleanup := newTestSupervisorEnv(t, "run_start_failure")
+	defer cleanup()
+	sup.BinaryPath = filepath.Join(t.TempDir(), "missing-workflow")
+	status, err := sup.Run(context.Background())
+	if err == nil || status != "failed" {
+		t.Fatalf("start failure = status %q err %v; want durable failed + error", status, err)
+	}
+	if run, getErr := j.GetRun(context.Background(), "run_start_failure"); getErr != nil || run.Status != "failed" || run.FinishedAt.IsZero() {
+		t.Fatalf("start failure state = %+v, %v", run, getErr)
+	}
+}
+
+func TestDistributedSupervisorStartFailureFinalizesOwnedLease(t *testing.T) {
+	sup, j, cleanup := newTestSupervisorEnv(t, "run_owned_start_failure")
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.SetRunStatus(ctx, "run_owned_start_failure", "queued"); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := j.ClaimQueuedRuns(ctx, "worker", 1, time.Minute)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim = %v, %v", claims, err)
+	}
+	sup.BinaryPath = filepath.Join(t.TempDir(), "missing-workflow")
+	sup.LeaseOwner = claims[0].Owner
+	status, err := sup.Run(ctx)
+	if err == nil || status != "failed" {
+		t.Fatalf("owned start failure = status %q err %v", status, err)
+	}
+	if run, getErr := j.GetRun(ctx, "run_owned_start_failure"); getErr != nil || run.Status != "failed" || run.FinishedAt.IsZero() {
+		t.Fatalf("owned start failure state = %+v, %v", run, getErr)
+	}
+	if err := j.ExtendLease(ctx, "run_owned_start_failure", claims[0].Owner, time.Minute); !errors.Is(err, journal.ErrLeaseOwnershipLost) {
+		t.Fatalf("owned terminal retained lease: %v", err)
+	}
+}
+
+func TestDistributedChildCrashLeavesDurableStepRecoverableForReaper(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	recordPath := filepath.Join(t.TempDir(), "calls.txt")
+	sup, j, cleanup := newTestSupervisorEnv(t, "run_owned_crash")
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := j.SetRunStatus(ctx, "run_owned_crash", "queued"); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := j.ClaimQueuedRuns(ctx, "worker", 1, time.Minute)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim = %v, %v", claims, err)
+	}
+	sup.BinaryPath = binary
+	sup.LeaseOwner = claims[0].Owner
+	sup.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_RETRY_AT", "send",
+		"FF_TEST_RETRY_MAX", "3",
+		"FF_TEST_CRASH_SEND_CALL", "2",
+	)
+	status, err := sup.Run(ctx)
+	if status != "" || !errors.Is(err, ErrRunRecoverable) {
+		t.Fatalf("owned child crash = status %q err %v; want recoverable/no terminal", status, err)
+	}
+	if run, getErr := j.GetRun(ctx, "run_owned_crash"); getErr != nil || run.Status != "running" || !run.FinishedAt.IsZero() {
+		t.Fatalf("recoverable crash state = %+v, %v", run, getErr)
+	}
+	if err := j.ExtendLease(ctx, "run_owned_crash", claims[0].Owner, -time.Hour); err != nil {
+		t.Fatalf("recoverable crash lost lease prematurely: %v", err)
+	}
+	if n, err := j.ReapExpiredLeases(ctx); err != nil || n != 1 {
+		t.Fatalf("recoverable crash reap = %d, %v", n, err)
+	}
+	if run, _ := j.GetRun(ctx, "run_owned_crash"); run.Status != "queued" {
+		t.Fatalf("recoverable crash was not requeued: %+v", run)
+	}
 }
 
 type testWriter struct{ t *testing.T }
@@ -164,7 +245,8 @@ func TestSupervisorHappyPath(t *testing.T) {
 // TestSupervisorReplayAfterCrash is the durable-execution proof: the
 // workflow os.Exit(7)s during the fetch step (the SDK does NOT send
 // step_end before the crash because os.Exit bypasses defers). The supervisor
-// observes EOF and marks the run failed. We then re-run with the same
+// observes EOF and parks the run behind a local recovery schedule. We then
+// claim that recovery and re-run with the same
 // run_id; the second supervisor reads the journal: fetch is "running" not
 // "succeeded", so it re-executes (and fetch records a SECOND line). After
 // the second run completes both steps, calls.txt contains:
@@ -190,20 +272,25 @@ func TestSupervisorReplayAfterCrash(t *testing.T) {
 	sup1.BinaryPath = binary
 
 	// First run: crash inside fetch.
-	sup1.ExtraEnv = ffTestEnv("FF_TEST_RECORD", recordPath, "FF_TEST_FAIL_AT", "fetch")
+	sup1.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_FAIL_AT", "fetch",
+		"FF_TEST_FETCH_RETRY_MAX", "2",
+	)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	status1, _ := sup1.Run(ctx)
-	if status1 != "failed" {
-		t.Fatalf("first run status = %s, want failed", status1)
+	if status1 != "suspended" {
+		t.Fatalf("first run status = %s, want suspended recovery", status1)
 	}
 
 	// Calls so far: only "fetch" (the closure ran, then os.Exit(7)).
 	verifyRecord(t, recordPath, []string{"fetch"})
 
 	// Second run: restart, this time without the crash flag.
+	resumeLocalRecoveryRun(t, j, "run_replay")
 	sup2 := *sup1 // share Journal + Vault
-	sup2.ExtraEnv = ffTestEnv("FF_TEST_RECORD", recordPath)
+	sup2.ExtraEnv = ffTestEnv("FF_TEST_RECORD", recordPath, "FF_TEST_FETCH_RETRY_MAX", "2")
 	status2, err := sup2.Run(ctx)
 	if err != nil {
 		t.Fatalf("second run: %v", err)
@@ -222,6 +309,139 @@ func TestSupervisorReplayAfterCrash(t *testing.T) {
 	if _, err := j.FindCachedOutput(context.Background(), "run_replay", "send", "k"); err != nil {
 		t.Fatalf("send cache after restart: %v", err)
 	}
+	if attempts, err := j.AttemptCountSeq(context.Background(), "run_replay", "fetch", 1); err != nil || attempts != 2 {
+		t.Fatalf("fetch attempts after crash/restart = %d, %v; want 2", attempts, err)
+	}
+}
+
+// TestSupervisorRetryBudgetSurvivesLeaseReapAndRestart proves the local
+// crash-recovery path end to end. Attempts 2 and 3 die after step_start; each
+// crash is parked behind a synthetic schedule and a fresh workflow subprocess
+// starts its local counter at one. The journal must nevertheless allocate
+// absolute attempts 2 and 3, then refuse closure call 4 because Max=3 was
+// consumed.
+func TestSupervisorRetryBudgetSurvivesLeaseReapAndRestart(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	recordPath := filepath.Join(t.TempDir(), "calls.txt")
+
+	sup1, j, closeDB := newTestSupervisorEnv(t, "run_retry_reap")
+	defer closeDB()
+	sup1.BinaryPath = binary
+	sup1.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_RETRY_AT", "send",
+		"FF_TEST_RETRY_MAX", "3",
+		"FF_TEST_CRASH_SEND_CALL", "2",
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	status, _ := sup1.Run(ctx)
+	if status != "suspended" {
+		t.Fatalf("first crashed worker status = %s, want suspended recovery", status)
+	}
+	verifyRecord(t, recordPath, []string{"fetch", "send", "send"})
+	resumeLocalRecoveryRun(t, j, "run_retry_reap")
+
+	sup2 := *sup1
+	sup2.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_RETRY_AT", "send",
+		"FF_TEST_RETRY_MAX", "3",
+		"FF_TEST_CRASH_SEND_CALL", "3",
+	)
+	status, _ = sup2.Run(ctx)
+	if status != "suspended" {
+		t.Fatalf("second crashed worker status = %s, want suspended recovery", status)
+	}
+	verifyRecord(t, recordPath, []string{"fetch", "send", "send", "send"})
+	resumeLocalRecoveryRun(t, j, "run_retry_reap")
+
+	sup3 := *sup1
+	sup3.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_RETRY_AT", "send",
+		"FF_TEST_RETRY_MAX", "3",
+	)
+	status, err := sup3.Run(ctx)
+	if err != nil {
+		t.Fatalf("exhausted restart: %v", err)
+	}
+	if status != "failed_dlq" {
+		t.Fatalf("exhausted restart status = %s, want failed_dlq", status)
+	}
+	// The third restart received RetryExhausted before the closure. A fourth
+	// send line would prove the worker-local Max budget had reset.
+	verifyRecord(t, recordPath, []string{"fetch", "send", "send", "send"})
+
+	if attempts, err := j.AttemptCountSeq(ctx, "run_retry_reap", "send", 2); err != nil || attempts != 3 {
+		t.Fatalf("durable send attempts = %d, %v; want 3", attempts, err)
+	}
+	latest, err := j.LatestStepAttemptSeq(ctx, "run_retry_reap", "send", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Attempt != 3 || latest.Status != journal.StatusFailed || !strings.Contains(latest.ErrorText, "retry budget exhausted") {
+		t.Fatalf("latest durable attempt = %+v, want failed attempt 3", latest)
+	}
+	items, err := j.ListDeadLetterItems(ctx, 10, 0)
+	if err != nil || len(items) != 1 || items[0].StepName != "send" {
+		t.Fatalf("exhausted DLQ = %+v, %v; want one send item", items, err)
+	}
+}
+
+func TestSupervisorHostBudgetOverridesRetryableHint(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	recordPath := filepath.Join(t.TempDir(), "calls.txt")
+	sup, j, closeDB := newTestSupervisorEnv(t, "run_host_budget")
+	defer closeDB()
+	sup.BinaryPath = binary
+	sup.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_RETRY_AT", "send",
+		"FF_TEST_RETRY_MAX", "2",
+		"FF_TEST_RETRY_WIRE_MAX", "1",
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	status, err := sup.Run(ctx)
+	if err != nil {
+		t.Fatalf("mismatched retry run: %v", err)
+	}
+	if status != "failed_dlq" {
+		t.Fatalf("mismatched retry status = %q, want failed_dlq", status)
+	}
+	// NextDelay requested closure #2, but the host's durable Max=1 must win.
+	verifyRecord(t, recordPath, []string{"fetch", "send"})
+	state, err := j.LatestStepAttemptSeq(ctx, "run_host_budget", "send", 2)
+	if err != nil || state.Attempt != 1 || state.Status != journal.StatusFailed || !strings.Contains(state.ErrorText, "retry budget exhausted") {
+		t.Fatalf("host-budget terminal state = %+v, %v", state, err)
+	}
+	items, err := j.ListDeadLetterItems(ctx, 10, 0)
+	if err != nil || len(items) != 1 || items[0].StepAttempt == nil || *items[0].StepAttempt != 1 {
+		t.Fatalf("host-budget DLQ = %+v, %v", items, err)
+	}
+}
+
+func resumeLocalRecoveryRun(t *testing.T, j *journal.Journal, runID string) {
+	t.Helper()
+	ctx := context.Background()
+	due, err := j.FindDueSchedules(ctx, time.Now().Add(time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, schedule := range due {
+		if schedule.RunID != runID || schedule.Kind != journal.KindRecovery {
+			continue
+		}
+		claimed, err := j.ClaimScheduleResume(ctx, schedule.ID, false)
+		if err != nil || !claimed {
+			t.Fatalf("claim local recovery = %v, %v", claimed, err)
+		}
+		return
+	}
+	t.Fatalf("no pending local recovery schedule for %s", runID)
 }
 
 // TestSupervisorLongSleepSuspendAndResume is the week-4 proof: a workflow
@@ -271,7 +491,7 @@ func TestSupervisorLongSleepSuspendAndResume(t *testing.T) {
 		Vault:              sup.Vault,
 		Log:                sup.Log,
 		Now:                func() time.Time { return advanced },
-		BinaryPath:         func(_ string) (string, error) { return binary, nil },
+		ArtifactPath:       func(_, _ string) (string, error) { return binary, nil },
 		TickInterval:       time.Hour, // doesn't matter; we call Tick directly
 		Batch:              10,
 		SupervisorTemplate: resumed,
@@ -294,6 +514,68 @@ func TestSupervisorLongSleepSuspendAndResume(t *testing.T) {
 	}
 	if _, err := j.FindCachedOutput(ctx, "run_long_sleep", "send", "k"); err != nil {
 		t.Fatalf("send not cached: %v", err)
+	}
+}
+
+func TestStartupRecoveryReusesCommittedWaitWithoutWakingLaterSleep(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	recordPath := filepath.Join(t.TempDir(), "calls.txt")
+	sup, j, closeDB := newTestSupervisorEnv(t, "run_wait_crash_window")
+	defer closeDB()
+	sup.BinaryPath = binary
+	sup.SuspendThreshold = 100 * time.Millisecond
+	sup.ExtraEnv = ffTestEnv(
+		"FF_TEST_RECORD", recordPath,
+		"FF_TEST_SLEEP", "1h",
+		"FF_TEST_SECOND_SLEEP", "2h",
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	status, err := sup.Run(ctx)
+	if err != nil || status != "suspended" {
+		t.Fatalf("seed first durable wait = %q, %v", status, err)
+	}
+	verifyRecord(t, recordPath, []string{"fetch", "sleep"})
+
+	// Model a hard stop after ScheduleSleep committed but before the run's
+	// suspended status did. Startup recovery must reuse that exact wait rather
+	// than adding a synthetic row that could wake wait-two later.
+	if err := j.SetRunStatus(ctx, sup.RunID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := j.ReapOrphanedRuns(ctx); err != nil || n != 1 {
+		t.Fatalf("startup wait classification = %d, %v", n, err)
+	}
+	advanced := time.Now().Add(90 * time.Minute)
+	resumed := *sup
+	resumed.Now = func() time.Time { return advanced }
+	sched := &Scheduler{
+		Journal:            j,
+		Vault:              sup.Vault,
+		Log:                sup.Log,
+		Now:                func() time.Time { return advanced },
+		ArtifactPath:       func(string, string) (string, error) { return binary, nil },
+		SupervisorTemplate: resumed,
+		Batch:              10,
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	verifyRecord(t, recordPath, []string{"fetch", "sleep", "sleep", "send", "sleep2"})
+	if run, err := j.GetRun(ctx, sup.RunID); err != nil || run.Status != "suspended" {
+		t.Fatalf("second wait state = %+v, %v", run, err)
+	}
+	first, err := j.FindScheduleBySeq(ctx, sup.RunID, 2, journal.KindSleep)
+	if err != nil || !first.Fired {
+		t.Fatalf("first wait not retired = %+v, %v", first, err)
+	}
+	second, err := j.FindScheduleBySeq(ctx, sup.RunID, 4, journal.KindSleep)
+	if err != nil || second.Fired || second.StepName != "wait-two" {
+		t.Fatalf("second wait checkpoint = %+v, %v", second, err)
+	}
+	due, err := j.FindDueSchedules(ctx, time.Now().Add(4*time.Hour), 10)
+	if err != nil || len(due) != 1 || due[0].ID != second.ID || due[0].Kind != journal.KindSleep {
+		t.Fatalf("stale recovery can wake later wait = %+v, %v", due, err)
 	}
 }
 
@@ -342,6 +624,119 @@ func TestSupervisorReplayUsesCacheOnSecondRun(t *testing.T) {
 	out, err := j.FindCachedOutput(context.Background(), "run_cached", "fetch", "k")
 	if err != nil || !strings.Contains(string(out), "fetched-customer") {
 		t.Fatalf("fetch cache stale: out=%s err=%v", out, err)
+	}
+}
+
+func TestStartupRecoveryReplaysCommittedHashResultToSuccess(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	recordPath := filepath.Join(t.TempDir(), "calls.txt")
+	sup, j, closeDB := newTestSupervisorEnv(t, "run_hash_committed_restart")
+	defer closeDB()
+	sup.BinaryPath = binary
+	sup.ExtraEnv = ffTestEnv("FF_TEST_RECORD", recordPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if status, err := sup.Run(ctx); err != nil || status != "succeeded" {
+		t.Fatalf("seed committed Hash result = %q, %v", status, err)
+	}
+	verifyRecord(t, recordPath, []string{"fetch", "send"})
+
+	// Simulate daemon death after both StepEnd/cache commits but before durable
+	// terminal status. The startup classifier sees a running orphan and the
+	// scheduler must replay cached values, not send the document again.
+	if err := j.SetRunStatus(ctx, sup.RunID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := j.ReapOrphanedRuns(ctx); err != nil || n != 1 {
+		t.Fatalf("startup committed-result classification = %d, %v", n, err)
+	}
+	sched := &Scheduler{
+		Journal:            j,
+		Vault:              sup.Vault,
+		Log:                sup.Log,
+		Now:                time.Now,
+		ArtifactPath:       func(string, string) (string, error) { return binary, nil },
+		SupervisorTemplate: *sup,
+		Batch:              10,
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	verifyRecord(t, recordPath, []string{"fetch", "send"})
+	if run, err := j.GetRun(ctx, sup.RunID); err != nil || run.Status != "succeeded" || run.FinishedAt.IsZero() {
+		t.Fatalf("startup committed-result recovery = %+v, %v", run, err)
+	}
+}
+
+func TestReplaySuccessDoesNotMutateHistoricalRun(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	sup, j, closeDB := newTestSupervisorEnv(t, "run_readonly_replay")
+	defer closeDB()
+	sup.BinaryPath = binary
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	status, err := sup.Run(ctx)
+	if err != nil || status != "succeeded" {
+		t.Fatalf("seed run = %s, %v", status, err)
+	}
+	before, err := j.GetRun(ctx, "run_readonly_replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAttempts, err := j.AttemptCountSeq(ctx, "run_readonly_replay", "fetch", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replay := *sup
+	replay.Mode = "replay"
+	status, err = replay.Run(ctx)
+	if err != nil || status != "succeeded" {
+		t.Fatalf("replay = %s, %v", status, err)
+	}
+	after, err := j.GetRun(ctx, "run_readonly_replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterAttempts, _ := j.AttemptCountSeq(ctx, "run_readonly_replay", "fetch", 1)
+	if after.Status != before.Status || !after.FinishedAt.Equal(before.FinishedAt) || afterAttempts != beforeAttempts {
+		t.Fatalf("successful replay mutated history: before=%+v/%d after=%+v/%d", before, beforeAttempts, after, afterAttempts)
+	}
+}
+
+func TestReplayDivergenceDoesNotMutateHistoricalRun(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	sup, j, closeDB := newTestSupervisorEnv(t, "run_readonly_divergence")
+	defer closeDB()
+	sup.BinaryPath = binary
+	sup.ExtraEnv = ffTestEnv("FF_TEST_FAIL_AT", "fetch", "FF_TEST_FETCH_RETRY_MAX", "2")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if status, _ := sup.Run(ctx); status != "suspended" {
+		t.Fatalf("seed crash status = %s, want suspended recovery", status)
+	}
+	before, err := j.GetRun(ctx, "run_readonly_divergence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAttempts, err := j.AttemptCountSeq(ctx, "run_readonly_divergence", "fetch", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replay := *sup
+	replay.Mode = "replay"
+	replay.ExtraEnv = nil
+	if _, err := replay.Run(ctx); !errors.Is(err, ErrReplayDivergence) {
+		t.Fatalf("replay divergence = %v, want ErrReplayDivergence", err)
+	}
+	after, err := j.GetRun(ctx, "run_readonly_divergence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterAttempts, _ := j.AttemptCountSeq(ctx, "run_readonly_divergence", "fetch", 1)
+	if after.Status != before.Status || !after.FinishedAt.Equal(before.FinishedAt) || afterAttempts != beforeAttempts {
+		t.Fatalf("divergent replay mutated history: before=%+v/%d after=%+v/%d", before, beforeAttempts, after, afterAttempts)
 	}
 }
 
@@ -417,7 +812,7 @@ func TestSupervisorAwaitSignalSuspendAndResume(t *testing.T) {
 		Journal:            j,
 		Vault:              sup.Vault,
 		Log:                sup.Log,
-		BinaryPath:         func(_ string) (string, error) { return binary, nil },
+		ArtifactPath:       func(_, _ string) (string, error) { return binary, nil },
 		TickInterval:       time.Hour,
 		Batch:              10,
 		SupervisorTemplate: resumed,

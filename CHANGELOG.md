@@ -281,9 +281,11 @@ docker-compose.yml, systemd unit, GitHub Actions for test + release).
 - **Workflow version history.** New `workflow_versions` table (migration
   0008). `CreateWorkflow` writes a version-1 row on initial register;
   `RecordWorkflowVersion` appends on each subsequent re-register.
-  `runs.workflow_version` column pins each dispatched run to the
-  current version, so the audit trail tells the truth even after the
-  workflow re-registers with new code. `ListWorkflowVersions` +
+  Migration 0031 binds each version and run to an immutable, full SHA-256
+  content-addressed executable; queue, resume, MCP dispatch, and DLQ redrive
+  resolve those exact verified bytes instead of the mutable current path.
+  `runs.workflow_version` plus `workflow_artifact_sha256` keep both execution
+  and the audit trail truthful after re-registration. `ListWorkflowVersions` +
   `CurrentWorkflowVersion` for dashboard / MCP surfaces.
 - **Streamable HTTP MCP transport.** New `POST /mcp` route on the
   dashboard server, gated behind the existing BasicAuth + RateLimit

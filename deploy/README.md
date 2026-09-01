@@ -1,9 +1,18 @@
 # Deploying Reactor
 
-Two paths covered: a Docker image (recommended for fresh installs) and
-a systemd unit (recommended for an existing Linux host).
+This page is a single-node installation walkthrough. Its Docker, Compose, and
+systemd examples use SQLite and are suitable for development or a local
+evaluation. They are **not** a production recipe for the Hash e-signature
+bridge, which requires an estate-owned PostgreSQL distributed topology with at
+least one `serve` process and one `worker` process. See
+[`docs/scaling.md`](../docs/scaling.md) for the runtime topology and
+[`docs/hash-esign-bridge.md`](../docs/hash-esign-bridge.md) for the bridge
+cutover gates. Reactor does not currently ship a turnkey production Compose
+manifest for that topology.
 
 ## Docker
+
+The commands in this section demonstrate a local, single-node SQLite install.
 
 ```bash
 # Single-arch (host CPU):
@@ -54,6 +63,9 @@ docker run -d --name reactor \
 
 ## systemd
 
+The unit below is likewise a single-node example. Do not use it as the only
+process for a production Hash bridge.
+
 ```bash
 # 1. Install the binary.
 sudo install -m 0755 bin/reactor /usr/local/bin/reactor
@@ -103,11 +115,18 @@ distribution your proxy passes in `X-Forwarded-For`.
 
 ## Backups
 
-The state dir is the entire backup target:
+For the SQLite example, take a quiesced copy of the state directory. For a
+PostgreSQL deployment, the state directory is **not** the entire backup target:
+take a database-native consistent backup/PITR stream as well as a protected copy
+of Reactor's state and release artifacts.
 
 - `master.key` (mode 0600). Without this no credentials can be decrypted.
-- `reactor.db` (sqlite) or your Postgres dump.
-- `workflows/` (built workflow binaries; can be rebuilt from source).
+- `reactor.db` for SQLite, or a separately verified PostgreSQL backup.
+- `workflows/`, their reviewed source/DAG, release identity, and checksums. Do
+  not assume a later rebuild is byte-for-byte or behaviorally identical.
 
-A nightly `tar -czf reactor-$(date +%F).tar.gz /var/lib/reactor`
-plus offsite copy is enough for v1.
+A state-directory archive alone is not sufficient for distributed production.
+Store the database recovery point, matching master key, workflow artifacts, and
+configuration as one documented recovery generation in separate protected
+storage. Restore it into isolation and prove that the vault decrypts and a
+pinned workflow can resume before accepting the backup or a release cutover.

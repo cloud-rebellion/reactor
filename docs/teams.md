@@ -55,7 +55,12 @@ Storing the **hash** of the cookie value (not the raw value) means a database sn
 | expires_at | timestamp NULL | optional |
 | revoked | bool | row stays so audit trail of "this token did X" survives |
 
-The raw token is shown to the user **exactly once** at mint time via the flash store.
+The raw token is shown to the user **exactly once** at mint time via the flash
+store. In normal deployments the short-lived payload is AES-GCM encrypted in
+the shared journal so a POST and its redirect GET may land on different
+replicas. The database holds only ciphertext and a digest; the random HttpOnly,
+SameSite=Strict cookie contains the one-time decryption capability. Set
+`REACTOR_SECURE_COOKIES=1` behind HTTPS termination.
 
 ## Password hashing
 
@@ -119,7 +124,10 @@ POST /tokens
 form: name=ci-deploy
 ```
 
-Returns `303 See Other` + a flash cookie. The next GET `/tokens` renders the raw token in a callout exactly once:
+Returns `303 See Other` + a one-time flash capability cookie. The cookie never
+contains the raw API token. The next GET `/tokens` atomically consumes and
+decrypts the shared flash row, then renders the raw token in a callout exactly
+once:
 
 ```text
 Token minted. Copy it now; it will not be shown again. Use it as:

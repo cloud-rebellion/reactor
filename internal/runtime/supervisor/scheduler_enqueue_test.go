@@ -25,7 +25,7 @@ func TestSchedulerEnqueueResume(t *testing.T) {
 	sched := &Scheduler{
 		Journal:      j,
 		Now:          time.Now,
-		BinaryPath:   func(string) (string, error) { return "", nil }, // unused on the enqueue path
+		ArtifactPath: func(string, string) (string, error) { return "/verified/artifact", nil },
 		Enqueue:      true,
 		Batch:        10,
 		TickInterval: time.Hour,

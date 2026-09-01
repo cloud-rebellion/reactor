@@ -427,13 +427,20 @@ func (s *Server) tokensCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	raw, _, err := s.Auth.MintAPIToken(r.Context(), me.ID, name, 0)
+	raw, tokenID, err := s.Auth.MintAPIToken(r.Context(), me.ID, name, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := s.flash.put(w, r, map[string]string{"new_token": raw}); err != nil {
-		s.errorPage(w, "flash put", err)
+		// A token whose raw value was never delivered cannot be used or
+		// recovered. Revoke it with a short context detached from a client
+		// cancellation so a flash-store outage does not leave an invisible
+		// active credential behind.
+		rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		rollbackErr := s.Auth.RevokeAPIToken(rollbackCtx, tokenID, me.ID)
+		cancel()
+		s.errorPage(w, "flash put", withRollbackError(err, rollbackErr))
 		return
 	}
 	http.Redirect(w, r, "/tokens", http.StatusSeeOther)

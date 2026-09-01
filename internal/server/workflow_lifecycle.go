@@ -288,12 +288,25 @@ func (s *Server) setTriggerState(w http.ResponseWriter, r *http.Request, state s
 	if !ok {
 		return
 	}
+	wfID, err := s.workflowIDForViewer(r, slug)
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+			return
+		}
+		s.errorPage(w, "lookup workflow", err)
+		return
+	}
 	triggerID := chi.URLParam(r, "trigger_id")
-	if err := s.Journal.SetTriggerState(r.Context(), triggerID, state); err != nil {
+	if err := s.Journal.SetTriggerStateForWorkflow(r.Context(), triggerID, wfID, state); err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "trigger not found", http.StatusNotFound)
+			return
+		}
 		s.errorPage(w, "set trigger state", err)
 		return
 	}
-	http.Redirect(w, r, "/workflows/"+slug, http.StatusSeeOther)
+	http.Redirect(w, r, workflowHrefFromRequest(r, slug), http.StatusSeeOther)
 }
 
 // triggerEditCron handles POST /workflows/{slug}/triggers/{trigger_id}/edit
@@ -302,6 +315,15 @@ func (s *Server) setTriggerState(w http.ResponseWriter, r *http.Request, state s
 func (s *Server) triggerEditCron(w http.ResponseWriter, r *http.Request) {
 	slug, ok := slugFromRequest(w, r)
 	if !ok {
+		return
+	}
+	wfID, err := s.workflowIDForViewer(r, slug)
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+			return
+		}
+		s.errorPage(w, "lookup workflow", err)
 		return
 	}
 	triggerID := chi.URLParam(r, "trigger_id")
@@ -320,11 +342,15 @@ func (s *Server) triggerEditCron(w http.ResponseWriter, r *http.Request) {
 		cfgMap["timezone"] = timezone
 	}
 	cfg, _ := json.Marshal(cfgMap)
-	if err := s.Journal.UpdateTriggerConfig(r.Context(), triggerID, cfg); err != nil {
+	if err := s.Journal.UpdateCronTriggerConfigForWorkflow(r.Context(), triggerID, wfID, cfg); err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "cron trigger not found", http.StatusNotFound)
+			return
+		}
 		s.errorPage(w, "update trigger config", err)
 		return
 	}
-	http.Redirect(w, r, "/workflows/"+slug, http.StatusSeeOther)
+	http.Redirect(w, r, workflowHrefFromRequest(r, slug), http.StatusSeeOther)
 }
 
 // credentialUpdateValue handles POST /credentials/{id}/value with a

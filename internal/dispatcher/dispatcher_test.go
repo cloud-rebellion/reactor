@@ -41,6 +41,15 @@ type fakeResolver struct {
 	idByslug map[string]string
 }
 
+const testArtifactSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func createExecutableWorkflow(t *testing.T, j *journal.Journal, id, slug string) {
+	t.Helper()
+	if err := j.CreateWorkflowWithArtifact(context.Background(), id, slug, "h", "0.1.0", testArtifactSHA256, json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (f *fakeResolver) WorkflowBySlug(_ context.Context, slug string) (string, error) {
 	id, ok := f.idByslug[slug]
 	if !ok {
@@ -67,7 +76,7 @@ func TestDispatcherUnknownWorkflow(t *testing.T) {
 	d := &Dispatcher{
 		Journal:  j,
 		Resolver: &fakeResolver{idByslug: map[string]string{}},
-		BinaryPath: func(_ string) (string, error) {
+		ArtifactPath: func(_, _ string) (string, error) {
 			return "/never/used", nil
 		},
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -83,21 +92,52 @@ func TestDispatcherUnknownWorkflow(t *testing.T) {
 func TestDispatcherBinaryMiss(t *testing.T) {
 	t.Parallel()
 	j := newJournal(t)
-	if err := j.CreateWorkflow(context.Background(), "wf_demo", "demo", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	createExecutableWorkflow(t, j, "wf_demo", "demo")
 	d := &Dispatcher{
 		Journal:  j,
 		Resolver: &fakeResolver{idByslug: map[string]string{"demo": "wf_demo"}},
-		BinaryPath: func(_ string) (string, error) {
+		ArtifactPath: func(_, _ string) (string, error) {
 			return "", errors.New("no such workflow binary")
 		},
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	trig := journal.Trigger{ID: "trg_x", WorkflowID: "wf_demo", Kind: journal.TriggerWebhook}
 	if err := d.Dispatch(context.Background(), trig, []byte(`{}`)); err == nil ||
-		!strings.Contains(err.Error(), "binary lookup") {
-		t.Fatalf("got %v, want binary lookup error", err)
+		!strings.Contains(err.Error(), "artifact") {
+		t.Fatalf("got %v, want immutable artifact error", err)
+	}
+}
+
+func TestDispatchWebhookDisabledReturnsErrorWithoutRun(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j := newJournal(t)
+	createExecutableWorkflow(t, j, "wf_paused", "paused")
+	if err := j.SetWorkflowEnabled(ctx, "wf_paused", false); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Journal: j,
+		Resolver: &fakeResolver{idByslug: map[string]string{
+			"paused": "wf_paused",
+		}},
+		ArtifactPath: func(_, _ string) (string, error) {
+			t.Fatal("disabled webhook must stop before binary lookup")
+			return "", nil
+		},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	runID, err := d.DispatchWebhook(ctx,
+		journal.Trigger{WorkflowID: "wf_paused", Kind: journal.TriggerWebhook}, []byte(`{}`))
+	if !errors.Is(err, ErrWorkflowDisabled) || runID != "" {
+		t.Fatalf("disabled webhook = run %q err %v, want empty/ErrWorkflowDisabled", runID, err)
+	}
+	runs, listErr := j.ListRecentRuns(ctx, 10)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("disabled webhook created %d run(s)", len(runs))
 	}
 }
 
@@ -108,21 +148,19 @@ func TestDispatchTestForcesLocal(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	j := newJournal(t)
-	if err := j.CreateWorkflow(ctx, "wf_demo", "demo", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	createExecutableWorkflow(t, j, "wf_demo", "demo")
 	d := &Dispatcher{
-		Journal:    j,
-		Resolver:   &SQLResolver{Journal: j},
-		BinaryPath: func(_ string) (string, error) { return "", errors.New("no such workflow binary") },
-		Sup:        supervisor.Supervisor{Vault: noopVault{}},
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Enqueue:    true, // distributed mode...
+		Journal:      j,
+		Resolver:     &SQLResolver{Journal: j},
+		ArtifactPath: func(_, _ string) (string, error) { return "", errors.New("no such workflow binary") },
+		Sup:          supervisor.Supervisor{Vault: noopVault{}},
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Enqueue:      true, // distributed mode...
 	}
 	trig := journal.Trigger{WorkflowID: "wf_demo", Kind: journal.TriggerManual}
 	// ...but a dry run takes the in-process path, so it hits binary lookup.
-	if _, err := d.DispatchTest(ctx, trig, []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "binary lookup") {
-		t.Fatalf("dry run should take the local path (binary lookup), got %v", err)
+	if _, err := d.DispatchTest(ctx, trig, []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "artifact") {
+		t.Fatalf("dry run should resolve an immutable local artifact, got %v", err)
 	}
 	if n, _ := j.CountQueued(ctx); n != 0 {
 		t.Fatalf("dry run must not enqueue, CountQueued = %d", n)
@@ -133,9 +171,7 @@ func TestDispatchTestForcesLocal(t *testing.T) {
 func TestSQLResolverRoundTrip(t *testing.T) {
 	t.Parallel()
 	j := newJournal(t)
-	if err := j.CreateWorkflow(context.Background(), "wf_demo", "demo", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	createExecutableWorkflow(t, j, "wf_demo", "demo")
 	r := &SQLResolver{Journal: j}
 	id, err := r.WorkflowBySlug(context.Background(), "demo")
 	if err != nil || id != "wf_demo" {
@@ -156,13 +192,11 @@ func TestSQLResolverRoundTrip(t *testing.T) {
 func TestDispatcherCreatesRunBeforeSpawn(t *testing.T) {
 	t.Parallel()
 	j := newJournal(t)
-	if err := j.CreateWorkflow(context.Background(), "wf_demo", "demo", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
+	createExecutableWorkflow(t, j, "wf_demo", "demo")
 	d := &Dispatcher{
 		Journal:  j,
 		Resolver: &SQLResolver{Journal: j},
-		BinaryPath: func(_ string) (string, error) {
+		ArtifactPath: func(_, _ string) (string, error) {
 			// Real path that won't exist; supervisor will fail to spawn,
 			// but Dispatch returns nil because CreateRun + goroutine
 			// kickoff already happened.
@@ -196,15 +230,13 @@ func TestDispatcherEnqueueMode(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	j := newJournal(t)
-	if err := j.CreateWorkflow(ctx, "wf_demo", "demo", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
-	}
-	binaryCalled := false
+	createExecutableWorkflow(t, j, "wf_demo", "demo")
+	artifactResolved := false
 	d := &Dispatcher{
 		Journal:  j,
 		Resolver: &SQLResolver{Journal: j},
-		BinaryPath: func(_ string) (string, error) {
-			binaryCalled = true // would only happen on the execute path
+		ArtifactPath: func(_, _ string) (string, error) {
+			artifactResolved = true // verification happens before the queue row is accepted
 			return "/nonexistent", nil
 		},
 		Sup:     supervisor.Supervisor{Vault: noopVault{}},
@@ -215,8 +247,8 @@ func TestDispatcherEnqueueMode(t *testing.T) {
 	if err := d.Dispatch(ctx, trig, []byte(`{"k":"v"}`)); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
-	if binaryCalled {
-		t.Fatal("enqueue mode must not resolve a binary / execute in-process")
+	if !artifactResolved {
+		t.Fatal("enqueue mode must verify its immutable artifact before accepting the run")
 	}
 	if n, _ := j.CountQueued(ctx); n != 1 {
 		t.Fatalf("CountQueued = %d, want 1", n)
@@ -226,22 +258,25 @@ func TestDispatcherEnqueueMode(t *testing.T) {
 	if err != nil || len(ids) != 1 {
 		t.Fatalf("claim = %v, %v", ids, err)
 	}
-	run, _ := j.GetRun(ctx, ids[0])
+	run, _ := j.GetRun(ctx, ids[0].RunID)
+	if run.WorkflowVersion != 1 || run.WorkflowArtifactSHA256 != testArtifactSHA256 {
+		t.Fatalf("execution pins = version %d artifact %q", run.WorkflowVersion, run.WorkflowArtifactSHA256)
+	}
 	if string(run.TriggerMeta) != `{"k":"v"}` {
 		t.Fatalf("trigger_meta = %s, want the payload", run.TriggerMeta)
 	}
 }
 
-// TestDispatcherDrainBlocksUntilWaitGroupClears proves the new drain
-// path: a single fake supervisor goroutine that lingers makes Drain
-// time out, then completes promptly when the goroutine returns.
+// TestDispatcherDrainBlocksUntilInFlight proves the drain path: a single
+// admitted operation that lingers makes Drain time out, then completes
+// promptly when the operation returns.
 func TestDispatcherDrainBlocksUntilInFlight(t *testing.T) {
 	t.Parallel()
 	d := &Dispatcher{}
-	d.inFlight.Add(1)
-	d.mu.Lock()
-	d.count = 1
-	d.mu.Unlock()
+	_, release, err := d.beginAdmission(false)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got := d.InFlight(); got != 1 {
 		t.Fatalf("InFlight = %d, want 1", got)
@@ -253,10 +288,7 @@ func TestDispatcherDrainBlocksUntilInFlight(t *testing.T) {
 	}
 
 	// Release the goroutine and Drain should return cleanly.
-	d.mu.Lock()
-	d.count = 0
-	d.mu.Unlock()
-	d.inFlight.Done()
+	release()
 	if err := d.Drain(time.Second); err != nil {
 		t.Fatalf("expected clean drain after release, got %v", err)
 	}

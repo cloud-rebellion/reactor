@@ -31,7 +31,8 @@ func TestHandleSleepAcksOnStaleSchedule(t *testing.T) {
 	// Pre-seed the schedule the way a previous suspend would have:
 	// wake_at one hour in the past, step name matching the frame below.
 	pastWake := time.Now().Add(-time.Hour)
-	if _, err := j.ScheduleSleep(context.Background(), "run_stale_sleep", "wait-a", pastWake); err != nil {
+	scheduleID, err := j.ScheduleSleep(context.Background(), "run_stale_sleep", "wait-a", pastWake)
+	if err != nil {
 		t.Fatalf("seed schedule: %v", err)
 	}
 
@@ -72,6 +73,63 @@ func TestHandleSleepAcksOnStaleSchedule(t *testing.T) {
 	}
 	if got.Kind != wire.KindAck {
 		t.Fatalf("reply kind = %v; want %v (KindAck)", got.Kind, wire.KindAck)
+	}
+	schedule, err := j.FindLatestSleepSchedule(context.Background(), "run_stale_sleep", "wait-a")
+	if err != nil || schedule.ID != scheduleID || !schedule.Fired {
+		t.Fatalf("consumed sleep schedule = %+v, %v", schedule, err)
+	}
+	if due, err := j.FindDueSchedules(context.Background(), time.Now().Add(time.Hour), 10); err != nil || len(due) != 0 {
+		t.Fatalf("consumed sleep remained due = %+v, %v", due, err)
+	}
+}
+
+func TestHandleAwaitSignalRetiresDeliveredAndExpiredSchedules(t *testing.T) {
+	for _, delivered := range []bool{true, false} {
+		name := "expired"
+		if delivered {
+			name = "delivered"
+		}
+		t.Run(name, func(t *testing.T) {
+			sup, j, closeDB := newTestSupervisorEnv(t, "run_signal_retire_"+name)
+			defer closeDB()
+			ctx := context.Background()
+			expires := time.Now().Add(-time.Minute)
+			if delivered {
+				expires = time.Now().Add(time.Hour)
+			}
+			scheduleID, err := j.ScheduleSignal(ctx, sup.RunID, "approval-step", "approval", "token", expires)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if delivered {
+				if _, _, err := j.FireSignal(ctx, "token", []byte(`{"approved":true}`)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sup.Now = time.Now
+			var out bytes.Buffer
+			d := &dispatcher{sup: sup, enc: wire.NewEncoder(&out), dec: wire.NewDecoder(emptyReader{}), writeMu: &sync.Mutex{}}
+			frame, err := wire.Wrap(1, 0, wire.KindAwaitSignal, wire.AwaitSignal{
+				StepName: "approval-step", SignalName: "approval", TimeoutMs: int64(time.Hour / time.Millisecond),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.handleAwaitSignal(ctx, frame); err != nil {
+				t.Fatal(err)
+			}
+			reply, err := wire.NewDecoder(&out).Decode()
+			if err != nil || reply.Kind != wire.KindSignalDeliver {
+				t.Fatalf("signal reply = %+v, %v", reply, err)
+			}
+			schedule, err := j.FindLatestSignalSchedule(ctx, sup.RunID, "approval-step")
+			if err != nil || schedule.ID != scheduleID || !schedule.Fired {
+				t.Fatalf("consumed signal schedule = %+v, %v", schedule, err)
+			}
+			if due, err := j.FindDueSchedules(ctx, time.Now().Add(2*time.Hour), 10); err != nil || len(due) != 0 {
+				t.Fatalf("consumed signal remained due = %+v, %v", due, err)
+			}
+		})
 	}
 }
 

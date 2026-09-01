@@ -42,7 +42,7 @@ type captureDispatcher struct {
 	lastPay []byte
 }
 
-func (c *captureDispatcher) Dispatch(_ context.Context, t journal.Trigger, payload []byte) error {
+func (c *captureDispatcher) DispatchTerminalChain(_ context.Context, t journal.Trigger, payload []byte) error {
 	c.calls.Add(1)
 	c.lastT = t
 	c.lastPay = append([]byte(nil), payload...)

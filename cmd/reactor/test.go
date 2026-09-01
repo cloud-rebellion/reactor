@@ -71,7 +71,7 @@ func cmdTest(ctx context.Context, log *slog.Logger, args []string) error {
 	}
 	defer jClose()
 
-	wfID, err := j.WorkflowIDBySlug(ctx, slug)
+	wfID, err := defaultTenantWorkflowID(ctx, j, slug)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
 			return fmt.Errorf("test: workflow %q not registered", slug)
@@ -103,10 +103,11 @@ func cmdTest(ctx context.Context, log *slog.Logger, args []string) error {
 	defer vaultCloser()
 
 	reg := registry.New(filepath.Join(*root, "workflows"))
-	binaryPath, err := reg.BinaryPath(slug)
+	candidate, err := reg.BuildArtifact(slug)
 	if err != nil {
-		return fmt.Errorf("test: binary lookup: %w (run `reactor workflow build` first)", err)
+		return fmt.Errorf("test: immutable build candidate lookup: %w (run `reactor workflow build` first)", err)
 	}
+	binaryPath := candidate.Path
 
 	// Read the run's original input so the replay subprocess sees the
 	// same payload the original run did. Without this the workflow

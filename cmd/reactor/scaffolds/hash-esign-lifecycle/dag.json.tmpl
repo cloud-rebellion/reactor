@@ -1,0 +1,14 @@
+{
+  "slug": "{{.Slug}}",
+  "version": "1.0.0",
+  "triggers": [{"kind": "webhook", "provider": "hash-v1"}],
+  "steps": [
+    {
+      "name": "brightcrm-lifecycle-writeback",
+      "kind": "step",
+      "idempotency_key": "reactor.namespaced(event.event_id)",
+      "timeout_seconds": 20,
+      "retry": {"base_ms": 5000, "max_ms": 300000, "attempts": 12}
+    }
+  ]
+}

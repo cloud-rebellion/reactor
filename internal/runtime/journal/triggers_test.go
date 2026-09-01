@@ -2,8 +2,10 @@ package journal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestCreateAndFindWebhookTrigger(t *testing.T) {
@@ -29,6 +31,63 @@ func TestCreateAndFindWebhookTrigger(t *testing.T) {
 	}
 	if string(got.Config) != `{"event":"invoice.paid"}` {
 		t.Fatalf("config = %s", got.Config)
+	}
+}
+
+func TestCreateWebhookTriggerInheritsWorkflowTenant(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := j.CreateWorkflowInTenant(ctx, "wf_acme", "tenant-webhook", "hash", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatalf("create tenant workflow: %v", err)
+	}
+	tokenID, err := NewTokenID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CreateWebhookTrigger(ctx, "wf_acme", tokenID, "cred_acme", "automation-v1", nil); err != nil {
+		t.Fatalf("create webhook trigger: %v", err)
+	}
+	got, err := j.FindWebhookByToken(ctx, tokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TenantID != "acme" {
+		t.Fatalf("trigger tenant = %q, want acme", got.TenantID)
+	}
+}
+
+func TestCreateWebhookTriggerUnknownWorkflowReturnsNotFound(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+
+	_, err := j.CreateWebhookTrigger(context.Background(), "wf_missing", "whk_missing", "cred", "generic", nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestCreateCronTriggerInheritsWorkflowTenant(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_cron_acme", "tenant-cron", "hash", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := j.CreateCronTrigger(ctx, "wf_cron_acme", []byte(`{"spec":"0 9 * * *"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	triggers, err := j.ListTriggersForWorkflow(ctx, "wf_cron_acme")
+	if err != nil || len(triggers) != 1 {
+		t.Fatalf("triggers = %+v, %v", triggers, err)
+	}
+	if triggers[0].ID != id || triggers[0].TenantID != "acme" {
+		t.Fatalf("trigger = %+v, want id %q in acme", triggers[0], id)
 	}
 }
 
@@ -68,6 +127,121 @@ func TestRecordWebhookDeliveryDeduplicates(t *testing.T) {
 	}
 	if !third {
 		t.Fatal("different provider should record as new")
+	}
+}
+
+func TestWebhookDeliveryLeaseLifecycle(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	const (
+		triggerID = "trg_lease"
+		provider  = "generic"
+		delivery  = "evt_lease"
+		digest    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+
+	first, err := j.ClaimWebhookDelivery(ctx, triggerID, provider, delivery, digest, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State != WebhookDeliveryClaimed || first.ClaimToken == "" {
+		t.Fatalf("first claim = %+v, want owned lease", first)
+	}
+
+	active, err := j.ClaimWebhookDelivery(ctx, triggerID, provider, delivery, digest, now.Add(30*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.State != WebhookDeliveryInProgress || !active.LeaseExpiresAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("active duplicate = %+v, want in-progress until %s", active, now.Add(time.Minute))
+	}
+
+	mismatch, err := j.ClaimWebhookDelivery(ctx, triggerID, provider, delivery, "different", now.Add(30*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mismatch.State != WebhookDeliveryPayloadMismatch {
+		t.Fatalf("payload mismatch = %+v", mismatch)
+	}
+
+	reclaimed, err := j.ClaimWebhookDelivery(ctx, triggerID, provider, delivery, digest, now.Add(61*time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed.State != WebhookDeliveryClaimed || reclaimed.ClaimToken == first.ClaimToken {
+		t.Fatalf("expired lease was not independently reclaimed: first=%+v reclaimed=%+v", first, reclaimed)
+	}
+
+	if err := j.CompleteWebhookDelivery(ctx, triggerID, provider, delivery, first.ClaimToken, "run_stale", now.Add(62*time.Second)); !errors.Is(err, ErrWebhookDeliveryClaimLost) {
+		t.Fatalf("stale owner completion = %v, want ErrWebhookDeliveryClaimLost", err)
+	}
+	if err := j.ReleaseWebhookDelivery(ctx, triggerID, provider, delivery, first.ClaimToken); !errors.Is(err, ErrWebhookDeliveryClaimLost) {
+		t.Fatalf("stale owner release = %v, want ErrWebhookDeliveryClaimLost", err)
+	}
+
+	if err := j.CompleteWebhookDelivery(ctx, triggerID, provider, delivery, reclaimed.ClaimToken, "run_42", now.Add(62*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := j.ClaimWebhookDelivery(ctx, triggerID, provider, delivery, digest, now.Add(3*time.Minute), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != WebhookDeliveryCompleted || completed.RunID != "run_42" {
+		t.Fatalf("completed replay = %+v, want run_42", completed)
+	}
+}
+
+func TestWebhookDeliveryReleaseAllowsImmediateRetry(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+
+	first, err := j.ClaimWebhookDelivery(ctx, "trg_release", "generic", "evt_release", "digest", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ReleaseWebhookDelivery(ctx, "trg_release", "generic", "evt_release", first.ClaimToken); err != nil {
+		t.Fatal(err)
+	}
+	second, err := j.ClaimWebhookDelivery(ctx, "trg_release", "generic", "evt_release", "digest", now.Add(time.Second), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State != WebhookDeliveryClaimed || second.ClaimToken == first.ClaimToken {
+		t.Fatalf("retry after release = %+v", second)
+	}
+}
+
+func TestWebhookLegacyCompletedReceiptAcceptsUnknownDigest(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+
+	// Migration 0028 uses an empty digest for pre-existing receipts because
+	// their original bodies are unavailable. They must remain completed dedup
+	// successes rather than turning every historical provider retry into 409.
+	const q = `INSERT INTO webhook_deliveries
+		(trigger_id, provider, delivery_id, received_at, payload_sha256, claim_token, completed_at)
+		VALUES ($1, $2, $3, $4, '', '', $5)`
+	if _, err := j.db.ExecContext(ctx, j.bind(q), "trg_legacy", "generic", "evt_legacy",
+		j.formatTime(now), j.formatTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := j.ClaimWebhookDelivery(ctx, "trg_legacy", "generic", "evt_legacy",
+		"newly-computed-digest", now.Add(time.Minute), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.State != WebhookDeliveryCompleted {
+		t.Fatalf("legacy receipt = %+v, want completed", claim)
 	}
 }
 

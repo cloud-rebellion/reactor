@@ -38,9 +38,9 @@ demo: build
 	$(BINARY) init --root $(DEMO_ROOT)
 	$(BINARY) migrate --db $(DEMO_DB)
 	$(BINARY) workflow build --src examples/cron-echo --slug cron-echo --root $(DEMO_ROOT)
-	$(BINARY) workflow register --db $(DEMO_DB) --slug cron-echo --src examples/cron-echo/main.go
+	$(BINARY) workflow register --db $(DEMO_DB) --slug cron-echo --src examples/cron-echo/main.go --root $(DEMO_ROOT)
 	$(BINARY) workflow build --src examples/welcome-customer --slug welcome-customer --root $(DEMO_ROOT)
-	$(BINARY) workflow register --db $(DEMO_DB) --slug welcome-customer --src examples/welcome-customer/main.go
+	$(BINARY) workflow register --db $(DEMO_DB) --slug welcome-customer --src examples/welcome-customer/main.go --root $(DEMO_ROOT)
 	$(BINARY) vault add --db $(DEMO_DB) --root $(DEMO_ROOT) \
 		--name crm-api-key --service crm --provider shared-secret \
 		--auto-rotate --interval-days 30 --value demo-crm-key-$(shell date +%s)

@@ -85,6 +85,14 @@ When `ANTHROPIC_API_KEY` is set the page also shows a **codegen prompt bar**: ty
 | DAG | (read-only) | Cytoscape visualisation of `dag.json`. |
 | Code + DAG editor | `POST /workflows/{slug}/{code,dag}` | Save runs the validator chain; failure renders 422 with the validator's message. |
 
+Webhook creation reveals the generated HMAC key and its non-secret backing
+credential ID only in the single-use, no-store result after creation. The
+credential ID links directly to its **Manual update** form. For `hash-v1`, Hash
+creates the authoritative endpoint secret: register the Reactor URL in Hash,
+capture Hash's one-time 64-byte ASCII-hex value, and replace the temporary
+Reactor value through that link before sending a test event. Secrets never
+belong in URLs, workflow source, or logs.
+
 ## Notifications (`/notifications`)
 
 `/notifications` lists channels + add form. Three kinds:
@@ -109,7 +117,12 @@ Aggregated credential audit log across every credential, newest first, capped at
 
 ## Tokens (`/tokens`)
 
-Each signed-in user sees their own API tokens. Mint by name; the raw token is shown exactly once on the post-mint redirect (uses the flash store, HttpOnly cookie keyed). `POST /tokens/{id}/revoke` marks the row revoked; the row stays so the audit trail of "this token did X" survives.
+Each signed-in user sees their own API tokens. Mint by name; the raw token is
+shown exactly once on the post-mint redirect. The shared flash row is encrypted,
+atomically consumed, and decryptable only with the short-lived HttpOnly cookie,
+so the redirect works across replicas without placing the token in the cookie
+or database plaintext. `POST /tokens/{id}/revoke` marks the row revoked; the row
+stays so the audit trail of "this token did X" survives.
 
 See [`Teams, users, sessions, API tokens`](/docs/teams) for the full RBAC model.
 

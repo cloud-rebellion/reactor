@@ -42,11 +42,24 @@ the same lens + validator + retry chain.
 7. **Atomic rename.** On success, mv tempdir into
    `<workflows-dir>/<slug>/`. Committer (default `GitCommitter`) stages
    + commits with `feat(workflow): <slug> v<version>`.
-8. **Auto build + register** (dashboard path only). After codegen
-   returns, the server runs `go build` into
-   `<root>/workflows/<slug>/workflow` and inserts the workflows row +
-   the version-1 row in workflow_versions. The operator's redirect
-   lands on `/workflows/<slug>` with a built + registered workflow.
+8. **Auto build + register** (dashboard path only). After codegen returns, the
+   server builds to a private stage, publishes the exact executable under its
+   SHA-256 content address, and atomically records that digest on version 1 (or
+   appends the next version for an existing slug). The mutable
+   exact digest is also recorded as the split-build candidate. The
+   `<root>/workflows/<slug>/workflow` compatibility copy is activated only after
+   the immutable artifact and database version exist, while holding the
+   workflow-version row lock and only if that version is still current. A
+   delayed older registration therefore cannot overwrite a newer activation.
+   The operator's redirect lands on `/workflows/<slug>` with a built +
+   registered workflow.
+
+For the split CLI path, `reactor workflow build` prints the published digest
+and atomically updates `<slug>/candidate.sha256`; `workflow register` consumes
+that reference by default. If two people or CI jobs may build the same slug at
+the same time, copy the digest printed by your build into
+`workflow register --artifact-sha256 <digest>` so the session cannot select the
+other build's newer candidate pointer.
 
 ## What the lens injects
 

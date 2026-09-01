@@ -70,7 +70,7 @@ func handleRunTerminal(
 // chainDispatcher is the surface fireChainedWorkflows needs from the
 // dispatcher; defined here so the helper can be tested with a stub.
 type chainDispatcher interface {
-	Dispatch(ctx context.Context, t journal.Trigger, payload []byte) error
+	DispatchTerminalChain(ctx context.Context, t journal.Trigger, payload []byte) error
 }
 
 // chainLookup is the subset of *journal.Journal fireChainedWorkflows
@@ -147,7 +147,7 @@ func fireChainedWorkflows(ctx context.Context, log *slog.Logger, j chainLookup, 
 	}
 	for _, t := range triggers {
 		t := t
-		if err := disp.Dispatch(ctx, t, payload); err != nil {
+		if err := disp.DispatchTerminalChain(ctx, t, payload); err != nil {
 			log.Warn("serve: chain dispatch failed",
 				"err", err,
 				"source_run_id", ev.RunID,

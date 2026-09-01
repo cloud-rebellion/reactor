@@ -33,10 +33,13 @@ type Scheduler struct {
 	Vault   VaultReader
 	Log     *slog.Logger
 
-	// BinaryPath is the workflow binary the supervisor exec's. In v0
-	// every workflow shares one binary path; multi-workflow indexing
-	// (per-slug binary lookup) lands week 6 with the codegen pipeline.
+	// BinaryPath is retained for compatibility/status wiring. Resumed runs must
+	// execute ArtifactPath using the digest pinned on their original run.
 	BinaryPath func(workflowSlug string) (string, error)
+
+	// ArtifactPath resolves the immutable executable pinned on the run. Resume
+	// paths must never fall through to BinaryPath's mutable current pointer.
+	ArtifactPath func(workflowSlug, artifactSHA256 string) (string, error)
 
 	// Now overrides the clock for tests. Defaults to time.Now.
 	Now func() time.Time
@@ -72,8 +75,11 @@ type Scheduler struct {
 	// itself. Default false keeps single-node resume in-process.
 	Enqueue bool
 
-	once sync.Once
-	stop chan struct{}
+	once    sync.Once
+	stop    chan struct{}
+	mu      sync.Mutex
+	count   int
+	stopped bool
 }
 
 // TerminalInfo is the payload OnTerminal receives when a resumed run
@@ -119,9 +125,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 // Stop signals Run to return. Idempotent.
 func (s *Scheduler) Stop() {
 	s.once.Do(func() {
-		if s.stop != nil {
-			close(s.stop)
+		s.mu.Lock()
+		s.stopped = true
+		if s.stop == nil {
+			s.stop = make(chan struct{})
 		}
+		close(s.stop)
+		s.mu.Unlock()
 	})
 }
 
@@ -134,6 +144,9 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 		return err
 	}
 	for _, sched := range due {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := s.dispatch(ctx, sched); err != nil {
 			s.Log.Error("scheduler dispatch failed",
 				"schedule_id", sched.ID, "run_id", sched.RunID, "err", err)
@@ -149,6 +162,15 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 // already in the schedules row; sleep: wake_at past) immediately acks
 // and lets the workflow proceed.
 func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error {
+	if err := s.beginDispatch(ctx); err != nil {
+		return err
+	}
+	defer func() {
+		s.mu.Lock()
+		s.count--
+		s.mu.Unlock()
+	}()
+
 	// The schedules row only carries run_id, so resolve the run to find
 	// its workflow (for the binary lookup + secret ACL) and its original
 	// trigger input (so the resumed process decodes the same Input the
@@ -158,6 +180,37 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 	if err != nil {
 		return fmt.Errorf("scheduler: get run %s: %w", sched.RunID, err)
 	}
+	slug, slugErr := s.Journal.WorkflowSlugByID(ctx, run.WorkflowID)
+	if slugErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Lookup failures are not proof that the pinned identity is invalid. Keep
+		// the schedule pending for the next tick (or startup) rather than turning
+		// a transient database error into a durable business failure.
+		return fmt.Errorf("scheduler: resolve workflow slug: %w", slugErr)
+	}
+	if _, err := s.Journal.ValidateRunWorkflowArtifact(ctx, run); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		var fence *journal.WorkflowArtifactFenceError
+		if errors.As(err, &fence) {
+			return s.failArtifactFencedSchedule(ctx, sched, run, slug, false, err)
+		}
+		// Only the typed validator result proves a permanent version/digest
+		// mismatch. Operational query errors retain the unfired schedule.
+		return fmt.Errorf("scheduler: validate workflow artifact: %w", err)
+	}
+	if s.ArtifactPath == nil {
+		return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
+			fmt.Errorf("%w: immutable artifact lookup is not configured", journal.ErrWorkflowArtifactFence))
+	}
+	binary, err := s.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	if err != nil {
+		return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
+			fmt.Errorf("%w: immutable artifact failed verification", journal.ErrWorkflowArtifactFence))
+	}
 
 	// Distributed mode: don't resume in-process. Claim the schedule (CAS)
 	// and re-enqueue the run so a worker picks it up. The worker's
@@ -165,61 +218,26 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 	// (FindLatestSleepSchedule still finds it; only FindDueSchedules
 	// filters fired) acks the past-due sleep/signal and resumes.
 	if s.Enqueue {
-		claimed, err := s.Journal.ClaimSchedule(ctx, sched.ID)
+		claimed, err := s.Journal.ClaimScheduleResume(ctx, sched.ID, true)
 		if err != nil {
 			return err
 		}
 		if !claimed {
 			return nil
 		}
-		if err := s.Journal.SetRunStatus(ctx, sched.RunID, "queued"); err != nil {
-			return err
-		}
 		s.Log.Info("scheduler: re-enqueued resumed run for a worker",
 			"run_id", sched.RunID, "step", sched.StepName, "kind", sched.Kind)
 		return nil
 	}
 
-	// A missing workflows row (deleted out from under a suspended run) is
-	// non-fatal here: fall back to an empty slug and let BinaryPath decide.
-	// In production reg.BinaryPath("") errors and the run surfaces as
-	// failed; tests stub BinaryPath to ignore the slug.
-	slug, slugErr := s.Journal.WorkflowSlugByID(ctx, run.WorkflowID)
-	if slugErr != nil {
-		s.Log.Warn("scheduler: resolve workflow slug failed; resuming with empty slug",
-			"run_id", sched.RunID, "workflow_id", run.WorkflowID, "err", slugErr)
-		slug = ""
-	}
-
-	binary, err := s.BinaryPath(slug)
-	if err != nil {
-		return fmt.Errorf("scheduler: binary lookup for %q: %w", slug, err)
-	}
-
 	// Claim the schedule atomically AFTER the binary resolves, so a row we
 	// can't service yet isn't consumed. ClaimSchedule is a compare-and-set:
 	// claimed=false means a peer daemon already took it, so skip silently.
-	claimed, err := s.Journal.ClaimSchedule(ctx, sched.ID)
+	claimed, err := s.Journal.ClaimScheduleResume(ctx, sched.ID, false)
 	if err != nil {
 		return err
 	}
 	if !claimed {
-		return nil
-	}
-
-	// Restore run state so the new supervisor doesn't see "suspended". This is
-	// a GUARDED compare-and-set: only respawn if the run is still 'suspended'.
-	// A concurrent operator cancel (RequestRunCancel) that committed after
-	// ClaimSchedule would otherwise be silently overwritten and the cancelled
-	// run would resume and run to completion.
-	resumed, err := s.Journal.ResumeSuspendedRun(ctx, sched.RunID)
-	if err != nil {
-		return err
-	}
-	if !resumed {
-		if s.Log != nil {
-			s.Log.Info("scheduler: run no longer suspended (cancelled or finalized); skipping resume", "run_id", sched.RunID)
-		}
 		return nil
 	}
 
@@ -243,22 +261,12 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 	// Run on a cancellable context decoupled from the tick, registered so
 	// an operator can stop a resumed run mid-step (exec.CommandContext
 	// kills the subprocess on cancel).
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	s.Cancels.Register(sched.RunID, cancel)
-	defer s.Cancels.Deregister(sched.RunID)
+	runCtx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	registration := s.Cancels.RegisterCause(sched.RunID, cancel)
+	defer s.Cancels.DeregisterRegistration(sched.RunID, registration)
 
 	status, runErr := sup.Run(runCtx)
-	if runCtx.Err() == context.Canceled {
-		status = "cancelled"
-		runErr = nil
-		// FinalizeCancel (not MarkRunFinished) so a schedule row this
-		// resumed run wrote on its way to re-suspending is fired too;
-		// otherwise the next tick would resume the run we just cancelled.
-		if mErr := s.Journal.FinalizeCancel(context.Background(), sched.RunID); mErr != nil {
-			s.Log.Warn("scheduler: finalize cancel failed", "run_id", sched.RunID, "err", mErr)
-		}
-	}
 	s.Log.Info("scheduler woke run",
 		"run_id", sched.RunID, "step", sched.StepName, "kind", sched.Kind, "status", status)
 
@@ -270,7 +278,7 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 		if runErr != nil {
 			errText = runErr.Error()
 		}
-		s.OnTerminal(ctx, TerminalInfo{
+		s.OnTerminal(context.WithoutCancel(ctx), TerminalInfo{
 			RunID:        sched.RunID,
 			WorkflowID:   run.WorkflowID,
 			WorkflowSlug: slug,
@@ -281,6 +289,86 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 		})
 	}
 	return runErr
+}
+
+func (s *Scheduler) beginDispatch(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.count++
+	return nil
+}
+
+func (s *Scheduler) failArtifactFencedSchedule(ctx context.Context, sched journal.Schedule, run journal.RunInfo, slug string, retryableArtifact bool, cause error) error {
+	durableCtx := context.WithoutCancel(ctx)
+	if retryableArtifact {
+		// Every sleep, signal, or synthetic recovery row is the only durable
+		// continuation for its suspended run. Once the persisted artifact identity
+		// has validated, node-local lookup/config/hash/permission failures are
+		// availability problems. Keep the exact row pending until the pinned bytes
+		// are restored; consuming it into ordinary failed would strand the run.
+		// Back off the next durable probe and append the operator marker only once
+		// so a long artifact outage cannot grow run_logs every scheduler tick.
+		retryDelay := time.Minute
+		if s.TickInterval > retryDelay {
+			retryDelay = s.TickInterval
+		}
+		if _, err := s.Journal.DeferScheduleArtifactAvailability(
+			durableCtx, sched.ID, run.ID, s.Now().Add(retryDelay),
+		); err != nil {
+			return errors.Join(fmt.Errorf("scheduler: scheduled run waiting for pinned workflow artifact: %w", cause), err)
+		}
+		return fmt.Errorf("scheduler: scheduled run waiting for pinned workflow artifact: %w", cause)
+	}
+	claimed, err := s.Journal.ClaimScheduleAndFailArtifactFence(durableCtx, sched.ID, run.ID)
+	if err != nil {
+		return errors.Join(fmt.Errorf("scheduler: workflow artifact fence: %w", cause), err)
+	}
+	if !claimed {
+		return nil
+	}
+	if s.Log != nil {
+		s.Log.Error("scheduler: resumed run blocked by workflow artifact fence",
+			"run_id", run.ID, "workflow_id", run.WorkflowID, "workflow_version", run.WorkflowVersion, "err", cause)
+	}
+	if s.OnTerminal != nil {
+		s.OnTerminal(durableCtx, TerminalInfo{
+			RunID: run.ID, WorkflowID: run.WorkflowID, WorkflowSlug: slug,
+			Status: "failed", TriggerKind: run.TriggerKind, ErrorText: journal.WorkflowArtifactFenceRunLog,
+		})
+	}
+	return fmt.Errorf("scheduler: workflow artifact fence: %w", cause)
+}
+
+// InFlight returns schedule dispatches currently resolving, claiming, or
+// executing. Tracking the whole dispatch closes the shutdown race between a
+// due-row claim and child registration.
+func (s *Scheduler) InFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
+
+// Drain waits for every active schedule dispatch, including a resumed
+// workflow subprocess. A zero timeout waits indefinitely.
+func (s *Scheduler) Drain(timeout time.Duration) error {
+	started := time.Now()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.InFlight() == 0 {
+			return nil
+		}
+		if timeout > 0 && time.Since(started) >= timeout {
+			return fmt.Errorf("scheduler: drain timed out after %s with %d dispatch(es) in flight", timeout, s.InFlight())
+		}
+		<-ticker.C
+	}
 }
 
 func (s *Scheduler) applyDefaults() {
@@ -296,9 +384,14 @@ func (s *Scheduler) applyDefaults() {
 	if s.Batch == 0 {
 		s.Batch = 50
 	}
+	if s.Cancels == nil {
+		s.Cancels = cancelreg.New()
+	}
+	s.mu.Lock()
 	if s.stop == nil {
 		s.stop = make(chan struct{})
 	}
+	s.mu.Unlock()
 }
 
 // ErrNoBinary is returned by BinaryPath when no workflow binary is registered.

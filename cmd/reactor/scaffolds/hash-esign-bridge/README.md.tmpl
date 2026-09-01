@@ -1,0 +1,222 @@
+# {{.Slug}}
+
+Provider-neutral CRM or standalone webhook to Hash e-signature bridge. Generated
+by `reactor new hash-esign-bridge {{.Slug}}` on {{.Date}}.
+
+The producer sends customer data and an operator-approved `template_key`.
+Reactor validates it, resolves that key to a fixed Hash template UUID, and calls
+Hash with a Reactor-derived, workflow-namespaced `Idempotency-Key`. Hash creates
+and sends exactly one document and returns no bearer signing links.
+
+## Configure
+
+1. Edit `trustedHashBaseURL` and `templateProfiles` in `main.go`. Keep both out of
+   webhook input. The Hash template must be a block template with the required
+   signature roles.
+2. Add and grant a dedicated Hash key with `write:authoring` and
+   `write:workflow` scopes:
+
+   ```bash
+   reactor vault add --name hash-esign-{{.Slug}} --service hash --provider manual --value-file /secure/path/hash-api-key
+   reactor vault grant {{.Slug}} hash-esign-{{.Slug}}
+   ```
+
+   The value file must contain the exact key bytes without a trailing newline.
+
+3. Build, register, and create an `automation-v1` webhook trigger in the Reactor
+   dashboard. Production should use distributed mode with PostgreSQL; Reactor's
+   bundled SQLite Compose file is development-only and is not a production
+   bridge topology.
+
+   ```bash
+   REACTOR_SDK_REPLACE=/absolute/path/to/reactor reactor workflow build --src . --slug {{.Slug}}
+   reactor workflow register --db <url> --slug {{.Slug}} --src main.go --dag dag.json --artifact-sha256 <sha256-printed-by-build>
+   ```
+
+   Until the Reactor SDK module is published, `REACTOR_SDK_REPLACE` must point
+   to the trusted Reactor checkout used to build the workflow. Copy the full
+   digest printed by `workflow build` into `--artifact-sha256`; this binds
+   registration to those exact bytes even if another build of the same slug
+   overlaps the release session.
+
+4. Give the producer only the generated webhook URL and HMAC secret. Send the
+   same stable value in the JSON `event_id` and `X-Webhook-Delivery` header.
+   Keep the original body byte-for-byte stable across retries.
+
+## Canonical event
+
+```json
+{
+  "spec_version": "1.0",
+  "event_id": "partner-123:deal-456:agreement-v1",
+  "event_type": "esignature.document.requested.v1",
+  "occurred_at": "2026-08-31T12:00:00Z",
+  "source": {
+    "provider": "brightcrm",
+    "tenant_external_id": "partner-123"
+  },
+  "customer": {
+    "external_id": "customer-789",
+    "name": "Ada Lovelace",
+    "email": "ada@example.com",
+    "company_name": "Analytical Engines AB",
+    "locale": "en"
+  },
+  "document": {
+    "template_key": "sales-partner-agreement-v1",
+    "name": "Partner agreement",
+    "variables": {"deal.reference": "D-456"},
+    "recipients": [
+      {
+        "external_id": "customer-789",
+        "role": "signer",
+        "name": "Ada Lovelace",
+        "email": "ada@example.com",
+        "locale": "en",
+        "signing_order": 0
+      }
+    ]
+  }
+}
+```
+
+Customer and recipient names are limited to both 300 UTF-8 bytes and 200
+Unicode code points; plain email addresses are limited to 254 bytes. A document
+may contain at most 200 string variables, each value at most 16 KiB. Variable
+names are at most 200 bytes and must match
+`^[A-Za-z_][A-Za-z0-9_.]*$`, the same syntax Hash templates accept.
+
+`occurred_at` and optional `document.expires_at` use strict RFC 3339: uppercase
+`T`/`Z`, a dot-prefixed fraction of at most nine digits, and a numeric offset no
+larger than `+23:59`/`-23:59`; comma fractions, longer fractions, and `+24:00`
+are rejected. Expiry must be at least ten minutes after the immutable
+`occurred_at`. That comparison is deliberately independent of
+the current clock so persisted events remain replayable. It cannot guarantee
+Hash admission after an async queue delay: omit expiry when policy permits, or
+choose a comfortably future deadline and handle Hash's final fresh-command
+check as a permanent operation failure requiring review.
+
+For each attempt, send exactly one `Content-Type: application/json` header
+(optionally with only `charset=utf-8`), set `X-Webhook-Timestamp` to current Unix
+seconds, and sign the exact UTF-8 bytes
+`<timestamp>.<X-Webhook-Delivery>.<raw_body>` with HMAC-SHA256. Send the
+64-character lower-case hex digest as
+`X-Webhook-Signature: sha256=<hex>`. Reactor accepts at most five minutes of
+clock skew and requires the sole top-level body `event_id` to equal
+`X-Webhook-Delivery`. Never use email as the ID; persist a stable business-
+operation ID and reuse the exact body and ID on every retry. Missing, repeated,
+differently encoded, or extended JSON media types receive HTTP 415.
+
+A fresh request returns `202` with `{accepted,deduped,run_id}` after the Reactor
+run is durable and queued. This does **not** mean Hash created a document.
+Persist `run_id` before acknowledging the outbox row. A completed delivery
+replay returns `200` with the same durable run ID, which lets a sender recover
+after crashing between receipt and persistence. The trigger must remain
+asynchronous; Reactor rejects an `automation-v1` trigger configured in
+synchronous mode so this receipt contract cannot drift.
+
+Reconcile without dashboard credentials through the same trigger capability:
+
+```http
+GET /webhook/<token>/status?delivery_id=<URL-encoded event_id>
+X-Webhook-Timestamp: <current Unix seconds>
+X-Webhook-Delivery: <the exact original event_id>
+X-Webhook-Signature: sha256=<64-character lower-case HMAC-SHA256 hex>
+```
+
+The GET body is empty, so the signed bytes end with a dot:
+`<timestamp>.<event_id>.`. Use a fresh timestamp and signature on every poll.
+Reactor returns `202` while the bound run is queued, running, or suspended and
+`200` only when it is terminal. A successful terminal response includes the
+safe Hash `automation_request_id`, `document_id`, status, and replay flag; it
+never includes customer data, signing links, logs, or arbitrary step output.
+The endpoint returns `404` for a nonexistent or incomplete receipt and cannot
+inspect deliveries owned by another trigger or tenant. All responses are
+`no-store`.
+
+## Google Apps Script
+
+`google-apps-script.gs` is an optional producer adapter. Configure its script
+properties `REACTOR_WEBHOOK_URL` and `REACTOR_WEBHOOK_SECRET`. The secret must
+be the exact Reactor trigger secret and contain at least 32 UTF-8 bytes. Its
+durable lifecycle is:
+
+1. Call `prepareHashESignDelivery` and persist its exact `event_id` and
+   `raw_body` in a durable outbox **before** any network request. A Sheet row is
+   suitable only while the full body fits one cell; use Drive, Firestore, Cloud
+   SQL, or another durable store for larger events.
+2. Call `sendHashESignRequest` only with that persisted record. On a retryable
+   transport/408/425/429/5xx result, schedule the same raw body after the bounded
+   `retry_after_seconds`; never rebuild it from mutable customer data.
+3. On `accepted:true`, persist `run_id` on the same row before changing its
+   state to accepted. If this write crashes, resend the original POST to
+   recover the same deduplicated run receipt.
+4. Once `run_id` is present, call `reconcileHashESignRequest`. A `202` schedules
+   another signed GET; do not resend the POST. Cap poll attempts or use an
+   operator-owned deadline and dead-letter rows that do not become terminal.
+5. Mark the business operation complete only when reconciliation returns both
+   `terminal:true` and `succeeded:true`; persist the safe `hash_result`. Route
+   failed/cancelled/DLQ terminal states to operator review.
+6. If an operator redrives a `failed_dlq` run in Reactor, reopen that same
+   outbox record and resume signed status GETs for its persisted `run_id`.
+   Never resend or rebuild the original POST merely because the run was
+   redriven. Plain failed/cancelled runs stay in review unless a new business
+   command is explicitly authorized.
+
+Use `LockService` or transactional compare-and-set updates so concurrent time
+triggers cannot race one outbox record. Never put the secret or raw customer
+body in Apps Script execution logs.
+
+Preparation also rejects non-object variables, incompatible Hash variable
+names, excessive identifiers/names/emails/locales/variable counts or values,
+invalid RFC 3339 timestamps, and expiry less than ten minutes after the exact
+event time before an outbox body is persisted. It preserves valid timestamp
+strings byte-for-byte in that immutable body. Both network functions require
+HTTPS, refuse redirects, validate certificates, bound identifiers/responses,
+require one unambiguous UTF-8 JSON response media type, reject duplicate JSON
+member names and control characters, and return only sanitized retry metadata.
+Run `verifyAutomationV1HmacTestVector`,
+`verifyPreparationValidationTestVectors`, `verifyStrictJSONParserTestVectors`, and
+`verifyResponseContentTypeTestVectors` manually after changing signing,
+parsing, or response-header handling.
+Apps Script's URL Fetch service requires the
+[`script.external_request` scope](https://developers.google.com/apps-script/reference/url-fetch/url-fetch-app),
+and its Utilities service provides
+[`computeHmacSha256Signature`](https://developers.google.com/apps-script/reference/utilities/utilities).
+
+Google remains an edge adapter: this same webhook works from BrightCRM, another
+CRM, curl, or any HMAC-capable automation system, and callers may also invoke
+Hash's automation API directly without Reactor.
+
+Script Properties are readable by script editors. Restrict editor access and
+rotate the webhook credential if access changes; never write either secret or
+customer payloads to execution logs.
+
+## Safety notes
+
+- Never accept a Hash base URL, organization ID, API key, template UUID, or
+  callback URL from the event.
+- Do not log the input body, customer, variables, or recipient data.
+- Treat 409 as an idempotency conflict requiring operator review. Reactor only
+  retries transport failures, 408, 425, 429, and 5xx responses; a server-provided
+  `Retry-After` delay is honored up to the workflow's five-minute safety cap.
+  The Hash Step makes at most twelve attempts over a bounded tens-of-minutes
+  window so a routine provider outage does not immediately require manual CRM
+  recovery.
+- Treat a reconciliation 404 after persisting `run_id` as missing/inconsistent
+  state requiring operator review; it can mean a nonexistent or incomplete
+  receipt, retention-purged receipt/run, or stale scoped ownership/reference,
+  and is not a normal active-run response.
+- Configure both `REACTOR_RUN_RETENTION_DAYS` and
+  `REACTOR_WEBHOOK_DEDUP_RETAIN_HOURS` for personal-data policy, but keep both
+  longer than the producer polling deadline plus the longest operator review
+  and DLQ-redrive window. Never purge either while an outbox record may be
+  reopened against its persisted `run_id`. Apply estate-wide rate limits at the
+  ingress proxy.
+- Registration publishes a content-addressed SHA-256 artifact and pins each run
+  to its exact workflow version/digest. Distribute every referenced artifact to
+  every worker, and retain digests referenced by queued, running, suspended, or
+  DLQ runs; Reactor does not currently garbage-collect version artifacts.
+- Back up and restore-drill PostgreSQL together with the matching Reactor master
+  key, workflow source/DAG, compiled artifacts, checksums, and configuration.
+  A state-directory archive alone does not back up a remote PostgreSQL database.

@@ -57,14 +57,26 @@ func (j *Journal) CreateWebhookTrigger(ctx context.Context, workflowID, tokenID,
 			cfg = []byte("{}")
 		}
 	}
+	// Derive tenant_id from the workflow row in the same statement. Callers must
+	// not be able to place a trigger in a tenant merely by supplying a tenant
+	// string, and omitting the column would silently use the schema's "default"
+	// tenant for every non-default workflow.
 	const q = `INSERT INTO triggers
-		(id, workflow_id, kind, config_json, state, token_id, secret_id, provider)
-		VALUES ($1, $2, 'webhook', $3, 'active', $4, $5, $6)`
-	_, err = j.db.ExecContext(ctx, j.bind(q),
-		id, workflowID, cfg, tokenID, secretID, nullable(provider),
+		(id, tenant_id, workflow_id, kind, config_json, state, token_id, secret_id, provider)
+		SELECT $1, tenant_id, id, 'webhook', $2, 'active', $3, $4, $5
+		FROM workflows WHERE id = $6`
+	res, err := j.db.ExecContext(ctx, j.bind(q),
+		id, cfg, tokenID, secretID, nullable(provider), workflowID,
 	)
 	if err != nil {
 		return "", fmt.Errorf("journal: create webhook trigger: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("journal: create webhook trigger rows affected: %w", err)
+	}
+	if n != 1 {
+		return "", ErrNotFound
 	}
 	return id, nil
 }
@@ -100,6 +112,28 @@ func (j *Journal) SetTriggerState(ctx context.Context, id, state string) error {
 	return nil
 }
 
+// SetTriggerStateForWorkflow changes a trigger only when it belongs to the
+// workflow the caller already authorized. Dashboard routes contain both a
+// workflow slug and a trigger id; binding both identifiers in the mutation
+// prevents a tenant member from pairing their own slug with another tenant's
+// trigger id. A missing or mismatched row is deliberately indistinguishable.
+func (j *Journal) SetTriggerStateForWorkflow(ctx context.Context, id, workflowID, state string) error {
+	const q = `UPDATE triggers SET state = $1, updated_at = $2
+		WHERE id = $3 AND workflow_id = $4`
+	res, err := j.db.ExecContext(ctx, j.bind(q), state, j.now(), id, workflowID)
+	if err != nil {
+		return fmt.Errorf("journal: set trigger state for workflow: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("journal: set trigger state for workflow rows affected: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // MarkTriggerError stores last_error for dashboard surfacing. Successful
 // later fires clear it via MarkTriggerFired.
 func (j *Journal) MarkTriggerError(ctx context.Context, id, msg string) error {
@@ -108,30 +142,236 @@ func (j *Journal) MarkTriggerError(ctx context.Context, id, msg string) error {
 	return err
 }
 
-// RecordWebhookDelivery inserts (provider, delivery_id) for dedup. Returns
-// (true, nil) when the delivery is new, (false, nil) on duplicate. The
-// caller treats duplicates as 200 no-ops per the webhook idempotency contract.
-// triggerID scopes the dedup namespace. It used to be absent, so a delivery id
-// consumed by ONE trigger made every other trigger receiving that id answer
-// "deduped" and never dispatch. See migration 0025.
-func (j *Journal) RecordWebhookDelivery(ctx context.Context, triggerID, provider, deliveryID string) (bool, error) {
-	const q = `INSERT INTO webhook_deliveries (trigger_id, provider, delivery_id) VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING`
-	res, err := j.db.ExecContext(ctx, j.bind(q), triggerID, provider, deliveryID)
+// WebhookDeliveryClaimState is the durable state returned when a receiver
+// tries to own one provider delivery.
+type WebhookDeliveryClaimState string
+
+const (
+	// WebhookDeliveryClaimed means this caller owns ClaimToken until
+	// LeaseExpiresAt and may dispatch the workflow.
+	WebhookDeliveryClaimed WebhookDeliveryClaimState = "claimed"
+	// WebhookDeliveryCompleted means an earlier owner already created the run.
+	// The receiver can acknowledge the provider without dispatching again.
+	WebhookDeliveryCompleted WebhookDeliveryClaimState = "completed"
+	// WebhookDeliveryInProgress means another live lease owns the delivery.
+	// The receiver must not falsely acknowledge it as complete: if that owner
+	// crashes, a retry after LeaseExpiresAt is how the delivery recovers.
+	WebhookDeliveryInProgress WebhookDeliveryClaimState = "in_progress"
+	// WebhookDeliveryPayloadMismatch means one delivery id was reused for a
+	// different request body. Treating it as a replay would silently lose data.
+	WebhookDeliveryPayloadMismatch WebhookDeliveryClaimState = "payload_mismatch"
+)
+
+// WebhookDeliveryClaim is the result of ClaimWebhookDelivery. ClaimToken is
+// populated only for the owner; RunID is populated for a completed receipt
+// when the dispatcher supplied one.
+type WebhookDeliveryClaim struct {
+	State          WebhookDeliveryClaimState
+	ClaimToken     string
+	LeaseExpiresAt time.Time
+	RunID          string
+}
+
+// ErrWebhookDeliveryClaimLost means a completion/release caller no longer
+// owns the row. A retry may have reclaimed an expired lease; token-guarded
+// writes prevent the stale owner from deleting or completing the new claim.
+var ErrWebhookDeliveryClaimLost = errors.New("journal: webhook delivery claim lost")
+
+// ClaimWebhookDelivery leases one verified delivery to exactly one receiver.
+//
+// The old RecordWebhookDelivery permanently inserted a dedup row before the
+// dispatcher created a durable run. A process crash in that gap caused every
+// provider retry to return dedup success even though the workflow never ran.
+// A lease makes that gap recoverable: an expired, incomplete row can be
+// reclaimed. This is deliberately at-least-once after a crash occurring after
+// dispatch but before CompleteWebhookDelivery; downstream effects must use
+// their own idempotency key (the provider delivery id is the natural choice).
+func (j *Journal) ClaimWebhookDelivery(
+	ctx context.Context,
+	triggerID, provider, deliveryID, payloadSHA256 string,
+	now time.Time,
+	lease time.Duration,
+) (WebhookDeliveryClaim, error) {
+	if lease <= 0 {
+		return WebhookDeliveryClaim{}, errors.New("journal: webhook delivery lease must be positive")
+	}
+	now = now.UTC()
+	expires := now.Add(lease)
+
+	// A release can race this method between its failed INSERT and SELECT. Loop
+	// a few times so that benign race becomes a fresh claim instead of an
+	// internal error. Each mutation remains guarded by the composite key and,
+	// for reclaim, the observed expiry predicate.
+	for attempt := 0; attempt < 4; attempt++ {
+		claimToken, err := newID("whc_")
+		if err != nil {
+			return WebhookDeliveryClaim{}, err
+		}
+		const insertQ = `INSERT INTO webhook_deliveries
+			(trigger_id, provider, delivery_id, received_at, payload_sha256, claim_token, lease_expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT DO NOTHING`
+		res, err := j.db.ExecContext(ctx, j.bind(insertQ),
+			triggerID, provider, deliveryID, j.formatTime(now), payloadSHA256, claimToken, j.formatTime(expires))
+		if err != nil {
+			return WebhookDeliveryClaim{}, fmt.Errorf("journal: claim webhook delivery: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			// Assuming ownership when the driver cannot prove the INSERT won can
+			// double-dispatch. Fail closed and let the provider retry instead.
+			return WebhookDeliveryClaim{}, fmt.Errorf("journal: claim webhook delivery rows affected: %w", err)
+		}
+		if n > 0 {
+			return WebhookDeliveryClaim{
+				State:          WebhookDeliveryClaimed,
+				ClaimToken:     claimToken,
+				LeaseExpiresAt: expires,
+			}, nil
+		}
+
+		// One atomic conditional UPDATE elects at most one owner when an old
+		// lease expires. Match the digest here so a reused id cannot overwrite
+		// the evidence of which payload originally claimed it.
+		const reclaimQ = `UPDATE webhook_deliveries
+			SET claim_token = $1, lease_expires_at = $2, run_id = NULL
+			WHERE trigger_id = $3 AND provider = $4 AND delivery_id = $5
+			  AND completed_at IS NULL
+			  AND (lease_expires_at IS NULL OR lease_expires_at <= $6)
+			  AND payload_sha256 = $7`
+		res, err = j.db.ExecContext(ctx, j.bind(reclaimQ),
+			claimToken, j.formatTime(expires), triggerID, provider, deliveryID,
+			j.formatTime(now), payloadSHA256)
+		if err != nil {
+			return WebhookDeliveryClaim{}, fmt.Errorf("journal: reclaim webhook delivery: %w", err)
+		}
+		n, err = res.RowsAffected()
+		if err != nil {
+			return WebhookDeliveryClaim{}, fmt.Errorf("journal: reclaim webhook delivery rows affected: %w", err)
+		}
+		if n > 0 {
+			return WebhookDeliveryClaim{
+				State:          WebhookDeliveryClaimed,
+				ClaimToken:     claimToken,
+				LeaseExpiresAt: expires,
+			}, nil
+		}
+
+		const selectQ = `SELECT payload_sha256, lease_expires_at, completed_at, run_id
+			FROM webhook_deliveries
+			WHERE trigger_id = $1 AND provider = $2 AND delivery_id = $3`
+		var (
+			storedHash     string
+			leaseExpiresDB sql.NullString
+			completedDB    sql.NullString
+			runIDDB        sql.NullString
+		)
+		err = j.db.QueryRowContext(ctx, j.bind(selectQ), triggerID, provider, deliveryID).
+			Scan(&storedHash, &leaseExpiresDB, &completedDB, &runIDDB)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // the current owner released between our INSERT and SELECT
+		}
+		if err != nil {
+			return WebhookDeliveryClaim{}, fmt.Errorf("journal: inspect webhook delivery: %w", err)
+		}
+		// Empty is the legacy sentinel for receipts migrated from 0027: their
+		// body was never stored or hashed, so they remain completed replays but
+		// cannot participate in payload-mismatch detection retroactively.
+		if storedHash != "" && storedHash != payloadSHA256 {
+			return WebhookDeliveryClaim{State: WebhookDeliveryPayloadMismatch}, nil
+		}
+		if completedDB.Valid {
+			return WebhookDeliveryClaim{State: WebhookDeliveryCompleted, RunID: runIDDB.String}, nil
+		}
+		var leaseExpires time.Time
+		if leaseExpiresDB.Valid {
+			leaseExpires, err = j.parseTime(leaseExpiresDB.String)
+			if err != nil {
+				return WebhookDeliveryClaim{}, fmt.Errorf("journal: parse webhook lease expiry: %w", err)
+			}
+		}
+		return WebhookDeliveryClaim{
+			State:          WebhookDeliveryInProgress,
+			LeaseExpiresAt: leaseExpires,
+		}, nil
+	}
+	return WebhookDeliveryClaim{}, errors.New("journal: webhook delivery changed during claim")
+}
+
+// CompleteWebhookDelivery makes a claim a permanent dedup receipt after the
+// dispatcher has created the run. The claim token is mandatory: an owner that
+// stalls past its lease cannot complete a newer owner's reclaimed row.
+func (j *Journal) CompleteWebhookDelivery(
+	ctx context.Context,
+	triggerID, provider, deliveryID, claimToken, runID string,
+	completedAt time.Time,
+) error {
+	const q = `UPDATE webhook_deliveries
+		SET completed_at = $1, lease_expires_at = NULL, run_id = $2
+		WHERE trigger_id = $3 AND provider = $4 AND delivery_id = $5
+		  AND claim_token = $6 AND completed_at IS NULL`
+	res, err := j.db.ExecContext(ctx, j.bind(q), j.formatTime(completedAt.UTC()), nullable(runID),
+		triggerID, provider, deliveryID, claimToken)
 	if err != nil {
-		return false, fmt.Errorf("journal: record webhook delivery: %w", err)
+		return fmt.Errorf("journal: complete webhook delivery: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, nil // permissive: assume new if driver doesn't report
+		return fmt.Errorf("journal: complete webhook delivery rows affected: %w", err)
 	}
-	return n > 0, nil
+	if n == 0 {
+		return ErrWebhookDeliveryClaimLost
+	}
+	return nil
 }
 
-// DeleteWebhookDelivery removes a dedup row. The webhook receiver calls
-// this to roll back the dedup claim when dispatch fails, so the provider's
-// retry of the SAME delivery is treated as fresh instead of being eaten
-// as a duplicate. Best-effort: a missing row is not an error.
+// ReleaseWebhookDelivery deletes only the caller's incomplete claim. Dispatch
+// failures use it to let the provider retry immediately; a stale owner cannot
+// delete a row that another request reclaimed after lease expiry.
+func (j *Journal) ReleaseWebhookDelivery(
+	ctx context.Context,
+	triggerID, provider, deliveryID, claimToken string,
+) error {
+	const q = `DELETE FROM webhook_deliveries
+		WHERE trigger_id = $1 AND provider = $2 AND delivery_id = $3
+		  AND claim_token = $4 AND completed_at IS NULL`
+	res, err := j.db.ExecContext(ctx, j.bind(q), triggerID, provider, deliveryID, claimToken)
+	if err != nil {
+		return fmt.Errorf("journal: release webhook delivery: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("journal: release webhook delivery rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrWebhookDeliveryClaimLost
+	}
+	return nil
+}
+
+// RecordWebhookDelivery is retained for internal callers compiled against the
+// pre-0028 journal surface. New receiver code must use Claim/Complete/Release.
+// Preserve the old method's permanent-record semantics by completing a claim
+// immediately; it is unsuitable for dispatch because it recreates the old
+// crash window by design.
+func (j *Journal) RecordWebhookDelivery(ctx context.Context, triggerID, provider, deliveryID string) (bool, error) {
+	now := time.Now().UTC()
+	claim, err := j.ClaimWebhookDelivery(ctx, triggerID, provider, deliveryID, "", now, 5*time.Minute)
+	if err != nil {
+		return false, err
+	}
+	if claim.State != WebhookDeliveryClaimed {
+		return false, nil
+	}
+	if err := j.CompleteWebhookDelivery(ctx, triggerID, provider, deliveryID, claim.ClaimToken, "", now); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DeleteWebhookDelivery is the legacy unconditional rollback helper. The live
+// receiver uses token-guarded ReleaseWebhookDelivery so an expired owner cannot
+// delete a newer claim.
 func (j *Journal) DeleteWebhookDelivery(ctx context.Context, triggerID, provider, deliveryID string) error {
 	const q = `DELETE FROM webhook_deliveries WHERE trigger_id = $1 AND provider = $2 AND delivery_id = $3`
 	if _, err := j.db.ExecContext(ctx, j.bind(q), triggerID, provider, deliveryID); err != nil {
@@ -178,6 +418,52 @@ func (j *Journal) DeleteTrigger(ctx context.Context, id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteTriggerForWorkflow deletes a trigger only from the workflow the caller
+// already authorized. Keep the unscoped DeleteTrigger for internal compensation
+// and CLI paths that resolve a globally unique trigger id directly.
+func (j *Journal) DeleteTriggerForWorkflow(ctx context.Context, id, workflowID string) error {
+	const q = `DELETE FROM triggers WHERE id = $1 AND workflow_id = $2`
+	res, err := j.db.ExecContext(ctx, j.bind(q), id, workflowID)
+	if err != nil {
+		return fmt.Errorf("journal: delete trigger for workflow: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("journal: delete trigger for workflow rows affected: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateCronTriggerConfigForWorkflow replaces config only for a cron trigger
+// owned by the authorized workflow. The kind predicate prevents a crafted edit
+// request from writing cron-shaped config over a webhook verifier binding.
+func (j *Journal) UpdateCronTriggerConfigForWorkflow(ctx context.Context, id, workflowID string, config []byte) error {
+	cfg := outputArg(config, j.engine)
+	if cfg == nil {
+		cfg = "{}"
+		if j.engine != EngineSQLite {
+			cfg = []byte("{}")
+		}
+	}
+	const q = `UPDATE triggers SET config_json = $1, updated_at = $2
+		WHERE id = $3 AND workflow_id = $4 AND kind = 'cron'`
+	res, err := j.db.ExecContext(ctx, j.bind(q), cfg, j.now(), id, workflowID)
+	if err != nil {
+		return fmt.Errorf("journal: update cron trigger config for workflow: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("journal: update cron trigger config for workflow rows affected: %w", err)
+	}
+	if n != 1 {
 		return ErrNotFound
 	}
 	return nil
@@ -269,11 +555,19 @@ func (j *Journal) CreateCronTrigger(ctx context.Context, workflowID string, conf
 			cfg = []byte("{}")
 		}
 	}
-	const q = `INSERT INTO triggers (id, workflow_id, kind, config_json, state)
-		VALUES ($1, $2, 'cron', $3, 'active')`
-	_, err = j.db.ExecContext(ctx, j.bind(q), id, workflowID, cfg)
+	const q = `INSERT INTO triggers (id, tenant_id, workflow_id, kind, config_json, state)
+		SELECT $1, tenant_id, id, 'cron', $2, 'active'
+		FROM workflows WHERE id = $3`
+	res, err := j.db.ExecContext(ctx, j.bind(q), id, cfg, workflowID)
 	if err != nil {
 		return "", fmt.Errorf("journal: create cron trigger: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("journal: create cron trigger rows affected: %w", err)
+	}
+	if n != 1 {
+		return "", ErrNotFound
 	}
 	return id, nil
 }
@@ -281,9 +575,15 @@ func (j *Journal) CreateCronTrigger(ctx context.Context, workflowID string, conf
 // PurgeOldWebhookDeliveries trims rows older than retain. Run periodically
 // so the dedup table doesn't grow unbounded. Default retention 7 days.
 func (j *Journal) PurgeOldWebhookDeliveries(ctx context.Context, retain time.Duration) error {
-	cutoff := j.formatTime(time.Now().UTC().Add(-retain))
-	const q = `DELETE FROM webhook_deliveries WHERE received_at < $1`
-	_, err := j.db.ExecContext(ctx, j.bind(q), cutoff)
+	now := time.Now().UTC()
+	cutoff := j.formatTime(now.Add(-retain))
+	// Never delete a live lease merely because repeated recovery attempts have
+	// kept an old delivery active beyond the retention window. Completed rows
+	// and abandoned, expired claims are safe to trim.
+	const q = `DELETE FROM webhook_deliveries
+		WHERE received_at < $1
+		  AND (completed_at IS NOT NULL OR lease_expires_at IS NULL OR lease_expires_at <= $2)`
+	_, err := j.db.ExecContext(ctx, j.bind(q), cutoff, j.formatTime(now))
 	return err
 }
 

@@ -2,13 +2,30 @@ package journal
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// ErrLeaseOwnershipLost means the caller no longer owns the exact generation
+// of a run lease it was given. Callers must stop the workflow immediately: a
+// reaper may already have handed the run to a replacement worker.
+var ErrLeaseOwnershipLost = errors.New("journal: run lease ownership lost")
+
+// RunLease is one queue claim. Owner is an opaque, unique-per-claim fencing
+// token. It deliberately differs from the stable worker id used by the fleet
+// registry: every heartbeat, terminal transition, and release must present
+// this exact value so an expired process cannot mutate a replacement claim.
+type RunLease struct {
+	RunID string
+	Owner string
+}
 
 // This file is the pull-queue + worker-lease surface that backs Reactor's
 // distributed mode. In single-node (local) mode the dispatcher executes a
@@ -27,9 +44,6 @@ import (
 // status "running" + started_at when it claims the run.
 func (j *Journal) CreateQueuedRun(ctx context.Context, runID, workflowID, triggerKind string, triggerMeta json.RawMessage) error {
 	tm := outputArg(triggerMeta, j.engine)
-	// tenant_id is denormalized from the workflow so the fair-share claim and
-	// quota counts read it off the run directly (workflowID passed twice
-	// because the $N rewriter does not dedupe repeated params).
 	const q = `INSERT INTO runs (id, workflow_id, trigger_kind, trigger_meta, status, created_at, tenant_id)
 		VALUES ($1, $2, $3, $4, 'queued', $5, COALESCE((SELECT tenant_id FROM workflows WHERE id = $6), 'default'))`
 	if _, err := j.db.ExecContext(ctx, j.bind(q), runID, workflowID, triggerKind, tm, j.now(), workflowID); err != nil {
@@ -38,12 +52,34 @@ func (j *Journal) CreateQueuedRun(ctx context.Context, runID, workflowID, trigge
 	return nil
 }
 
+// CreateQueuedRunPinned writes the queue row and both execution pins in one
+// INSERT. There is no crash window in which a claimable row exists without its
+// exact workflow version and immutable artifact identity.
+func (j *Journal) CreateQueuedRunPinned(ctx context.Context, runID, workflowID, triggerKind string, triggerMeta json.RawMessage, workflowVersion int, artifactSHA256 string) error {
+	if workflowVersion <= 0 || !validArtifactSHA256(artifactSHA256) {
+		return fmt.Errorf("journal: create pinned queued run: %w", ErrWorkflowArtifactFence)
+	}
+	tm := outputArg(triggerMeta, j.engine)
+	// tenant_id is denormalized from the workflow so the fair-share claim and
+	// quota counts read it off the run directly (workflowID passed twice
+	// because the $N rewriter does not dedupe repeated params).
+	const q = `INSERT INTO runs (id, workflow_id, trigger_kind, trigger_meta, status, created_at, tenant_id, workflow_version, workflow_artifact_sha256)
+		VALUES ($1, $2, $3, $4, 'queued', $5, COALESCE((SELECT tenant_id FROM workflows WHERE id = $6), 'default'), $7, $8)`
+	if _, err := j.db.ExecContext(ctx, j.bind(q), runID, workflowID, triggerKind, tm, j.now(), workflowID, workflowVersion, artifactSHA256); err != nil {
+		return fmt.Errorf("journal: create queued run: %w", err)
+	}
+	return nil
+}
+
 // ClaimQueuedRuns atomically leases up to limit queued runs for workerID,
-// flips them to "running", and writes a lease row per run. Returns the
-// claimed run ids (possibly empty). leaseTTL is how long the claim is
+// flips them to "running", and writes a lease row per run. Returns exact
+// claim generations (possibly empty). leaseTTL is how long the claim is
 // valid before ReapExpiredLeases may requeue the run (a worker extends its
 // lease via ExtendLease while executing).
-func (j *Journal) ClaimQueuedRuns(ctx context.Context, workerID string, limit int, leaseTTL time.Duration) ([]string, error) {
+func (j *Journal) ClaimQueuedRuns(ctx context.Context, workerID string, limit int, leaseTTL time.Duration) ([]RunLease, error) {
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("journal: claim queued runs: empty worker id")
+	}
 	if limit <= 0 {
 		limit = 1
 	}
@@ -52,6 +88,15 @@ func (j *Journal) ClaimQueuedRuns(ctx context.Context, workerID string, limit in
 		return nil, err
 	}
 	defer tx.Rollback()
+	if j.engine == EngineSQLite {
+		// SQLite has no SELECT ... FOR UPDATE. Acquire its single-writer lock
+		// before reading enabled flags so SetWorkflowEnabled and a queue claim
+		// have a deterministic winner.
+		if _, err := tx.ExecContext(ctx, `UPDATE workflows SET id = id
+			WHERE id IN (SELECT workflow_id FROM runs WHERE status = 'queued')`); err != nil {
+			return nil, fmt.Errorf("journal: lock queued workflow state: %w", err)
+		}
+	}
 
 	// Pick candidates tenant-fairly (interleaved by per-tenant queue position,
 	// disabled tenants skipped, over-concurrency tenants dropped). This select
@@ -82,8 +127,11 @@ func (j *Journal) ClaimQueuedRuns(ctx context.Context, workerID string, limit in
 			ph[i] = "$" + strconv.Itoa(i+1)
 			args[i] = id
 		}
-		lockQ := `SELECT id FROM runs WHERE status = 'queued' AND id IN (` +
-			strings.Join(ph, ",") + `) FOR UPDATE SKIP LOCKED`
+		lockQ := `SELECT r.id FROM runs r
+			JOIN workflows w ON w.id = r.workflow_id
+			WHERE r.status = 'queued' AND r.cancel_requested = false
+			AND w.enabled = true AND r.id IN (` +
+			strings.Join(ph, ",") + `) FOR UPDATE OF r, w SKIP LOCKED`
 		locked, lerr := scanIDs(tx.QueryContext(ctx, lockQ, args...))
 		if lerr != nil {
 			return nil, fmt.Errorf("journal: claim lock: %w", lerr)
@@ -113,23 +161,60 @@ func (j *Journal) ClaimQueuedRuns(ctx context.Context, workerID string, limit in
 	}
 
 	expires := j.formatTime(time.Now().UTC().Add(leaseTTL))
+	claims := make([]RunLease, 0, len(ids))
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx,
-			j.bind(`UPDATE runs SET status = 'running', started_at = $1 WHERE id = $2`),
-			j.now(), id); err != nil {
+		owner, err := newLeaseOwner(workerID)
+		if err != nil {
+			return nil, err
+		}
+		res, err := tx.ExecContext(ctx,
+			j.bind(`UPDATE runs SET status = 'running', started_at = $1
+				WHERE id = $2 AND status = 'queued' AND cancel_requested = $3`),
+			j.now(), id, j.boolValue(false))
+		if err != nil {
 			return nil, fmt.Errorf("journal: claim mark running: %w", err)
 		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return nil, fmt.Errorf("journal: claim mark running: run %s changed concurrently", id)
+		}
 		if _, err := tx.ExecContext(ctx,
-			j.bind(`INSERT INTO leases (run_id, worker_id, expires_at) VALUES ($1, $2, $3)
-				ON CONFLICT (run_id) DO UPDATE SET worker_id = excluded.worker_id, expires_at = excluded.expires_at`),
-			id, workerID, expires); err != nil {
+			j.bind(`INSERT INTO leases (run_id, worker_id, expires_at) VALUES ($1, $2, $3)`),
+			id, owner, expires); err != nil {
 			return nil, fmt.Errorf("journal: claim lease insert: %w", err)
 		}
+		claims = append(claims, RunLease{RunID: id, Owner: owner})
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return ids, nil
+	return claims, nil
+}
+
+func newLeaseOwner(workerID string) (string, error) {
+	var generation [16]byte
+	if _, err := rand.Read(generation[:]); err != nil {
+		return "", fmt.Errorf("journal: create lease generation: %w", err)
+	}
+	return workerID + "/" + hex.EncodeToString(generation[:]), nil
+}
+
+// VerifyLeaseOwner is the worker's pre-spawn fence. It prevents a stale
+// goroutine that was delayed before ExecuteRun from launching after a reaper
+// has already installed another generation. Heartbeats and finalization still
+// carry the token because ownership can change after this point.
+func (j *Journal) VerifyLeaseOwner(ctx context.Context, runID, owner string) error {
+	const q = `SELECT 1 FROM leases l
+		JOIN runs r ON r.id = l.run_id
+		WHERE l.run_id = $1 AND l.worker_id = $2 AND r.status = 'running'`
+	var one int
+	err := j.db.QueryRowContext(ctx, j.bind(q), runID, owner).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: verify run=%s", ErrLeaseOwnershipLost, runID)
+	}
+	if err != nil {
+		return fmt.Errorf("journal: verify lease owner: %w", err)
+	}
+	return nil
 }
 
 // ExtendLease renews the lease on a run the worker is still executing.
@@ -137,19 +222,26 @@ func (j *Journal) ClaimQueuedRuns(ctx context.Context, workerID string, limit in
 // renewed by its dead original owner.
 func (j *Journal) ExtendLease(ctx context.Context, runID, workerID string, ttl time.Duration) error {
 	const q = `UPDATE leases SET expires_at = $1 WHERE run_id = $2 AND worker_id = $3`
-	_, err := j.db.ExecContext(ctx, j.bind(q),
+	res, err := j.db.ExecContext(ctx, j.bind(q),
 		j.formatTime(time.Now().UTC().Add(ttl)), runID, workerID)
 	if err != nil {
 		return fmt.Errorf("journal: extend lease: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: extend run=%s", ErrLeaseOwnershipLost, runID)
 	}
 	return nil
 }
 
 // ReleaseLease drops a run's lease. Called when the run reaches a terminal
 // status so the row no longer counts as in-flight.
-func (j *Journal) ReleaseLease(ctx context.Context, runID string) error {
-	if _, err := j.db.ExecContext(ctx, j.bind(`DELETE FROM leases WHERE run_id = $1`), runID); err != nil {
+func (j *Journal) ReleaseLease(ctx context.Context, runID, owner string) error {
+	res, err := j.db.ExecContext(ctx, j.bind(`DELETE FROM leases WHERE run_id = $1 AND worker_id = $2`), runID, owner)
+	if err != nil {
 		return fmt.Errorf("journal: release lease: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: release run=%s", ErrLeaseOwnershipLost, runID)
 	}
 	return nil
 }
@@ -166,20 +258,102 @@ func (j *Journal) ReapExpiredLeases(ctx context.Context) (int64, error) {
 	}
 	defer tx.Rollback()
 	now := j.formatTime(time.Now().UTC())
-	res, err := tx.ExecContext(ctx,
-		j.bind(`UPDATE runs SET status = 'queued'
-			WHERE status = 'running'
-			AND id IN (SELECT run_id FROM leases WHERE expires_at < $1)`),
-		now)
+	// PostgreSQL's FOR UPDATE makes renewal and reaping mutually exclusive.
+	// SQLite transactions begin deferred, so take its single-writer lock with a
+	// no-op guarded UPDATE before selecting the exact expired generations.
+	if j.engine == EngineSQLite {
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE leases SET worker_id = worker_id WHERE expires_at < $1`), now); err != nil {
+			return 0, fmt.Errorf("journal: lock expired leases: %w", err)
+		}
+	}
+	q := `SELECT run_id, worker_id FROM leases WHERE expires_at < $1`
+	if j.engine == EnginePostgres {
+		q += ` FOR UPDATE SKIP LOCKED`
+	}
+	rows, err := tx.QueryContext(ctx, j.bind(q), now)
 	if err != nil {
-		return 0, fmt.Errorf("journal: reap requeue: %w", err)
+		return 0, fmt.Errorf("journal: select expired leases: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, j.bind(`DELETE FROM leases WHERE expires_at < $1`), now); err != nil {
-		return 0, fmt.Errorf("journal: reap delete leases: %w", err)
+	var expired []RunLease
+	for rows.Next() {
+		var claim RunLease
+		if err := rows.Scan(&claim.RunID, &claim.Owner); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("journal: scan expired lease: %w", err)
+		}
+		expired = append(expired, claim)
 	}
-	n, _ := res.RowsAffected()
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("journal: close expired leases: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("journal: iterate expired leases: %w", err)
+	}
+
+	var n int64
+	var cancelled []string
+	for _, claim := range expired {
+		// Lock the run after its lease (the same order as owned finalization),
+		// then inspect cancel_requested under that lock. A cancel accepted while
+		// the old owner was dead must become terminal here, never a queued run a
+		// replacement worker can claim.
+		runQ := `SELECT status, cancel_requested FROM runs WHERE id = $1`
+		if j.engine == EnginePostgres {
+			runQ += ` FOR UPDATE`
+		}
+		var (
+			status          string
+			cancelRequested any
+		)
+		if err := tx.QueryRowContext(ctx, j.bind(runQ), claim.RunID).Scan(&status, &cancelRequested); err != nil {
+			return 0, fmt.Errorf("journal: lock expired lease run: %w", err)
+		}
+
+		if parseBool(cancelRequested) && (status == "running" || status == "queued" || status == "suspended") {
+			res, err := tx.ExecContext(ctx, j.bind(`UPDATE runs
+				SET status = 'cancelled', finished_at = $1
+				WHERE id = $2 AND status = $3 AND cancel_requested = $4`),
+				j.now(), claim.RunID, status, j.boolValue(true))
+			if err != nil {
+				return 0, fmt.Errorf("journal: reap cancelled dead owner: %w", err)
+			}
+			if moved, _ := res.RowsAffected(); moved != 1 {
+				return 0, fmt.Errorf("journal: reap cancelled dead owner: run %s changed concurrently", claim.RunID)
+			}
+			if _, err := tx.ExecContext(ctx,
+				j.bind(`UPDATE schedules SET fired = $1 WHERE run_id = $2 AND fired = $3`),
+				j.boolValue(true), claim.RunID, j.boolValue(false)); err != nil {
+				return 0, fmt.Errorf("journal: reap cancelled dead owner schedules: %w", err)
+			}
+			cancelled = append(cancelled, claim.RunID)
+		} else if status == "running" {
+			res, err := tx.ExecContext(ctx, j.bind(`UPDATE runs SET status = 'queued'
+				WHERE id = $1 AND status = 'running' AND cancel_requested = $2`),
+				claim.RunID, j.boolValue(false))
+			if err != nil {
+				return 0, fmt.Errorf("journal: reap requeue: %w", err)
+			}
+			moved, _ := res.RowsAffected()
+			if moved != 1 {
+				return 0, fmt.Errorf("journal: reap requeue: run %s changed concurrently", claim.RunID)
+			}
+			n++
+		}
+
+		res, err := tx.ExecContext(ctx, j.bind(`DELETE FROM leases
+			WHERE run_id = $1 AND worker_id = $2 AND expires_at < $3`), claim.RunID, claim.Owner, now)
+		if err != nil {
+			return 0, fmt.Errorf("journal: reap delete lease: %w", err)
+		}
+		if deleted, _ := res.RowsAffected(); deleted != 1 {
+			return 0, fmt.Errorf("%w: reap run=%s", ErrLeaseOwnershipLost, claim.RunID)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	for _, runID := range cancelled {
+		j.recordUsageBestEffort(ctx, runID, "cancelled")
 	}
 	return n, nil
 }
@@ -200,16 +374,21 @@ func (j *Journal) ReapExpiredLeases(ctx context.Context) (int64, error) {
 // Fair interleaving (not the hard cap) is what prevents starvation.
 func (j *Journal) fairCandidateQuery(limit int) string {
 	falseLit := "false"
+	trueLit := "true"
 	if j.engine == EngineSQLite {
 		falseLit = "0"
+		trueLit = "1"
 	}
 	return `WITH running AS (
 		SELECT tenant_id, COUNT(*) AS n FROM runs WHERE status = 'running' GROUP BY tenant_id
 	),
 	ranked AS (
-		SELECT id, tenant_id, created_at,
-			ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at, id) AS rn
-		FROM runs WHERE status = 'queued'
+		SELECT r.id, r.tenant_id, r.created_at,
+			ROW_NUMBER() OVER (PARTITION BY r.tenant_id ORDER BY r.created_at, r.id) AS rn
+		FROM runs r
+		JOIN workflows w ON w.id = r.workflow_id
+		WHERE r.status = 'queued' AND r.cancel_requested = ` + falseLit + `
+		AND w.enabled = ` + trueLit + `
 	)
 	SELECT k.id
 	FROM ranked k

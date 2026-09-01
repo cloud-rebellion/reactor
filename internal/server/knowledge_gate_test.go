@@ -17,7 +17,7 @@ import (
 
 // knowledgeFixture writes two entries: one shared playbook with no tenant, and
 // one post-mortem stamped to another tenant, carrying the workflow slug, step
-// name and step error text the generator emits (see internal/postmortem).
+// name and synthesized Step diagnostics the generator emits (see internal/postmortem).
 func knowledgeFixture(t *testing.T) *knowledge.Store {
 	t.Helper()
 	root := t.TempDir()

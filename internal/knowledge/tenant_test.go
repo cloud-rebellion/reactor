@@ -10,7 +10,7 @@ import (
 // base instead of losing it to a blanket admin gate.
 //
 // The corpus had no tenant concept at all, so /knowledge served every tenant's
-// post-mortems (workflow slugs, step names, truncated step error text) to any
+// post-mortems (workflow slugs, step names, and synthesized diagnostics) to any
 // member while /postmortems refused them. Gating the whole page to admins
 // closed the leak but took a real feature away from members, and the corpus is
 // meant to be the thing workflow authors read.

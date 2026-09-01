@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/bright-interaction/reactor/internal/registry"
 )
 
 // BuildAndRegisterRequest is the input to BuildAndRegister. Every field
@@ -26,19 +28,18 @@ type BuildAndRegisterRequest struct {
 	// optional dag.json. The go build command runs with cmd.Dir = SrcDir.
 	SrcDir string
 
-	// StateRoot is the daemon's state directory. The compiled binary
-	// lands at <StateRoot>/workflows/<Slug>/workflow with mode 0700 on
-	// the parent dir.
+	// StateRoot is the daemon's state directory. The compiled binary is
+	// published below <StateRoot>/workflows/<Slug>/artifacts/sha256/<digest>/
+	// and selected by candidate.sha256; workflow is compatibility-only.
 	StateRoot string
 
 	// SDKVersion is recorded on the workflows row + the version-1
 	// workflow_versions row. Defaults to "0.1.0" when empty.
 	SDKVersion string
 
-	// SkipIfExists, when true, returns the existing workflow_id without
-	// inserting a new row. The CLI register path uses this for
-	// idempotent re-registration; the dashboard upload + codegen
-	// auto-build paths also benefit from it.
+	// SkipIfExists, when true, reuses the existing workflow_id instead of
+	// inserting a duplicate workflow row. A successful build still appends a
+	// new immutable artifact-bound workflow version.
 	SkipIfExists bool
 
 	// TenantID owns the resulting workflow. Empty means the journal's default
@@ -70,6 +71,9 @@ type JournalForBuildRegister interface {
 	// delegates to it with the default tenant, so both stay on this interface
 	// while callers without a tenant context keep the shorter one.
 	CreateWorkflowInTenant(ctx context.Context, id, slug, codeHash, sdkVersion string, dag json.RawMessage, tenantID string) error
+	CreateWorkflowInTenantWithArtifact(ctx context.Context, id, slug, codeHash, sdkVersion, artifactSHA256 string, dag json.RawMessage, tenantID string) error
+	RecordWorkflowVersionWithArtifact(ctx context.Context, workflowID, sdkVersion, codeHash, artifactSHA256 string, dag json.RawMessage) (int, error)
+	ActivateWorkflowArtifactIfCurrent(ctx context.Context, workflowID string, version int, artifactSHA256 string, activate func() error) (bool, error)
 }
 
 // BuildAndRegister is the canonical "compile a workflow + insert the
@@ -82,11 +86,15 @@ type JournalForBuildRegister interface {
 // Steps:
 //  1. Validate slug.
 //  2. mkdir -p <StateRoot>/workflows/<Slug> with mode 0700.
-//  3. go build -o <StateRoot>/workflows/<Slug>/workflow .  (cwd = SrcDir).
+//  3. go build to a private stage (cwd = SrcDir).
 //  4. Compute SHA-256 of <SrcDir>/main.go (16-char hex prefix).
 //  5. Read <SrcDir>/dag.json (optional; defaults to "{}").
-//  6. If SkipIfExists and the slug is already registered, return its id.
-//  7. Mint a workflow_id + insert via CreateWorkflow.
+//  6. Publish the compiled bytes under their SHA-256 content address.
+//  7. If SkipIfExists and the slug exists, append its next artifact-bound
+//     version; otherwise mint a workflow_id + atomically insert version 1.
+//  8. Record the immutable candidate selected by split build/test tooling.
+//  9. Refresh the mutable compatibility binary under the workflow-version row
+//     lock, but only if this registration is still current.
 func BuildAndRegister(ctx context.Context, j JournalForBuildRegister, req BuildAndRegisterRequest) (BuildAndRegisterResult, error) {
 	if req.Slug == "" || !IsValidSlug(req.Slug) {
 		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: invalid slug %q (must match ^[a-z][a-z0-9-]*$)", req.Slug)
@@ -105,22 +113,11 @@ func BuildAndRegister(ctx context.Context, j JournalForBuildRegister, req BuildA
 	if err := os.MkdirAll(binDir, 0o700); err != nil {
 		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: mkdir %s: %w", binDir, err)
 	}
-	// The daemon owns module setup, on EVERY path into a compile. This used to
-	// run only in BuildAndRegisterSource, so the tarball-upload path built with
-	// the caller's own go.mod verbatim: a `replace github.com/bright-interaction/reactor
-	// => ./vendor/fake` plus attacker code under ./vendor substituted for the
-	// SDK and executed at build time as the daemon uid, and the import
-	// allowlist never saw it because the walker skips vendor trees. Reject the
-	// two escape hatches regenerating go.mod cannot neutralise (a vendor tree,
-	// which Go auto-activates from vendor/modules.txt, and a go.work that
-	// overrides the module graph outright), then regenerate the module.
-	for _, banned := range []string{"vendor", "go.work", "go.work.sum"} {
-		if _, err := os.Stat(filepath.Join(req.SrcDir, banned)); err == nil {
-			return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: %q is not allowed in a workflow source tree (the daemon owns module setup)", banned)
-		}
-	}
-	if err := initModule(ctx, "go", req.SrcDir, req.Slug); err != nil {
-		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: init module: %w", err)
+	// The daemon owns module setup on every path into a compile. The shared
+	// preparation gate rejects module-graph escape hatches, discards supplied
+	// go.mod/go.sum files, and creates the workflow-local module used below.
+	if err := PrepareWorkflowModule(ctx, "go", req.SrcDir, req.Slug); err != nil {
+		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: prepare module: %w", err)
 	}
 	// Static import allowlist BEFORE compiling: a hostile brief or saved
 	// edit must not pull a third-party module that could run code at build
@@ -146,12 +143,30 @@ func BuildAndRegister(ctx context.Context, j JournalForBuildRegister, req BuildA
 		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: the Go toolchain is required to compile workflows but %q was not found on PATH (expected in the distroless production image); build workflows with the reactor CLI on a host that has Go, or deploy an image that bundles the toolchain: %w", "go", err)
 	}
 
-	binPath := filepath.Join(binDir, "workflow")
-	cmd := exec.CommandContext(ctx, "go", "build", BuildVCSFlag, "-o", binPath, ".")
+	stage, err := os.CreateTemp(binDir, ".workflow-build-")
+	if err != nil {
+		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: create binary stage: %w", err)
+	}
+	stagePath := stage.Name()
+	if err := stage.Close(); err != nil {
+		_ = os.Remove(stagePath)
+		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: close binary stage: %w", err)
+	}
+	_ = os.Remove(stagePath) // go build requires control of the output file.
+	defer os.Remove(stagePath)
+	cmd := exec.CommandContext(ctx, "go", "build", BuildVCSFlag, "-o", stagePath, ".")
 	cmd.Dir = req.SrcDir
 	cmd.Env = SecureBuildEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: go build: %w (output: %s)", err, string(out))
+	}
+	fileRegistry := registry.New(filepath.Join(req.StateRoot, "workflows"))
+	artifact, err := fileRegistry.PublishArtifact(req.Slug, stagePath)
+	if err != nil {
+		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: publish immutable artifact: %w", err)
+	}
+	if err := fileRegistry.SetBuildArtifact(req.Slug, artifact.Digest); err != nil {
+		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: record candidate artifact: %w", err)
 	}
 
 	codeHash := ""
@@ -165,7 +180,7 @@ func BuildAndRegister(ctx context.Context, j JournalForBuildRegister, req BuildA
 	}
 
 	res := BuildAndRegisterResult{
-		BinaryPath: binPath,
+		BinaryPath: artifact.Path,
 		CodeHash:   codeHash,
 		DAGRaw:     dag,
 	}
@@ -178,6 +193,16 @@ func BuildAndRegister(ctx context.Context, j JournalForBuildRegister, req BuildA
 		// are unique per tenant, so "some tenant owns this slug" is the wrong
 		// question.
 		if existing, err := j.WorkflowIDBySlugInTenant(ctx, req.Slug, req.TenantID); err == nil && existing != "" {
+			version, err := j.RecordWorkflowVersionWithArtifact(ctx, existing, req.SDKVersion, codeHash, artifact.Digest, dag)
+			if err != nil {
+				return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: record workflow version: %w", err)
+			}
+			if _, err := j.ActivateWorkflowArtifactIfCurrent(ctx, existing, version, artifact.Digest, func() error {
+				_, err := fileRegistry.ActivateArtifact(req.Slug, artifact.Digest)
+				return err
+			}); err != nil {
+				return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: activate workflow artifact: %w", err)
+			}
 			res.WorkflowID = existing
 			return res, nil
 		}
@@ -188,8 +213,14 @@ func BuildAndRegister(ctx context.Context, j JournalForBuildRegister, req BuildA
 		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: id: %w", err)
 	}
 	wfID := "wf_" + hex.EncodeToString(idBytes)
-	if err := j.CreateWorkflowInTenant(ctx, wfID, req.Slug, codeHash, req.SDKVersion, dag, req.TenantID); err != nil {
+	if err := j.CreateWorkflowInTenantWithArtifact(ctx, wfID, req.Slug, codeHash, req.SDKVersion, artifact.Digest, dag, req.TenantID); err != nil {
 		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: create workflow: %w", err)
+	}
+	if _, err := j.ActivateWorkflowArtifactIfCurrent(ctx, wfID, 1, artifact.Digest, func() error {
+		_, err := fileRegistry.ActivateArtifact(req.Slug, artifact.Digest)
+		return err
+	}); err != nil {
+		return BuildAndRegisterResult{}, fmt.Errorf("build_and_register: activate workflow artifact: %w", err)
 	}
 	res.WorkflowID = wfID
 	return res, nil
@@ -204,13 +235,13 @@ type BuildSourceRequest struct {
 	// DAGJSON is the optional dag.json body; defaults to "{}" when empty or
 	// not valid JSON.
 	DAGJSON string
-	// StateRoot is the daemon's state directory; the compiled binary lands at
-	// <StateRoot>/workflows/<Slug>/workflow.
+	// StateRoot is the daemon's state directory; compiled bytes are published
+	// under the slug's immutable SHA-256 artifact namespace.
 	StateRoot string
 	// SDKVersion is recorded on the workflows row; defaults to "0.1.0".
 	SDKVersion string
-	// SkipIfExists returns the existing id without rebuilding when the slug is
-	// already registered.
+	// SkipIfExists reuses the existing id and appends an immutable version when
+	// the slug is already registered.
 	SkipIfExists bool
 }
 
@@ -220,7 +251,7 @@ type BuildSourceRequest struct {
 // AI client writes the Go, Reactor builds it in-container with NO external
 // LLM/API key and no shell access. The source is materialised + built in a
 // temp dir (kept out of the workflows tree), and the compiled binary lands at
-// <StateRoot>/workflows/<Slug>/workflow via BuildAndRegister, which also runs
+// an immutable content address via BuildAndRegister, which also runs
 // the import allowlist + lint + go build gates.
 func BuildAndRegisterSource(ctx context.Context, j JournalForBuildRegister, req BuildSourceRequest) (BuildAndRegisterResult, error) {
 	if req.Slug == "" || !IsValidSlug(req.Slug) {

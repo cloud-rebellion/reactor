@@ -386,7 +386,7 @@ func TestCreateWorkflowToolGatedOnStateRoot(t *testing.T) {
 	srv, _, _ := newTestServer(t, true) // Dispatch set, no StateRoot
 	resps := roundtrip(t, srv, []rpcRequest{{ID: json.RawMessage(`1`), Method: "tools/list"}})
 	body, _ := json.Marshal(resps[0].Result)
-	if strings.Contains(string(body), "reactor_create_workflow") {
+	if strings.Contains(string(body), `"name":"reactor_create_workflow"`) {
 		t.Fatalf("create_workflow must be absent without StateRoot: %s", body)
 	}
 
@@ -394,7 +394,7 @@ func TestCreateWorkflowToolGatedOnStateRoot(t *testing.T) {
 	srv2.StateRoot = t.TempDir()
 	resps2 := roundtrip(t, srv2, []rpcRequest{{ID: json.RawMessage(`1`), Method: "tools/list"}})
 	body2, _ := json.Marshal(resps2[0].Result)
-	if !strings.Contains(string(body2), "reactor_create_workflow") {
+	if !strings.Contains(string(body2), `"name":"reactor_create_workflow"`) {
 		t.Fatalf("create_workflow must be present with StateRoot + Dispatch: %s", body2)
 	}
 }

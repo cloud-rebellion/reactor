@@ -1,0 +1,14 @@
+{
+  "slug": "{{.Slug}}",
+  "version": "1.0.0",
+  "triggers": [{"kind": "webhook", "provider": "automation-v1"}],
+  "steps": [
+    {
+      "name": "hash-create-and-send",
+      "kind": "step",
+      "idempotency_key": "reactor.namespaced(event.event_id)",
+      "timeout_seconds": 30,
+      "retry": {"base_ms": 5000, "max_ms": 300000, "attempts": 12}
+    }
+  ]
+}

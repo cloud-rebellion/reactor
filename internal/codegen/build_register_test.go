@@ -12,16 +12,22 @@ import (
 
 // fakeJournal stubs JournalForBuildRegister.
 type fakeJournal struct {
-	existingSlug   string
-	existingID     string
-	existingTenant string
-	createdID      string
-	createdSlug    string
-	createdHash    string
-	createdSDK     string
-	createdDAG     json.RawMessage
-	createdTenant  string
-	createErr      error
+	existingSlug     string
+	existingID       string
+	existingTenant   string
+	createdID        string
+	createdSlug      string
+	createdHash      string
+	createdSDK       string
+	createdDAG       json.RawMessage
+	createdTenant    string
+	createdArtifact  string
+	recordedID       string
+	recordedArtifact string
+	recordedVersion  int
+	currentVersion   int
+	currentArtifact  string
+	createErr        error
 }
 
 func (f *fakeJournal) WorkflowIDBySlug(_ context.Context, slug string) (string, error) {
@@ -45,6 +51,10 @@ func (f *fakeJournal) CreateWorkflow(ctx context.Context, id, slug, codeHash, sd
 }
 
 func (f *fakeJournal) CreateWorkflowInTenant(_ context.Context, id, slug, codeHash, sdkVersion string, dag json.RawMessage, tenantID string) error {
+	return f.CreateWorkflowInTenantWithArtifact(context.Background(), id, slug, codeHash, sdkVersion, "", dag, tenantID)
+}
+
+func (f *fakeJournal) CreateWorkflowInTenantWithArtifact(_ context.Context, id, slug, codeHash, sdkVersion, artifactSHA256 string, dag json.RawMessage, tenantID string) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
@@ -54,7 +64,32 @@ func (f *fakeJournal) CreateWorkflowInTenant(_ context.Context, id, slug, codeHa
 	f.createdSDK = sdkVersion
 	f.createdDAG = dag
 	f.createdTenant = tenantID
+	f.createdArtifact = artifactSHA256
+	f.currentVersion = 1
+	f.currentArtifact = artifactSHA256
 	return nil
+}
+
+func (f *fakeJournal) RecordWorkflowVersionWithArtifact(_ context.Context, workflowID, _ string, _ string, artifactSHA256 string, _ json.RawMessage) (int, error) {
+	if f.createErr != nil {
+		return 0, f.createErr
+	}
+	f.recordedID = workflowID
+	f.recordedArtifact = artifactSHA256
+	f.recordedVersion++
+	f.currentVersion = f.recordedVersion + 1
+	f.currentArtifact = artifactSHA256
+	return f.currentVersion, nil
+}
+
+func (f *fakeJournal) ActivateWorkflowArtifactIfCurrent(_ context.Context, _ string, version int, artifactSHA256 string, activate func() error) (bool, error) {
+	if version != f.currentVersion || artifactSHA256 != f.currentArtifact {
+		return false, nil
+	}
+	if err := activate(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // writeMiniWorkflow produces a tiny compilable workflow source dir +
@@ -107,6 +142,9 @@ func TestBuildAndRegisterHappyPath(t *testing.T) {
 	if len(j.createdHash) != 16 {
 		t.Fatalf("code hash should be 16 hex chars; got %q", j.createdHash)
 	}
+	if len(j.createdArtifact) != 64 {
+		t.Fatalf("artifact sha256 should be 64 lowercase hex chars; got %q", j.createdArtifact)
+	}
 }
 
 func TestBuildAndRegisterRejectsBadSlug(t *testing.T) {
@@ -124,7 +162,7 @@ func TestBuildAndRegisterRejectsBadSlug(t *testing.T) {
 	}
 }
 
-func TestBuildAndRegisterSkipsExisting(t *testing.T) {
+func TestBuildAndRegisterReusesExistingIDAndAppendsVersion(t *testing.T) {
 	t.Parallel()
 	src := writeMiniWorkflow(t, false)
 	root := t.TempDir()
@@ -146,6 +184,9 @@ func TestBuildAndRegisterSkipsExisting(t *testing.T) {
 	}
 	if j.createdID != "" {
 		t.Fatalf("CreateWorkflow should not have been called; got %s", j.createdID)
+	}
+	if j.recordedID != "wf_existing" || len(j.recordedArtifact) != 64 {
+		t.Fatalf("existing workflow version was not artifact-bound: %+v", j)
 	}
 }
 

@@ -9,8 +9,8 @@ import (
 	"github.com/bright-interaction/reactor/internal/knowledge"
 )
 
-// postmortems renders the AI post-mortem corpus (admin-only). When a run fails
-// permanently (DLQ), the daemon asks Claude for a structured root-cause +
+// postmortems renders the AI post-mortem corpus (admin-only). When explicitly
+// enabled, a permanent (DLQ) failure asks Claude for a structured root-cause +
 // recommendation and stores it as a knowledge entry under topic "post-mortems".
 // Those same entries are searchable over MCP, so the next agent that builds or
 // repairs a workflow reads the accumulated lessons: the platform gets better at
@@ -39,9 +39,9 @@ func (s *Server) postmortems(w http.ResponseWriter, r *http.Request) {
 
 func postmortemsBody(entries []knowledge.Entry) string {
 	var b strings.Builder
-	b.WriteString(`<p class="muted">Every permanent failure becomes an AI post-mortem: Claude analyses the run + steps and writes a root cause, lesson, and recommendation here. These entries are searchable over MCP, so the next agent that builds or fixes a workflow reads the accumulated lessons. That is the self-healing loop -- failures compound into knowledge that improves future builds.</p>`)
+	b.WriteString(`<p class="muted">When AI post-mortems are explicitly enabled, Claude analyses redacted run metadata and fixed error summaries and writes a root cause, lesson, and recommendation here. Raw Step errors, trigger bodies, and Step outputs are not sent. These entries are searchable over MCP, so future workflow repairs can use the accumulated lessons.</p>`)
 	if len(entries) == 0 {
-		b.WriteString(`<p class="muted">No post-mortems yet. They appear automatically the first time a run fails permanently (with an Anthropic API key configured).</p>`)
+		b.WriteString(`<p class="muted">No post-mortems yet. Automatic generation requires both the explicit AI post-mortem opt-in and an Anthropic API key.</p>`)
 		return b.String()
 	}
 	for _, e := range entries {

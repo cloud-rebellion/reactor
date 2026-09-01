@@ -108,7 +108,7 @@ Deeper material lives in [docs/](docs/): [architecture](docs/architecture.md), [
 
 ## Deployment
 
-See [deploy/README.md](deploy/README.md) for systemd + Docker walkthroughs. [`deploy/docker-compose.yml`](deploy/docker-compose.yml) is the fastest path. Native packages: [`packaging/`](packaging/) ships the Homebrew formula template + nfpm config the release CI uses to build `.deb` and `.rpm` artifacts on every `v*` tag.
+See [deploy/README.md](deploy/README.md) for systemd + Docker walkthroughs. [`deploy/docker-compose.yml`](deploy/docker-compose.yml) is a development-only SQLite quickstart; production bridges use the documented PostgreSQL `serve --mode distributed` plus dedicated `worker` topology. Native packages: [`packaging/`](packaging/) ships the Homebrew formula template + nfpm config the release CI uses to build `.deb` and `.rpm` artifacts on every `v*` tag.
 
 ## License
 

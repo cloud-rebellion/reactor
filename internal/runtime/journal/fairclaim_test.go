@@ -18,11 +18,11 @@ func mkWorkflowTenant(t *testing.T, j *Journal, ctx context.Context, wfID, tenan
 	}
 }
 
-func tenantOf(t *testing.T, j *Journal, ctx context.Context, ids []string) map[string]int {
+func tenantOf(t *testing.T, j *Journal, ctx context.Context, ids []RunLease) map[string]int {
 	t.Helper()
 	counts := map[string]int{}
-	for _, id := range ids {
-		counts[runTenant(t, j, ctx, id)]++
+	for _, claim := range ids {
+		counts[runTenant(t, j, ctx, claim.RunID)]++
 	}
 	return counts
 }
@@ -131,5 +131,33 @@ func TestClaimSkipsDisabledTenant(t *testing.T) {
 	}
 	if c := tenantOf(t, j, ctx, ids)["off"]; c != 0 {
 		t.Fatalf("disabled tenant claimed %d, want 0", c)
+	}
+}
+
+func TestClaimSkipsDisabledWorkflowUntilReenabled(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflow(ctx, "wf_paused_queue", "paused-queue", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateQueuedRun(ctx, "run_paused_queue", "wf_paused_queue", "webhook", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SetWorkflowEnabled(ctx, "wf_paused_queue", false); err != nil {
+		t.Fatal(err)
+	}
+	if claims, err := j.ClaimQueuedRuns(ctx, "worker", 1, time.Minute); err != nil || len(claims) != 0 {
+		t.Fatalf("disabled workflow claim = %v, %v; want none", claims, err)
+	}
+	if run, err := j.GetRun(ctx, "run_paused_queue"); err != nil || run.Status != "queued" {
+		t.Fatalf("disabled workflow queue state = %+v, %v", run, err)
+	}
+	if err := j.SetWorkflowEnabled(ctx, "wf_paused_queue", true); err != nil {
+		t.Fatal(err)
+	}
+	if claims, err := j.ClaimQueuedRuns(ctx, "worker", 1, time.Minute); err != nil || len(claims) != 1 || claims[0].RunID != "run_paused_queue" {
+		t.Fatalf("reenabled workflow claim = %v, %v", claims, err)
 	}
 }

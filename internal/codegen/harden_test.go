@@ -57,7 +57,7 @@ func TestSecureBuildEnvAllowlistDropsNonPrefixedSecret(t *testing.T) {
 			t.Errorf("build env leaked non-prefixed secret %q (denylist->allowlist regression)", leaked)
 		}
 	}
-	for _, want := range []string{"CGO_ENABLED=0", "GOPROXY=off", "GOENV=off", "PATH=/usr/bin"} {
+	for _, want := range []string{"CGO_ENABLED=0", "GOWORK=off", "GOPROXY=off", "GOENV=off", "PATH=/usr/bin"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("build env missing hermetic pin %q", want)
 		}
@@ -100,6 +100,46 @@ func main() { _ = context.Background(); fmt.Println(sdk.Version) }
 	if err := CheckAllowedImports(dir); err != nil {
 		t.Fatalf("stdlib + SDK imports should pass, got: %v", err)
 	}
+}
+
+func TestStageWorkflowSourceIsNonDestructiveAndRejectsSymlinks(t *testing.T) {
+	t.Run("preserves caller module files", func(t *testing.T) {
+		source := t.TempDir()
+		writeGo(t, source, "main.go", "package main\nfunc main() {}\n")
+		module := []byte("module caller-owned\n")
+		if err := os.WriteFile(filepath.Join(source, "go.mod"), module, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		stage, cleanup, err := StageWorkflowSource(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cleanup()
+		if _, err := os.Stat(filepath.Join(stage, "main.go")); err != nil {
+			t.Fatalf("staged main.go: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(stage, "go.mod")); !os.IsNotExist(err) {
+			t.Fatalf("caller module file entered build stage: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(source, "go.mod"))
+		if err != nil || string(got) != string(module) {
+			t.Fatalf("source go.mod changed: got %q err=%v", got, err)
+		}
+	})
+
+	t.Run("rejects symlink", func(t *testing.T) {
+		source := t.TempDir()
+		outside := filepath.Join(t.TempDir(), "outside.go")
+		writeGo(t, filepath.Dir(outside), filepath.Base(outside), "package main\n")
+		if err := os.Symlink(outside, filepath.Join(source, "main.go")); err != nil {
+			t.Fatal(err)
+		}
+		if _, cleanup, err := StageWorkflowSource(source); err == nil {
+			cleanup()
+			t.Fatal("symlink unexpectedly entered build stage")
+		}
+	})
 }
 
 // TestSecureBuildEnvStripsSecrets confirms the untrusted `go build`

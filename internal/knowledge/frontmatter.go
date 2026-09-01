@@ -32,7 +32,7 @@ type Frontmatter struct {
 	// anything an admin authors estate-wide, readable by every tenant. A
 	// non-empty value belongs to that tenant alone. Automatic post-mortems are
 	// stamped from the run, which is what keeps one tenant's failure detail
-	// (workflow slug, step names, step error text) out of another's view.
+	// (workflow slug, step names, synthesized diagnostics) out of another's view.
 	Tenant          string    `yaml:"tenant,omitempty"`
 	Title           string    `yaml:"title"`
 	CreatedAt       time.Time `yaml:"created_at"`

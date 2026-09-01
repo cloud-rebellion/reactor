@@ -4,8 +4,11 @@ Reactor runs in one of two modes, chosen with `--mode` (or `REACTOR_MODE`):
 
 - **`local`** (default) -- single binary. Triggers execute workflows
   in-process as subprocesses, bounded by `REACTOR_MAX_CONCURRENT_RUNS`
-  (default 32). SQLite or Postgres. This is everything most self-hosters
-  need: a bigger box goes a long way.
+  (default 32). SQLite or Postgres. Interrupted runs resume from durable Step,
+  retry-attempt, and DLQ-repair checkpoints instead of resetting their bounded
+  attempt budget. This is single-process recovery, not leased high
+  availability: local mode remains useful for development and evaluation but
+  is not the approved production topology for the Hash e-signature bridge.
 - **`distributed`** -- horizontal scale. The daemon ENQUEUES runs; one or
   more `reactor worker` processes claim and execute them off a shared
   Postgres-backed queue. Add capacity by running more workers. **Requires
@@ -45,6 +48,16 @@ execution + horizontal scale on just Postgres.
   (`status` back to `queued`). Re-running is safe: the supervisor replays
   completed steps from the journal, so the run resumes rather than
   repeating side effects.
+- Queue admission pins the exact content-addressed workflow artifact. All API
+  and worker nodes therefore need the same durable artifact set. Execution
+  nodes must receive it through a read-only shared mount or an atomic,
+  checksum-verified distribution; they must not rewrite artifacts in place. A
+  rolling v2 activation cannot make an existing v1 run execute v2; v1 resolves
+  its historical digest. An invalid or unpinned persisted identity fails the
+  run through the terminal artifact fence. When the identity is valid but a
+  node cannot read or verify its local bytes, execution stays blocked and the
+  exact run/schedule remains recoverable with bounded backoff and an
+  operator-visible run-log marker. It never falls through to newer bytes.
 - Sleep/signal **resumes** are re-enqueued too -- the scheduler flips a
   woken run back to `queued` and a worker picks it up, so long-running and
   suspended workloads also spread across the fleet.
@@ -53,13 +66,23 @@ execution + horizontal scale on just Postgres.
   Postgres advisory lock. Run multiple `serve` daemons for HA: followers
   serve HTTP + enqueue, and one takes over leadership if the leader dies.
 
+The journal cache closes the ordinary process-crash gap only after a Step's
+successful result is committed. There is necessarily a smaller external-commit
+gap: a worker can die after Hash accepted a create-and-send command but before
+Reactor records `StepEnd`. The replacement worker must execute that Step again.
+Hash Steps are safe only because both attempts reuse the exact stable external
+event-derived Reactor Step key and Hash `Idempotency-Key`; Hash returns the
+original document rather than creating another. Never derive either key from a
+retry number, timestamp, worker, or deployment version. The lifecycle bridge
+uses the same rule with Hash `event_id` and BrightCRM's durable dedup record.
+
 ## Running it
 
 ```bash
 # one (or more) API + leader daemon(s)
 reactor serve --mode distributed --db postgres://user:pw@db/reactor --root /var/lib/reactor
 
-# as many workers as you need, same DB + state root
+# as many workers as you need, same DB + immutable artifact set
 reactor worker --db postgres://user:pw@db/reactor --root /var/lib/reactor --concurrency 16
 reactor worker --db postgres://user:pw@db/reactor --root /var/lib/reactor --concurrency 16
 ```
@@ -77,6 +100,16 @@ drains in-flight runs first).
 | `--lease-ttl` | `60s` | lease validity; heartbeated while running, reaped if a worker dies |
 | `--poll-interval` | `2s` | how often an idle worker polls for work |
 | `--drain-timeout` / `REACTOR_DRAIN_TIMEOUT` | `30s` | shutdown grace before in-flight runs are killed |
+
+### Retry/DLQ version cutovers
+
+The release that introduces durable `dlq_pending` repair checkpoints and exact
+DLQ step identity is not safe as a mixed old/new worker rollout. Before applying
+that release or migration, quiesce admission, disable any autoscaler that could
+start the old image, gracefully drain every old worker, and verify that no old
+worker process remains. Apply the migrations, distribute the reviewed immutable
+artifacts, upgrade `serve` and the worker image, then start only new-version
+workers and run restart plus DLQ-redrive smoke tests before reopening admission.
 
 ## Autoscaling (optional)
 
@@ -134,14 +167,15 @@ safety. The hard `MAX` cap matters most off-host: it bounds how many
 containers or Pods the autoscaler can ever create.
 
 **docker.** The worker container runs `worker --db <db> --root <root>`.
-Workers need the compiled workflow binaries under `--root`, so mount the
-host state root (and set the DB network) with `REACTOR_AUTOSCALE_DOCKER_ARGS`,
-e.g. `REACTOR_AUTOSCALE_DOCKER_ARGS="-v /var/lib/reactor:/var/lib/reactor --network host"`.
+Workers need the compiled workflow binaries under `--root`. For a production
+fleet, provide the reviewed artifact set through a read-only mount (or an
+atomic, checksum-verified local distribution) and set the DB network with
+`REACTOR_AUTOSCALE_DOCKER_ARGS`, for example:
 
 ```bash
 REACTOR_AUTOSCALE_SPAWNER=docker \
 REACTOR_WORKER_IMAGE=registry.example.com/reactor:latest \
-REACTOR_AUTOSCALE_DOCKER_ARGS="-v /var/lib/reactor:/var/lib/reactor --network host" \
+REACTOR_AUTOSCALE_DOCKER_ARGS="-v /var/lib/reactor:/var/lib/reactor:ro --network host" \
 reactor serve --mode distributed --autoscale --db postgres://... --root /var/lib/reactor
 ```
 
@@ -152,8 +186,9 @@ scale-down deletes it. Set `REACTOR_AUTOSCALE_K8S_NAMESPACE` (default
 Secret: `REACTOR_AUTOSCALE_K8S_DB_SECRET=reactor-db` (key
 `REACTOR_AUTOSCALE_K8S_DB_SECRET_KEY`, default `db-url`) -- it is injected
 as env and passed via `--db $(REACTOR_DB)`. Multi-host workers need the
-workflow binaries available cluster-wide, so bake them into the image or
-mount a shared `--root` (PVC/NFS) in the Pod spec.
+workflow binaries available cluster-wide, so bake the reviewed immutable set
+into the image or mount a shared `--root` (PVC/NFS) with `readOnly: true` in
+the Pod spec. Publish new artifacts outside the worker execution root.
 
 **command.** Total flexibility for anything else (Nomad, systemd, an
 internal API). Your spawn command must print the new worker's id to stdout;
@@ -236,14 +271,15 @@ automatically with the failing step and its error text plus a link to the run
 timeline, and a recurring-failure summary that ranks workflows by failure
 count so you fix the worst offenders first. It is tenant-scoped like the rest.
 
-The **`/postmortems`** page closes a self-healing loop. When a run fails
-permanently (lands in the dead-letter queue), the daemon asks Claude to analyse
-the run and steps and emit a structured post-mortem (root cause, lesson,
-recommendation), which it stores in the knowledge corpus. That same corpus is
-searchable over MCP, so the next agent that builds or repairs a workflow reads
-the accumulated lessons: failures compound into knowledge that improves future
-builds. (Needs an Anthropic API key; without one the dead-letter queue still
-works, you just don't get auto-generated lessons.)
+The **`/postmortems`** page can close a self-healing loop. When explicitly
+enabled, a terminal DLQ run asks Claude to analyse redacted stable metadata and
+fixed error summaries; raw Step errors, trigger bodies, and output bodies are
+never included. Claude emits a structured post-mortem (root cause, lesson,
+recommendation), which Reactor stores in the knowledge corpus. That same corpus
+is searchable over MCP, so the next agent that builds or repairs a workflow can
+read the accumulated lessons. This external egress is default-off and requires
+both `REACTOR_AI_POSTMORTEM_ENABLED=true` and `ANTHROPIC_API_KEY`; the DLQ works
+normally without either setting.
 
 ## What this is (and isn't) for
 

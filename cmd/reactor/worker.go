@@ -14,6 +14,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/runtime/cancelreg"
+	"github.com/bright-interaction/reactor/internal/runtime/journal"
 )
 
 // cmdWorker runs a distributed-mode worker: it claims queued runs from the
@@ -47,6 +50,15 @@ func cmdWorker(ctx context.Context, log *slog.Logger, args []string) error {
 	}
 	if *concurrency < 1 {
 		*concurrency = 1
+	}
+	if *leaseTTL <= 0 {
+		return errors.New("worker: --lease-ttl must be greater than zero")
+	}
+	if *pollInterval <= 0 {
+		return errors.New("worker: --poll-interval must be greater than zero")
+	}
+	if *drainTimeout <= 0 {
+		return errors.New("worker: --drain-timeout must be greater than zero")
 	}
 	masterHex, err := loadMasterKey(*masterKeyHex, *masterKeyFile, *root)
 	if err != nil {
@@ -150,26 +162,45 @@ func runWorkerLoop(ctx context.Context, log *slog.Logger, deps *serveDeps, opts 
 			}
 			continue
 		}
-		for _, id := range ids {
+		for _, claim := range ids {
 			sem <- struct{}{}
 			wg.Add(1)
-			go func(runID string) {
+			go func(claim journal.RunLease) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				stopHB := make(chan struct{})
-				go heartbeatLease(deps, runID, workerID, opts.leaseTTL, stopHB)
-				if err := deps.dispatcher.ExecuteRun(context.Background(), runID); err != nil {
-					log.Error("worker: execute failed", "run_id", runID, "err", err)
+				execCtx, cancelExec := context.WithCancelCause(context.Background())
+				hbCtx, stopHeartbeat := context.WithCancel(context.Background())
+				hbDone := make(chan error, 1)
+				go func() {
+					hbDone <- heartbeatLease(hbCtx, deps.journal, claim.RunID, claim.Owner, opts.leaseTTL, cancelExec)
+				}()
+				execErr := deps.dispatcher.ExecuteRun(execCtx, claim.RunID, claim.Owner)
+				stopHeartbeat()
+				hbErr := <-hbDone
+				cancelExec(context.Canceled)
+				if execErr != nil {
+					log.Error("worker: execute failed", "run_id", claim.RunID, "err", execErr)
 				}
-				close(stopHB)
-			}(id)
+				if hbErr != nil {
+					log.Error("worker: lease heartbeat failed; execution cancelled", "run_id", claim.RunID, "err", hbErr)
+				}
+			}(claim)
 		}
 	}
 
+	// Close admission before sampling/draining. A claim goroutine that had not
+	// entered ExecuteRun yet is rejected and leaves its exact lease recoverable
+	// for normal expiry/reaping; it cannot Add after Drain observed zero.
+	deps.dispatcher.Stop()
 	log.Info("worker: draining in-flight runs", "count", deps.dispatcher.InFlight(), "timeout", opts.drainTimeout.String())
 	if err := deps.dispatcher.Drain(opts.drainTimeout); err != nil {
-		killed := deps.cancels.CancelAll()
-		log.Warn("worker: drain timed out; killed in-flight runs", "killed", killed, "err", err)
+		// A rolling shutdown is infrastructure interruption, not an operator
+		// cancelling these runs. Cause-aware cancellation kills the children but
+		// makes distributed supervisors retain their running rows and leases so
+		// lease expiry + reaping can safely resume them on another worker.
+		admissions := deps.dispatcher.CancelAdmissions(cancelreg.ErrInfrastructureShutdown)
+		killed := deps.cancels.CancelAllWithCause(cancelreg.ErrInfrastructureShutdown)
+		log.Warn("worker: drain timed out; interrupted in-flight runs for recovery", "killed", killed, "admissions", admissions, "err", err)
 		_ = deps.dispatcher.Drain(5 * time.Second)
 	}
 	wg.Wait()
@@ -216,20 +247,62 @@ func reaperLoop(ctx context.Context, log *slog.Logger, deps *serveDeps, leaseTTL
 
 // heartbeatLease keeps a claimed run's lease fresh while it executes so the
 // reaper doesn't requeue a long-but-healthy run. Stops when stop is closed.
-func heartbeatLease(deps *serveDeps, runID, workerID string, leaseTTL time.Duration, stop <-chan struct{}) {
+type leaseHeartbeatJournal interface {
+	ExtendLease(ctx context.Context, runID, owner string, ttl time.Duration) error
+	GetRun(ctx context.Context, runID string) (journal.RunInfo, error)
+}
+
+var errLeaseHeartbeatUnsafe = errors.New("worker: lease heartbeat lost")
+
+func heartbeatLease(ctx context.Context, j leaseHeartbeatJournal, runID, owner string, leaseTTL time.Duration, cancelExec context.CancelCauseFunc) error {
 	interval := leaseTTL / 3
-	if interval < time.Second {
-		interval = time.Second
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
-		case <-stop:
-			return
+		case <-ctx.Done():
+			return nil
 		case <-t.C:
-			_ = deps.journal.ExtendLease(context.Background(), runID, workerID, leaseTTL)
+			err := j.ExtendLease(ctx, runID, owner, leaseTTL)
+			if err == nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			cause := fmt.Errorf("%w: run=%s: %v", errLeaseHeartbeatUnsafe, runID, err)
+			// Ownership is the only safe authority to keep the child alive. A
+			// terminal probe cannot prove this generation produced that outcome:
+			// a replacement may have reaped, finished, and released first.
+			cancelExec(cause)
+			// Finalization atomically writes the terminal/suspended state and
+			// deletes the lease. A heartbeat racing just after that commit is a
+			// normal heartbeat stop, but the child context is still cancelled because
+			// the terminal row may belong to a newer claim generation.
+			if errors.Is(err, journal.ErrLeaseOwnershipLost) {
+				probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+				run, probeErr := j.GetRun(probeCtx, runID)
+				cancel()
+				if probeErr == nil && isDurableOutcomeStatus(run.Status) {
+					return nil
+				}
+			}
+			return cause
 		}
+	}
+}
+
+func isDurableOutcomeStatus(status string) bool {
+	switch status {
+	case "succeeded", "failed", "failed_dlq", "cancelled", "suspended":
+		return true
+	default:
+		// queued is especially important here: it means the lease was reaped
+		// and a replacement may claim at any moment, so the stale child must die.
+		return false
 	}
 }
 

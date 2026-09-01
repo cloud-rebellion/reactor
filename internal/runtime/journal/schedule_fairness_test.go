@@ -129,6 +129,56 @@ func TestFindDueSchedulesSkipsDisabledTenants(t *testing.T) {
 	}
 }
 
+// Disabling one workflow is also an execution kill switch for work already
+// parked on Sleep/AwaitSignal. The scheduler must leave the row pending and the
+// run suspended, so a later re-enable resumes it instead of dropping it.
+func TestFindDueSchedulesSkipsDisabledWorkflowUntilReenabled(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	seedDueSleeps(t, j, "paused", 1, time.Now().UTC().Add(-time.Hour))
+	if err := j.SetWorkflowEnabled(ctx, "wf_paused", false); err != nil {
+		t.Fatal(err)
+	}
+	due, err := j.FindDueSchedules(ctx, time.Now().UTC(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("disabled workflow returned %d due schedules; want none", len(due))
+	}
+	// Also exercise the atomic claim gate directly. This models a scheduler
+	// that selected the row just before the disable transaction committed.
+	pending, err := j.FindLatestSleepSchedule(ctx, "run_paused_0", "wait")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := j.ClaimScheduleResume(ctx, pending.ID, false); err != nil || claimed {
+		t.Fatalf("disabled workflow direct resume claim = %v, %v; want false", claimed, err)
+	}
+	info, err := j.GetRun(ctx, "run_paused_0")
+	if err != nil || info.Status != "suspended" {
+		t.Fatalf("disabled workflow run changed = %+v, %v", info, err)
+	}
+	schedule, err := j.FindLatestSleepSchedule(ctx, "run_paused_0", "wait")
+	if err != nil || schedule.Fired {
+		t.Fatalf("disabled workflow schedule was consumed = %+v, %v", schedule, err)
+	}
+
+	if err := j.SetWorkflowEnabled(ctx, "wf_paused", true); err != nil {
+		t.Fatal(err)
+	}
+	due, err = j.FindDueSchedules(ctx, time.Now().UTC(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != schedule.ID {
+		t.Fatalf("re-enabled workflow due schedules = %+v; want %s", due, schedule.ID)
+	}
+}
+
 // TestFindDueSchedulesHonoursConcurrencyCap covers the quota bypass. Resumption
 // never went through CheckWorkflowEnqueueAllowed, so a tenant could exceed
 // max_concurrent_runs simply by having its workflows sleep: the cap applied to

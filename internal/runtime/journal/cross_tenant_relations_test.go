@@ -44,6 +44,10 @@ func TestCrossTenantRelationsAreRefused(t *testing.T) {
 		if _, err := j.CreateChainTrigger(ctx, "wf_acme_b", "wf_acme_a", "succeeded"); err != nil {
 			t.Fatalf("same-tenant chain must still work: %v", err)
 		}
+		triggers, err := j.ListTriggersForWorkflow(ctx, "wf_acme_b")
+		if err != nil || len(triggers) != 1 || triggers[0].TenantID != "acme" {
+			t.Fatalf("chain trigger did not inherit downstream tenant: %+v, %v", triggers, err)
+		}
 		// A nonexistent endpoint is refused rather than silently succeeding,
 		// which is how phantom grants got in through MCP and the CLI.
 		if _, err := j.CreateChainTrigger(ctx, "wf_acme_b", "wf_ghost", "succeeded"); err == nil {

@@ -17,6 +17,9 @@ func TestScheduleSleepAndFindDue(t *testing.T) {
 	pastA, _ := j.ScheduleSleep(ctx, "run_1", "wait-a", now.Add(-time.Hour))
 	pastB, _ := j.ScheduleSleep(ctx, "run_1", "wait-b", now.Add(-30*time.Minute))
 	_, _ = j.ScheduleSleep(ctx, "run_1", "future", now.Add(time.Hour))
+	if err := j.SetRunStatus(ctx, "run_1", "suspended"); err != nil {
+		t.Fatal(err)
+	}
 
 	due, err := j.FindDueSchedules(ctx, now, 10)
 	if err != nil {
@@ -184,6 +187,9 @@ func TestFindDueSchedulesIncludesSignalRows(t *testing.T) {
 	if _, _, err := j.FireSignal(ctx, "sig_b", []byte(`"yes"`)); err != nil {
 		t.Fatal(err)
 	}
+	if err := j.SetRunStatus(ctx, "run_1", "suspended"); err != nil {
+		t.Fatal(err)
+	}
 
 	// FireSignal bumps wake_at to time.Now() (which may be after the
 	// captured `now`); query a moment in the future to capture both rows.
@@ -326,6 +332,9 @@ func TestFindDueSchedulesSkipsUnparseableWakeAt(t *testing.T) {
 
 	if _, err := j.ScheduleSleep(ctx, "run_1", "good", time.Now().Add(-time.Minute)); err != nil {
 		t.Fatalf("schedule sleep: %v", err)
+	}
+	if err := j.SetRunStatus(ctx, "run_1", "suspended"); err != nil {
+		t.Fatal(err)
 	}
 	const q = `INSERT INTO schedules (id, run_id, step_name, kind, wake_at, fired)
 		VALUES ($1, $2, $3, 'sleep', $4, $5)`

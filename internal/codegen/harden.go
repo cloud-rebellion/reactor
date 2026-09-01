@@ -4,12 +4,106 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+// StageWorkflowSource copies a workflow into a private temporary directory for
+// compilation. Caller-owned module files are deliberately omitted because
+// Reactor creates a trusted module graph in the staging directory; the source
+// tree itself is never rewritten by a build. Symlinks and special files are
+// rejected so staging cannot read outside the selected workflow directory or
+// block on a device/FIFO.
+func StageWorkflowSource(src string) (string, func(), error) {
+	info, err := os.Stat(src)
+	if err != nil {
+		return "", nil, fmt.Errorf("stage workflow source: stat: %w", err)
+	}
+	if !info.IsDir() {
+		return "", nil, fmt.Errorf("stage workflow source: %q is not a directory", src)
+	}
+	for _, banned := range []string{"vendor", "go.work", "go.work.sum"} {
+		if _, err := os.Lstat(filepath.Join(src, banned)); err == nil {
+			return "", nil, fmt.Errorf("stage workflow source: %q is not allowed in a workflow source tree", banned)
+		} else if !os.IsNotExist(err) {
+			return "", nil, fmt.Errorf("stage workflow source: inspect %q: %w", banned, err)
+		}
+	}
+
+	stage, err := os.MkdirTemp("", "reactor-workflow-build-")
+	if err != nil {
+		return "", nil, fmt.Errorf("stage workflow source: create temporary directory: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(stage) }
+	fail := func(err error) (string, func(), error) {
+		cleanup()
+		return "", nil, err
+	}
+
+	err = filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("stage workflow source: symlink %q is not allowed", rel)
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return os.Mkdir(filepath.Join(stage, rel), 0o700)
+		}
+		if rel == "go.mod" || rel == "go.sum" {
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("stage workflow source: special file %q is not allowed", rel)
+		}
+
+		input, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		openedInfo, err := input.Stat()
+		if err != nil || !openedInfo.Mode().IsRegular() {
+			_ = input.Close()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("stage workflow source: file %q changed while staging", rel)
+		}
+		output, err := os.OpenFile(filepath.Join(stage, rel), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		if _, err := io.Copy(output, input); err != nil {
+			_ = input.Close()
+			_ = output.Close()
+			return err
+		}
+		if err := input.Close(); err != nil {
+			_ = output.Close()
+			return err
+		}
+		return output.Close()
+	})
+	if err != nil {
+		return fail(fmt.Errorf("stage workflow source: %w", err))
+	}
+	return stage, cleanup, nil
+}
 
 // AllowedImportPrefixes is the set of non-stdlib import path prefixes a
 // generated or uploaded workflow may use. Everything in the standard
@@ -144,6 +238,8 @@ func importAllowed(path string) bool {
 //   - GOTOOLCHAIN=local pins the toolchain so a hostile go.mod `toolchain`
 //     line can't trigger a network toolchain download + exec.
 //   - GOFLAGS=-mod=mod keeps module resolution working for the SDK import.
+//   - GOWORK=off prevents a workspace file above the source directory from
+//     replacing Reactor's freshly generated module graph.
 //
 // buildEnvAllowlist is the set of environment variables the untrusted
 // `go build` of workflow source may inherit. It is an ALLOWLIST, not a
@@ -179,6 +275,7 @@ func SecureBuildEnv() []string {
 		"CGO_ENABLED=0",
 		"GOTOOLCHAIN=local",
 		"GOFLAGS=-mod=mod",
+		"GOWORK=off",
 		"GOPROXY=off",
 		"GOSUMDB=off",
 		"GOENV=off",

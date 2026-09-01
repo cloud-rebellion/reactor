@@ -28,6 +28,8 @@ var availableTemplates = []string{
 	"scheduled-rotation",
 	"approval-flow",
 	"stripe-webhook",
+	"hash-esign-bridge",
+	"hash-esign-lifecycle",
 	"github-pr-reviewer",
 	"scheduled-report",
 }
@@ -43,7 +45,11 @@ var availableTemplates = []string{
 func cmdNew(_ context.Context, _ *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("new", flag.ContinueOnError)
 	dest := fs.String("dest", ".", "destination directory; new <slug>/ subdir is created here")
-	if err := fs.Parse(reorderArgs(args)); err != nil {
+	orderedArgs, err := reorderNewArgs(args)
+	if err != nil {
+		return err
+	}
+	if err := fs.Parse(orderedArgs); err != nil {
 		return err
 	}
 	if fs.NArg() < 2 {
@@ -80,9 +86,33 @@ func cmdNew(_ context.Context, _ *slog.Logger, args []string) error {
 		return err
 	}
 
-	fmt.Printf("created %s/ from template %s\n\nNext steps:\n  cd %s\n  reactor workflow build --src . --slug %s\n  reactor workflow register --db <url> --slug %s --src main.go\n",
-		target, tmplName, target, slug, slug)
+	fmt.Printf("created %s/ from template %s\n\nNext steps:\n  cd %s\n  reactor workflow build --src . --slug %s\n  %s\n",
+		target, tmplName, target, slug, workflowRegisterHint(slug))
 	return nil
+}
+
+func workflowRegisterHint(slug string) string {
+	return fmt.Sprintf("reactor workflow register --db <url> --slug %s --src main.go --dag dag.json --artifact-sha256 <sha256-printed-by-build>", slug)
+}
+
+// reorderNewArgs supports the documented positional-first form
+// `reactor new <template> <slug> --dest <dir>`. The shared reorderArgs helper
+// can only move --name=value and boolean flags because it cannot know which
+// arbitrary flags consume a following value.
+func reorderNewArgs(args []string) ([]string, error) {
+	normalized := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		if args[index] == "--dest" || args[index] == "-dest" {
+			if index+1 >= len(args) {
+				return nil, errors.New("new: --dest requires a directory")
+			}
+			normalized = append(normalized, args[index]+"="+args[index+1])
+			index++
+			continue
+		}
+		normalized = append(normalized, args[index])
+	}
+	return reorderArgs(normalized), nil
 }
 
 func knownTemplate(name string) bool {

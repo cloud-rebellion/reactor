@@ -62,10 +62,22 @@ func (j *Journal) CreateChainTrigger(ctx context.Context, downstreamWorkflowID, 
 	if err != nil {
 		return "", err
 	}
-	const q = `INSERT INTO triggers (id, workflow_id, kind, config_json, state, source_workflow_id)
-		VALUES ($1, $2, $3, $4, 'active', $5)`
-	if _, err := j.db.ExecContext(ctx, j.bind(q), id, downstreamWorkflowID, string(TriggerWorkflowComplete), outputArg(cfg, j.engine), sourceWorkflowID); err != nil {
+	// As with webhook and cron triggers, ownership is inherited from the
+	// downstream workflow atomically rather than falling through to the schema's
+	// default tenant.
+	const q = `INSERT INTO triggers (id, tenant_id, workflow_id, kind, config_json, state, source_workflow_id)
+		SELECT $1, tenant_id, id, $2, $3, 'active', $4
+		FROM workflows WHERE id = $5`
+	res, err := j.db.ExecContext(ctx, j.bind(q), id, string(TriggerWorkflowComplete), outputArg(cfg, j.engine), sourceWorkflowID, downstreamWorkflowID)
+	if err != nil {
 		return "", fmt.Errorf("journal: create chain trigger: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", fmt.Errorf("journal: create chain trigger rows affected: %w", err)
+	}
+	if n != 1 {
+		return "", ErrNotFound
 	}
 	return id, nil
 }

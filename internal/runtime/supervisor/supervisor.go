@@ -116,11 +116,28 @@ type Supervisor struct {
 	// true: empty table allows every fetch (the legacy v0 behaviour;
 	// kept for migration scenarios via REACTOR_VAULT_ACL_PERMISSIVE=1).
 	ACLPermissive bool
+
+	// LeaseOwner is the opaque per-claim generation assigned by the
+	// distributed queue. When set, every run-state transition is fenced by
+	// this exact owner and committed atomically with releasing its lease.
+	// Empty means local/replay execution and preserves the single-node path.
+	LeaseOwner string
 }
+
+// ErrRunRecoverable tells a distributed worker that the child process died at
+// a durable running/retrying step boundary. The run intentionally remains
+// running with its lease intact; normal expiry + reaping will enqueue a fresh
+// supervisor which consumes the durable retry budget.
+var ErrRunRecoverable = errors.New("supervisor: workflow process crashed at a recoverable step boundary")
+
+// ErrDeadLetterRepairRecoverable tags a failed exact-DLQ repair. Even when the
+// database error happened before StatusDLQPending could be committed, a leased
+// worker must leave the run/lease intact for expiry and repair retry.
+var ErrDeadLetterRepairRecoverable = errors.New("supervisor: exact dead-letter repair is recoverable")
 
 // Run spawns the workflow binary and dispatches its frames until EOF or
 // ctx cancellation. Returns the run's terminal status.
-func (s *Supervisor) Run(ctx context.Context) (string, error) {
+func (s *Supervisor) Run(ctx context.Context) (status string, runErr error) {
 	if s.Log == nil {
 		s.Log = slog.Default()
 	}
@@ -130,6 +147,52 @@ func (s *Supervisor) Run(ctx context.Context) (string, error) {
 	if s.SuspendThreshold == 0 {
 		s.SuspendThreshold = 30 * time.Second
 	}
+	status = "failed"
+	forceLocalRecovery := false
+	// A single exit funnels every path (including stdin/stdout/start/hello
+	// failures and panics) through durable state persistence. Returning an
+	// empty status means no transition committed, so callers must not fire
+	// terminal hooks.
+	defer func() {
+		if rec := recover(); rec != nil {
+			status = "failed"
+			runErr = errors.Join(runErr, fmt.Errorf("supervisor: panic: %v", rec))
+		}
+		if s.Mode == "replay" || status == "" {
+			return
+		}
+		if ctx.Err() != nil {
+			// A non-standard cancellation cause is the distributed heartbeat
+			// declaring this lease unsafe. Do not convert that into an operator
+			// cancellation or release the possibly-replaced lease.
+			cause := context.Cause(ctx)
+			if cause != nil && !errors.Is(cause, context.Canceled) {
+				if s.LeaseOwner != "" {
+					status = ""
+					runErr = errors.Join(runErr, fmt.Errorf("supervisor: execution ownership became unsafe: %w", cause))
+					return
+				}
+				// Local drain timeout is a controlled infrastructure stop, not
+				// operator intent. Even before the first durable StepStart, park a
+				// synthetic recovery schedule for the next healthy daemon.
+				status = "failed"
+				forceLocalRecovery = true
+				runErr = errors.Join(runErr, fmt.Errorf("supervisor: infrastructure stop: %w", cause))
+			} else {
+				status = "cancelled"
+			}
+		}
+
+		durableCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		persistedStatus, err := s.persistOutcomeStatus(durableCtx, status, forceLocalRecovery)
+		if err != nil {
+			status = ""
+			runErr = errors.Join(runErr, fmt.Errorf("supervisor: persist run outcome: %w", err))
+		} else {
+			status = persistedStatus
+		}
+	}()
 
 	cmd := exec.CommandContext(ctx, s.BinaryPath)
 	// The child workflow runs untrusted, operator-or-AI-authored code. It
@@ -195,8 +258,10 @@ func (s *Supervisor) Run(ctx context.Context) (string, error) {
 	waitErr := cmd.Wait()
 
 	terminal := "succeeded"
+	var executionErr error
 	if loopErr != nil && !errors.Is(loopErr, io.EOF) {
 		terminal = "failed"
+		executionErr = errors.Join(executionErr, loopErr)
 	}
 	if waitErr != nil {
 		var exitErr *exec.ExitError
@@ -208,24 +273,85 @@ func (s *Supervisor) Run(ctx context.Context) (string, error) {
 	// not terminal; it stays in "suspended" state and the scheduler will
 	// re-spawn at wake_at. Don't overwrite that with succeeded/failed.
 	if disp.suspended.Load() {
-		if err := s.Journal.SetRunStatus(ctx, s.RunID, "suspended"); err != nil {
-			s.Log.Warn("set suspended status failed", "err", err)
-		}
 		return "suspended", nil
 	}
 	if disp.deadLetter.Load() {
 		terminal = "failed_dlq"
 	}
-	if mErr := s.Journal.MarkRunFinished(ctx, s.RunID, terminal); mErr != nil {
-		s.Log.Warn("mark run finished failed", "err", mErr)
-	}
 	if closeErr != nil && !errors.Is(closeErr, io.ErrClosedPipe) {
 		s.Log.Warn("supervisor: stdin close", "err", closeErr)
 	}
-	if loopErr != nil && !errors.Is(loopErr, io.EOF) {
-		return terminal, loopErr
+
+	// A child crash after a durable step_start/Retryable step_end is safe to
+	// replay. In distributed mode keep both run and lease recoverable; the
+	// heartbeat stops when ExecuteRun returns and the reaper later queues it.
+	// Early launch/hello failures have no such checkpoint and remain terminal.
+	if s.LeaseOwner != "" && terminal == "failed" && ctx.Err() == nil {
+		if errors.Is(executionErr, ErrDeadLetterRepairRecoverable) {
+			return "", errors.Join(executionErr, waitErr, ErrRunRecoverable)
+		}
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		recoverable, probeErr := s.Journal.HasRecoverableStepAttempt(probeCtx, s.RunID)
+		cancel()
+		if probeErr != nil {
+			return "", errors.Join(executionErr, waitErr, probeErr)
+		}
+		if recoverable {
+			return "", errors.Join(executionErr, waitErr, ErrRunRecoverable)
+		}
 	}
-	return terminal, nil
+	return terminal, executionErr
+}
+
+// PersistOutcome is the only run-state writer used by Supervisor.Run. Replay
+// mode calls neither this method nor any other state writer. Distributed runs
+// use the lease-owned atomic transition; local runs retain the established
+// journal APIs but now propagate their errors instead of logging false success.
+func (s *Supervisor) PersistOutcome(ctx context.Context, status string) error {
+	_, err := s.PersistOutcomeStatus(ctx, status)
+	return err
+}
+
+// PersistOutcomeStatus returns the status that actually committed. A failed
+// process before the first redrive StepStart atomically restores the exact
+// authorization and persists failed_dlq, rather than stranding the run as
+// failed with an unusable StatusRedrive marker.
+func (s *Supervisor) PersistOutcomeStatus(ctx context.Context, status string) (string, error) {
+	return s.persistOutcomeStatus(ctx, status, false)
+}
+
+func (s *Supervisor) persistOutcomeStatus(ctx context.Context, status string, forceLocalRecovery bool) (string, error) {
+	if s.Journal == nil {
+		return "", errors.New("supervisor: journal is nil")
+	}
+	if status == "failed" {
+		var (
+			recovered bool
+			err       error
+		)
+		if s.LeaseOwner != "" {
+			recovered, err = s.Journal.RecoverOwnedPendingDeadLetterRedrive(ctx, s.RunID, s.LeaseOwner)
+		} else {
+			return s.Journal.RecoverLocalInterruptedRun(ctx, s.RunID, forceLocalRecovery)
+		}
+		if err != nil {
+			return "", err
+		}
+		if recovered {
+			return "failed_dlq", nil
+		}
+	}
+	if s.LeaseOwner != "" {
+		return status, s.Journal.FinalizeOwnedRun(ctx, s.RunID, s.LeaseOwner, status)
+	}
+	switch status {
+	case "suspended":
+		return status, s.Journal.SetRunStatus(ctx, s.RunID, status)
+	case "cancelled":
+		return status, s.Journal.FinalizeCancel(ctx, s.RunID)
+	default:
+		return status, s.Journal.MarkRunFinished(ctx, s.RunID, status)
+	}
 }
 
 // dispatcher owns one live workflow connection.
@@ -325,6 +451,9 @@ func (d *dispatcher) handleStepStart(ctx context.Context, f wire.Frame) error {
 		if d.sup.Mode == "replay" {
 			return fmt.Errorf("%w: step %q (ordinal %d) has no cached output", ErrReplayDivergence, body.StepName, body.Seq)
 		}
+		if body.DurableAttempts {
+			return d.handleDurableStepStart(ctx, f, body)
+		}
 		if _, err := d.sup.Journal.RecordStepStartSeq(ctx, d.sup.RunID, body.StepName, body.Seq, body.Attempt, body.IdempotencyKey, body.InputHash); err != nil {
 			return fmt.Errorf("supervisor: record step_start: %w", err)
 		}
@@ -359,6 +488,9 @@ func (d *dispatcher) handleStepStart(ctx context.Context, f wire.Frame) error {
 		}
 		return fmt.Errorf("%w: step %q has no cached output", ErrReplayDivergence, body.StepName)
 	}
+	if body.DurableAttempts {
+		return d.handleDurableStepStart(ctx, f, body)
+	}
 
 	// Insert a running attempt row. Best-effort: if the row already exists
 	// (concurrent supervisor for the same run, which should never happen
@@ -368,6 +500,97 @@ func (d *dispatcher) handleStepStart(ctx context.Context, f wire.Frame) error {
 		return fmt.Errorf("supervisor: record step_start: %w", err)
 	}
 	reply, _ := wire.Wrap(d.nextID(), f.ID, wire.KindStepReply, wire.StepReply{Replay: false})
+	return d.write(reply)
+}
+
+// handleDurableStepStart makes the journal, rather than a freshly spawned
+// workflow process, authoritative for attempt numbering. ClaimStepAttemptSeq
+// persists step_start before this method replies, so a worker crash consumes
+// that number and a reaped run cannot reset its budget to attempt one.
+func (d *dispatcher) handleDurableStepStart(ctx context.Context, f wire.Frame, body wire.StepStart) error {
+	if body.MaxAttempts < 0 {
+		return errors.New("supervisor: negative durable retry budget")
+	}
+	claim, err := d.sup.Journal.ClaimStepAttemptSeq(
+		ctx,
+		d.sup.RunID,
+		body.StepName,
+		body.Seq,
+		body.MaxAttempts,
+		body.IdempotencyKey,
+		body.InputHash,
+	)
+	if err != nil {
+		if errors.Is(err, journal.ErrStepAttemptDivergence) {
+			return fmt.Errorf("%w: step %q (ordinal %d) changed while retrying", ErrReplayDivergence, body.StepName, body.Seq)
+		}
+		return fmt.Errorf("supervisor: claim durable step attempt: %w", err)
+	}
+
+	if !claim.Exhausted {
+		reply, _ := wire.Wrap(d.nextID(), f.ID, wire.KindStepReply, wire.StepReply{
+			Replay:        false,
+			Attempt:       claim.Attempt,
+			BudgetAttempt: claim.BudgetAttempt,
+		})
+		return d.write(reply)
+	}
+
+	// The no-closure verdict is itself durable. If the last allocated attempt
+	// died while running, terminalize that same row; if step_end had already
+	// persisted StatusFailed, preserve its original error. Either path lands in
+	// DLQ before the SDK is told the budget is exhausted. A crash between the
+	// step row UPDATE and the original DLQ write is therefore repaired here.
+	if claim.Previous == nil {
+		return errors.New("supervisor: retry budget exhausted without a prior attempt")
+	}
+	state := *claim.Previous
+	if state.Status == journal.StatusSucceeded {
+		// Defensive race handling: the normal cache lookup above should win,
+		// but serving the committed result is safer than dead-lettering it.
+		reply, _ := wire.Wrap(d.nextID(), f.ID, wire.KindStepReply, wire.StepReply{Replay: true, Output: state.Output})
+		return d.write(reply)
+	}
+	if state.Status == journal.StatusRunning || state.Status == journal.StatusRetrying {
+		if state.Status == journal.StatusRunning {
+			state.ErrorText = fmt.Sprintf("retry budget exhausted after interrupted attempt %d", state.Attempt)
+		} else if state.ErrorText == "" {
+			state.ErrorText = fmt.Sprintf("retry budget exhausted after retryable attempt %d", state.Attempt)
+		} else {
+			state.ErrorText = fmt.Sprintf("retry budget exhausted after attempt %d: %s", state.Attempt, state.ErrorText)
+		}
+		state.Output = json.RawMessage("null")
+		if err := d.sup.Journal.FinalizeExhaustedStepAttemptSeq(
+			ctx, d.sup.RunID, body.StepName, body.Seq, state.Attempt, state.Output, state.ErrorText,
+		); err != nil {
+			return fmt.Errorf("supervisor: terminalize exhausted step attempt: %w", err)
+		}
+		d.deadLetter.Store(true)
+		state.Status = journal.StatusFailed
+	}
+	if state.ErrorText == "" {
+		state.ErrorText = fmt.Sprintf("retry budget exhausted after attempt %d", state.Attempt)
+	}
+	payload := state.Output
+	if len(payload) == 0 || string(payload) == "null" {
+		payload = json.RawMessage("{}")
+	}
+	if _, err := d.sup.Journal.EnsureStepAttemptDeadLetter(
+		ctx, d.sup.RunID, body.StepName, body.Seq, state.Attempt, state.ErrorText, payload,
+	); err != nil {
+		// Do not send RetryExhausted when the operator-visible terminal record
+		// is missing. Returning a protocol error keeps the run recoverable: a
+		// restarted/reaped supervisor retries this idempotent repair first.
+		return errors.Join(ErrDeadLetterRepairRecoverable,
+			fmt.Errorf("supervisor: repair exhausted step dead-letter: %w", err))
+	}
+	d.deadLetter.Store(true)
+	reply, _ := wire.Wrap(d.nextID(), f.ID, wire.KindStepReply, wire.StepReply{
+		Replay:         false,
+		Attempt:        state.Attempt,
+		BudgetAttempt:  claim.BudgetAttempt,
+		RetryExhausted: true,
+	})
 	return d.write(reply)
 }
 
@@ -385,26 +608,26 @@ func (d *dispatcher) handleStepEnd(ctx context.Context, f wire.Frame) error {
 	if len(out) == 0 {
 		out = json.RawMessage("null")
 	}
-	if err := d.sup.Journal.RecordStepEndSeq(ctx, d.sup.RunID, body.StepName, body.Seq, body.Attempt, out, body.ErrorText); err != nil {
-		return fmt.Errorf("supervisor: record step_end: %w", err)
+	var recordErr error
+	if body.DurableAttempts || (body.ErrorText != "" && !body.Retryable) {
+		var deadLettered bool
+		deadLettered, recordErr = d.sup.Journal.FinalizeStepAttemptSeq(ctx, d.sup.RunID, body.StepName, body.Seq, body.Attempt, out, body.ErrorText, body.Retryable)
+		if deadLettered {
+			d.deadLetter.Store(true)
+		}
+	} else {
+		recordErr = d.sup.Journal.RecordStepEndSeq(ctx, d.sup.RunID, body.StepName, body.Seq, body.Attempt, out, body.ErrorText)
+	}
+	if recordErr != nil {
+		return fmt.Errorf("supervisor: record step_end: %w", recordErr)
 	}
 	// Final-attempt failures land in the dead-letter queue so an operator
 	// can inspect or replay them without grovelling through the steps
 	// table. Retryable errors are kept out of DLQ; the workflow side will
 	// emit another step_start with a higher attempt number for them.
-	// (Today the SDK is single-attempt; the Retryable flag still gates
-	// DLQ for forward-compatibility with host-side retries.)
-	if body.ErrorText != "" && !body.Retryable {
-		payload := out
-		if len(payload) == 0 || string(payload) == "null" {
-			payload = json.RawMessage("{}")
-		}
-		if err := d.sup.Journal.MoveStepToDeadLetter(ctx, d.sup.RunID, body.StepName, body.ErrorText, payload); err != nil {
-			d.sup.Log.Warn("supervisor: dead-letter write failed", "err", err, "run_id", d.sup.RunID, "step", body.StepName)
-		} else {
-			d.deadLetter.Store(true)
-		}
-	}
+	// Terminal outcomes, including legacy/non-durable wire frames, use the
+	// atomic finalizer above. That preserves body.Seq/body.Attempt as exact DLQ
+	// identity and never ACKs a failed step whose operator record did not commit.
 	ack, _ := wire.Wrap(d.nextID(), f.ID, wire.KindAck, nil)
 	return d.write(ack)
 }
@@ -439,6 +662,13 @@ func (d *dispatcher) handleSleep(ctx context.Context, f wire.Frame) error {
 	switch {
 	case err == nil:
 		if !existing.WakeAt.After(d.sup.Now()) {
+			// A lease/startup recovery can reach this row without the scheduler
+			// having claimed it (crash after INSERT, before suspended status).
+			// Retire the exact checkpoint before ACK so it cannot later wake an
+			// unrelated second wait on the same run.
+			if err := d.sup.Journal.FireSchedule(ctx, existing.ID); err != nil {
+				return fmt.Errorf("supervisor: retire resumed sleep schedule: %w", err)
+			}
 			ack, _ := wire.Wrap(d.nextID(), f.ID, wire.KindAck, nil)
 			return d.write(ack)
 		}
@@ -447,6 +677,9 @@ func (d *dispatcher) handleSleep(ctx context.Context, f wire.Frame) error {
 		// wake_at so the scheduler tick handles the rest.
 		return d.suspendForSleep(ctx, body.StepName, body.Seq, existing.WakeAt, false)
 	case errors.Is(err, journal.ErrNotFound):
+		if d.sup.Mode == "replay" {
+			return fmt.Errorf("%w: sleep %q has no recorded schedule", ErrReplayDivergence, body.StepName)
+		}
 		// Fresh path; fall through.
 	default:
 		return fmt.Errorf("supervisor: lookup sleep schedule: %w", err)
@@ -560,6 +793,9 @@ func (d *dispatcher) handleAwaitSignal(ctx context.Context, f wire.Frame) error 
 	case err == nil:
 		// Resume path. Decide based on payload presence and wake_at.
 		if len(existing.SignalPayload) > 0 {
+			if err := d.sup.Journal.FireSchedule(ctx, existing.ID); err != nil {
+				return fmt.Errorf("supervisor: retire delivered signal schedule: %w", err)
+			}
 			reply, _ := wire.Wrap(d.nextID(), f.ID, wire.KindSignalDeliver, wire.SignalDeliver{
 				SignalName: existing.SignalName,
 				Token:      existing.SignalToken,
@@ -568,6 +804,9 @@ func (d *dispatcher) handleAwaitSignal(ctx context.Context, f wire.Frame) error 
 			return d.write(reply)
 		}
 		if !existing.WakeAt.IsZero() && !existing.WakeAt.After(d.sup.Now()) {
+			if err := d.sup.Journal.FireSchedule(ctx, existing.ID); err != nil {
+				return fmt.Errorf("supervisor: retire expired signal schedule: %w", err)
+			}
 			reply, _ := wire.Wrap(d.nextID(), f.ID, wire.KindSignalDeliver, wire.SignalDeliver{
 				SignalName: existing.SignalName,
 				Token:      existing.SignalToken,
@@ -580,6 +819,9 @@ func (d *dispatcher) handleAwaitSignal(ctx context.Context, f wire.Frame) error 
 		// the same token so external deliveries against it still resolve.
 		return d.suspendForSignal(body, existing.SignalToken)
 	case errors.Is(err, journal.ErrNotFound):
+		if d.sup.Mode == "replay" {
+			return fmt.Errorf("%w: signal %q has no recorded schedule", ErrReplayDivergence, body.SignalName)
+		}
 		// Fresh path.
 	default:
 		return fmt.Errorf("supervisor: lookup signal schedule: %w", err)

@@ -90,3 +90,36 @@ func KeyForPayload(workflowSlug, stepName, payloadID string) string
 
 Canonical sha256 over (slug, step, sorted-kv-pairs). Use as
 StepOpts.IdempotencyKey. Single-id shortcut for the common webhook case.
+
+## sdk/esign
+
+```go
+const SpecVersion = "1.0"
+const EventTypeDocumentRequested = "esignature.document.requested.v1"
+
+func DecodeDocumentRequested(raw []byte) (DocumentRequested, error)
+func (DocumentRequested) Validate() error
+```
+
+Provider-neutral e-signature request envelope used by CRM, Google Apps Script,
+and standalone producers. Decoding rejects unknown fields, unsupported versions
+or event types, non-string variables, invalid customer/recipient identities,
+duplicate recipients, and oversized collections. Tenant, endpoint, API key,
+organization, and concrete template UUID are deliberately absent from the
+trusted routing contract.
+
+## sdk/esign/hash
+
+```go
+func NewClient(baseURL, apiKey string, httpClient *http.Client) (*Client, error)
+func (c *Client) CreateAndSend(ctx context.Context, idempotencyKey string, request SignatureRequest) (SignatureResult, error)
+func IsRetryable(error) bool
+func Recipients([]esign.Recipient) []Recipient
+```
+
+Single-attempt adapter for Hash's `POST /api/automation/v1/signature-requests`
+command. It requires HTTPS outside loopback, refuses redirects, bounds response
+bodies, sanitizes API errors, and never returns signer bearer links. Put it
+inside one Reactor Step and use the same stable event ID for the Step and Hash
+idempotency keys. Let the Step retry only transport errors, timeouts, ambiguous
+2xx responses, 408, 425, 429, and 5xx; a stable 4xx response is permanent.

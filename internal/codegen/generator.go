@@ -414,8 +414,8 @@ func (v *GoBuildValidator) Validate(ctx context.Context, dir string, in EmitInpu
 		gobin = "go"
 	}
 
-	if err := initModule(ctx, gobin, dir, in.Slug); err != nil {
-		return fmt.Errorf("module init: %w", err)
+	if err := PrepareWorkflowModule(ctx, gobin, dir, in.Slug); err != nil {
+		return fmt.Errorf("module preparation: %w", err)
 	}
 
 	// Reject disallowed imports before compiling anything: `go build` is
@@ -442,21 +442,47 @@ func (v *GoBuildValidator) Validate(ctx context.Context, dir string, in EmitInpu
 	return nil
 }
 
-// initModule sets up a workflow-local go.mod that points at the Reactor
-// SDK. In production the codegen orchestrator runs INSIDE the Reactor
-// binary so we replace the SDK import with the parent module's local copy
-// via go.work; for v0 we use a vendored go.mod that pins the published
-// SDK version. v0 ships a stub: just `go mod init` and let `go build`
-// fetch deps. This is the simplest path that works for tests.
-func initModule(ctx context.Context, gobin, dir, slug string) error {
+// PrepareWorkflowModule creates the trusted, workflow-local module graph used
+// by every Reactor workflow compiler. It rejects the module escape hatches
+// that regenerating go.mod cannot neutralise, removes any caller-supplied
+// go.mod/go.sum, and optionally wires the operator-controlled local Reactor SDK
+// path from REACTOR_SDK_REPLACE.
+func PrepareWorkflowModule(ctx context.Context, gobin, dir, slug string) error {
+	if gobin == "" {
+		gobin = "go"
+	}
+	if dir == "" {
+		return errors.New("workflow module: source directory is required")
+	}
+	if !IsValidSlug(slug) {
+		return fmt.Errorf("workflow module: invalid slug %q", slug)
+	}
+
+	// A root vendor tree can replace the allowlisted SDK with attacker source
+	// that CheckAllowedImports deliberately skips. A go.work can override the
+	// freshly generated module graph. Reject both even though GOWORK=off is also
+	// pinned in SecureBuildEnv, so every authoring surface has one fail-closed
+	// policy and operators get a clear error.
+	for _, banned := range []string{"vendor", "go.work", "go.work.sum"} {
+		path := filepath.Join(dir, banned)
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("workflow module: %q is not allowed in a workflow source tree (Reactor owns module setup)", banned)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("workflow module: inspect %q: %w", banned, err)
+		}
+	}
+
 	// Never trust a supplied go.mod. An uploaded tarball could ship a go.mod
 	// carrying `replace github.com/bright-interaction/reactor => ./evil` (plus
 	// attacker code in ./evil) that substitutes for the SDK and runs at build
 	// time, and `go mod init` refuses when one exists. The daemon owns module
 	// setup, so remove any supplied go.mod/go.sum and regenerate a clean one
 	// wired only to the bundled SDK.
-	_ = os.Remove(filepath.Join(dir, "go.mod"))
-	_ = os.Remove(filepath.Join(dir, "go.sum"))
+	for _, supplied := range []string{"go.mod", "go.sum"} {
+		if err := os.Remove(filepath.Join(dir, supplied)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("workflow module: remove supplied %s: %w", supplied, err)
+		}
+	}
 	if _, err := run(ctx, gobin, dir, "mod", "init", "reactor-workflow/"+slug); err != nil {
 		return err
 	}
