@@ -56,7 +56,8 @@ import (
 )
 func run(ctx context.Context, flow reactor.Flow, _ struct{}) error {
     _, err := reactor.Step(flow, ctx, "record", reactor.StepOpts{}, func(stepCtx context.Context) (string, error) {
-        if secret, fetchErr := vault.Get(stepCtx, "cred_http_mcp_ungranted"); fetchErr == nil || secret != nil {
+        deniedCredentialID := "cred_http_mcp_ungranted"
+        if secret, fetchErr := vault.Get(stepCtx, deniedCredentialID); fetchErr == nil || secret != nil {
             return "", errors.New("ungranted credential was released")
         }
         secret, fetchErr := vault.Get(stepCtx, "cred_http_mcp")
@@ -385,11 +386,19 @@ func TestServeMCPHTTPAuthoringLifecycle(t *testing.T) {
 		ArtifactStatus  string `json:"artifact_status"`
 		SourceIntegrity string `json:"source_integrity"`
 		Enabled         bool   `json:"enabled"`
+		Dependencies    struct {
+			UnresolvedReferenceCount int `json:"unresolved_reference_count"`
+			DynamicCallCount         int `json:"dynamic_call_count"`
+		} `json:"dependencies"`
 	}
 	if err := json.Unmarshal([]byte(reviewed.Text), &review); err != nil {
 		t.Fatalf("decode review %q: %v", reviewed.Text, err)
 	}
-	if review.Version != 1 || review.ReviewStatus != "ready_for_review" || review.ArtifactStatus != "verified" || review.SourceIntegrity != "verified" || review.Enabled {
+	// The direct literal fetch has no same-tenant credential metadata yet.
+	// The denied fetch uses an indirect ID, so static readiness reports its
+	// limited coverage; the compiled child must still enforce the live ACL.
+	if review.Version != 1 || review.ReviewStatus != "needs_connections" || review.ArtifactStatus != "verified" || review.SourceIntegrity != "verified" || review.Enabled ||
+		review.Dependencies.UnresolvedReferenceCount != 1 || review.Dependencies.DynamicCallCount != 1 {
 		t.Fatalf("review receipt = %+v", review)
 	}
 	var tenantView struct {
@@ -462,6 +471,11 @@ func TestServeMCPHTTPAuthoringLifecycle(t *testing.T) {
 			t.Fatalf("credential %q was persisted in plaintext", credential.id)
 		}
 	}
+	missingCredential := httpMCPCall(t, client, endpoint, cfg.mcpToken, "reactor_preflight_dispatch_workflow", map[string]any{"slug": "http-mcp-e2e"})
+	if missingCredential.IsError || !strings.Contains(missingCredential.Text, `"missing_grants":["cred_http_mcp"]`) ||
+		!strings.Contains(missingCredential.Text, `"dispatchable_now":false`) || !strings.Contains(missingCredential.Text, `"admission_status":"blocked"`) {
+		t.Fatalf("preflight did not block the missing literal credential grant: %+v", missingCredential)
+	}
 	granted := httpMCPCall(t, client, endpoint, cfg.mcpToken, "reactor_grant_secret", map[string]any{
 		"workflow_id": createdReceipt.WorkflowID, "credential_id": "cred_http_mcp",
 	})
@@ -469,7 +483,9 @@ func TestServeMCPHTTPAuthoringLifecycle(t *testing.T) {
 		t.Fatalf("grant response = %+v", granted)
 	}
 	reviewed = httpMCPCall(t, client, endpoint, cfg.mcpToken, "reactor_review_workflow", map[string]any{"slug": "http-mcp-e2e"})
-	if reviewed.IsError || !strings.Contains(reviewed.Text, `"credential_id":"cred_http_mcp"`) || !strings.Contains(reviewed.Text, `"secret_grants"`) {
+	if reviewed.IsError || !strings.Contains(reviewed.Text, `"credential_id":"cred_http_mcp"`) ||
+		!strings.Contains(reviewed.Text, `"secret_grants"`) || !strings.Contains(reviewed.Text, `"review_status":"ready_for_review"`) ||
+		!strings.Contains(reviewed.Text, `"dynamic_call_count":1`) {
 		t.Fatalf("review after grant = %+v", reviewed)
 	}
 	if strings.Contains(reviewed.Text, grantedValue) || strings.Contains(reviewed.Text, ungrantedValue) {
