@@ -35,10 +35,10 @@ func oauthRedirectURI(r *http.Request) string {
 	// registered with the provider; trusting these headers unconditionally
 	// would let any client spoof the OAuth callback host.
 	if isTrustedProxyRequest(r) {
-		if v := r.Header.Get("X-Forwarded-Proto"); v != "" {
+		if v := forwardedProto(r); v != "" {
 			scheme = v
 		}
-		if v := r.Header.Get("X-Forwarded-Host"); v != "" {
+		if v := forwardedHost(r); v != "" {
 			host = v
 		}
 	}
@@ -158,15 +158,25 @@ func connectionsBody(conns []oauth.Connection, providers []oauth.Provider, tenan
 	if len(conns) == 0 {
 		b.WriteString(`<p class="empty">No connected accounts yet. Connect one below.</p>`)
 	} else {
-		b.WriteString(`<table><thead><tr><th>Provider</th><th>Name</th><th>Connection id</th><th>Status</th><th></th></tr></thead><tbody>`)
+		b.WriteString(`<table><thead><tr><th>Provider</th><th>Name</th><th>Connection id</th><th>Status</th><th>API access</th><th></th></tr></thead><tbody>`)
 		for _, c := range conns {
 			tag := `<span class="tag tag-on">connected</span>`
 			if c.Status != "connected" {
 				tag = `<span class="tag tag-off">` + template.HTMLEscapeString(c.Status) + `</span>`
 			}
-			fmt.Fprintf(&b, `<tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td><td><form method="POST" action="/connections/%s/delete" class="form-inline" data-confirm="Disconnect %s?"><button type="submit" class="btn-link">disconnect</button></form></td></tr>`,
+			access := "Pending API review"
+			if c.ProviderID == "salesforce" {
+				access = "Salesforce GET broker"
+			} else if c.TokenAccessMode == "legacy_raw" {
+				access = "Legacy raw token"
+			} else if c.TokenAccessMode == "broker_only" && c.BrokerPolicyVersion > 0 {
+				access = "Brokered GET reviewed"
+			} else if c.TokenAccessMode == "broker_only" {
+				access = "Broker-only; review required before GET"
+			}
+			fmt.Fprintf(&b, `<tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td><form method="POST" action="/connections/%s/delete" class="form-inline" data-confirm="Disconnect %s?"><button type="submit" class="btn-link">disconnect</button></form></td></tr>`,
 				template.HTMLEscapeString(c.ProviderID), template.HTMLEscapeString(c.Name),
-				template.HTMLEscapeString(c.ID), tag,
+				template.HTMLEscapeString(c.ID), tag, template.HTMLEscapeString(access),
 				urlEsc(c.ID), template.HTMLEscapeString(c.Name))
 		}
 		b.WriteString(`</tbody></table>`)

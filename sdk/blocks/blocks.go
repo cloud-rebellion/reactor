@@ -7,8 +7,8 @@
 // place, so replay is safe and there are no spooky side effects). Merges keep
 // unmatched rows instead of silently dropping them.
 //
-// Everything here is a pure transform: call them inside or between Step
-// closures. They never do IO, so they do not need their own Step.
+// The ordinary helpers are pure transforms and do not need their own Step.
+// Observed variants send value-free receipts and require a supervised Step.
 package blocks
 
 import (
@@ -97,6 +97,14 @@ func Map[T, R any](in []T, fn func(T) R) []R {
 	return out
 }
 
+// Iterate applies fn in input order and returns one result per item. It is an
+// explicit name for the n8n Loop Over Items shape; unlike a durable Step loop,
+// this helper is pure and sequential, so the enclosing Step remains the
+// replay/timeout boundary and no hidden concurrency is introduced.
+func Iterate[T, R any](in []T, fn func(T) R) []R {
+	return Map(in, fn)
+}
+
 // Filter returns the elements for which pred is true, in order.
 func Filter[T any](in []T, pred func(T) bool) []T {
 	out := make([]T, 0, len(in))
@@ -115,6 +123,12 @@ func Reduce[T, R any](in []T, init R, fn func(acc R, v T) R) R {
 		acc = fn(acc, v)
 	}
 	return acc
+}
+
+// Aggregate folds all items into one value. It is the named aggregation form
+// used in generated workflow plans; Reduce remains the lower-level spelling.
+func Aggregate[T, R any](in []T, init R, fn func(acc R, v T) R) R {
+	return Reduce(in, init, fn)
 }
 
 // UniqueBy keeps the first element for each distinct key, preserving order.
@@ -198,6 +212,22 @@ func Chunk[T any](in []T, size int) [][]T {
 	return out
 }
 
+// Split partitions in while preserving order. Items for which pred returns
+// true are returned in yes; all others are returned in no. Both slices are
+// newly allocated, so callers can safely mutate their results.
+func Split[T any](in []T, pred func(T) bool) (yes, no []T) {
+	yes = make([]T, 0, len(in))
+	no = make([]T, 0, len(in))
+	for _, v := range in {
+		if pred != nil && pred(v) {
+			yes = append(yes, v)
+		} else {
+			no = append(no, v)
+		}
+	}
+	return yes, no
+}
+
 // Flatten concatenates a slice of slices into one.
 func Flatten[T any](in [][]T) []T {
 	n := 0
@@ -218,6 +248,13 @@ func Flatten[T any](in [][]T) []T {
 // Append concatenates sets in order (n8n's "Append" merge mode).
 func Append[T any](sets ...[]T) []T {
 	return Flatten(sets)
+}
+
+// Merge combines two collections by appending the right collection to the
+// left. Use MergeByKey or Zip when the plan needs join or positional semantics
+// instead of concatenation.
+func Merge[T any](left, right []T) []T {
+	return Append(left, right)
 }
 
 // Zip combines two slices positionally, stopping at the shorter length (n8n's

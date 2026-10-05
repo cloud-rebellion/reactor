@@ -21,6 +21,20 @@ const WorkflowArtifactFenceRunLog = "execution blocked: pinned workflow artifact
 // v2. Runtime execution never uses that mutable path, but authoring/status
 // tooling must still not advertise stale bytes.
 func (j *Journal) ActivateWorkflowArtifactIfCurrent(ctx context.Context, workflowID string, version int, artifactSHA256 string, activate func() error) (bool, error) {
+	return j.activateWorkflowArtifactIfCurrent(ctx, workflowID, version, artifactSHA256, false, activate)
+}
+
+// ActivateWorkflowArtifactIfCurrentAndDisabled is the MCP authoring retry
+// variant. It applies the same version and digest fence as the normal
+// activation, but also checks that the workflow remains disabled under the
+// workflow row lock. An exact-source retry must not make an enabled workflow
+// look like a newly staged disabled version or refresh its mutable review
+// files while another operator has activated it.
+func (j *Journal) ActivateWorkflowArtifactIfCurrentAndDisabled(ctx context.Context, workflowID string, version int, artifactSHA256 string, activate func() error) (bool, error) {
+	return j.activateWorkflowArtifactIfCurrent(ctx, workflowID, version, artifactSHA256, true, activate)
+}
+
+func (j *Journal) activateWorkflowArtifactIfCurrent(ctx context.Context, workflowID string, version int, artifactSHA256 string, requireDisabled bool, activate func() error) (bool, error) {
 	if workflowID == "" || version <= 0 || !validArtifactSHA256(artifactSHA256) || activate == nil {
 		return false, errors.New("journal: activate workflow artifact: invalid arguments")
 	}
@@ -60,6 +74,15 @@ func (j *Journal) ActivateWorkflowArtifactIfCurrent(ctx context.Context, workflo
 	}
 	if currentVersion != version || !currentDigest.Valid || currentDigest.String != artifactSHA256 {
 		return false, nil
+	}
+	if requireDisabled {
+		var enabled any
+		if err := tx.QueryRowContext(ctx, j.bind(`SELECT enabled FROM workflows WHERE id = $1`), workflowID).Scan(&enabled); err != nil {
+			return false, fmt.Errorf("journal: read workflow artifact activation state: %w", err)
+		}
+		if parseBool(enabled) {
+			return false, ErrWorkflowEnabled
+		}
 	}
 	if err := activate(); err != nil {
 		return false, fmt.Errorf("journal: activate current workflow artifact: %w", err)
@@ -127,6 +150,9 @@ func (j *Journal) FailRunArtifactFenceStatus(ctx context.Context, runID string) 
 	if err := appendArtifactFenceLog(ctx, tx, j, runID); err != nil {
 		return "", err
 	}
+	if err := j.enqueueTerminalEffectTx(ctx, tx, runID, targetStatus); err != nil {
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("journal: commit artifact fence failure: %w", err)
 	}
@@ -152,7 +178,8 @@ func (j *Journal) FailLeasedRunArtifactFenceStatus(ctx context.Context, runID, o
 		return "", fmt.Errorf("journal: begin leased artifact fence failure: %w", err)
 	}
 	defer tx.Rollback()
-	if err := j.lockOwnedLease(ctx, tx, runID, owner); err != nil {
+	leaseDeadline, err := j.lockOwnedLease(ctx, tx, runID, owner)
+	if err != nil {
 		return "", err
 	}
 	statusQ := `SELECT status FROM runs WHERE id = $1`
@@ -192,12 +219,18 @@ func (j *Journal) FailLeasedRunArtifactFenceStatus(ctx context.Context, runID, o
 	if err := appendArtifactFenceLog(ctx, tx, j, runID); err != nil {
 		return "", err
 	}
+	if err := j.enqueueTerminalEffectTx(ctx, tx, runID, targetStatus); err != nil {
+		return "", err
+	}
 	res, err = tx.ExecContext(ctx, j.bind(`DELETE FROM leases WHERE run_id = $1 AND worker_id = $2`), runID, owner)
 	if err != nil {
 		return "", fmt.Errorf("journal: release leased artifact-fenced run: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return "", fmt.Errorf("%w: artifact fence run=%s", ErrLeaseOwnershipLost, runID)
+	}
+	if err := checkOwnedLeaseDeadline(runID, leaseDeadline); err != nil {
+		return "", err
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("journal: commit leased artifact fence failure: %w", err)
@@ -224,12 +257,29 @@ func (j *Journal) LogRunArtifactFence(ctx context.Context, runID string) error {
 }
 
 func appendArtifactFenceLog(ctx context.Context, tx *sql.Tx, j *Journal, runID string) error {
+	tenantQ := `SELECT tenant_id FROM runs WHERE id = $1`
+	if j.engine == EnginePostgres {
+		tenantQ += ` FOR UPDATE`
+	}
+	var tenantID string
+	if err := tx.QueryRowContext(ctx, j.bind(tenantQ), runID).Scan(&tenantID); err != nil {
+		return fmt.Errorf("journal: resolve artifact fence log tenant: %w", err)
+	}
+	if err := j.requireRunLogPayloadKey(ctx, tx); err != nil {
+		return err
+	}
 	var seq int
 	if err := tx.QueryRowContext(ctx, j.bind(`SELECT COALESCE(MAX(seq), -1) + 1 FROM run_logs WHERE run_id = $1`), runID).Scan(&seq); err != nil {
 		return fmt.Errorf("journal: next artifact fence log sequence: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, j.bind(`INSERT INTO run_logs (run_id, seq, line) VALUES ($1, $2, $3)`),
-		runID, seq, WorkflowArtifactFenceRunLog); err != nil {
+	value, err := j.prepareRunLogLine(tenantID, runID, int64(seq), runLogKindArtifactFence, WorkflowArtifactFenceRunLog)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, j.bind(`INSERT INTO run_logs
+		(run_id, seq, line, payload_crypto_version, plaintext_bytes, kind)
+		VALUES ($1, $2, $3, $4, $5, $6)`),
+		runID, seq, value.line, value.version, value.plainBytes, runLogKindArtifactFence); err != nil {
 		return fmt.Errorf("journal: append artifact fence log: %w", err)
 	}
 	return nil

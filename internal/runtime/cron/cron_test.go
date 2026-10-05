@@ -194,6 +194,26 @@ func TestCronReconcileRemovesDeactivated(t *testing.T) {
 	}
 }
 
+// A clock callback may already be queued when an operator disables a
+// trigger. The callback must re-read the durable state instead of dispatching
+// the stale row captured by robfig/cron.
+func TestCronFireRechecksAuthoritativeTriggerState(t *testing.T) {
+	t.Parallel()
+	d, disp, j := newTestDriver(t, "* * * * *")
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Stop()
+	captured := d.loaded[0]
+	if err := j.SetTriggerState(context.Background(), captured.ID, "disabled"); err != nil {
+		t.Fatalf("disable trigger: %v", err)
+	}
+	d.fire(context.Background(), captured)
+	if got := disp.calls.Load(); got != 0 {
+		t.Fatalf("stale cron callback dispatched %d run(s), want 0", got)
+	}
+}
+
 // TestCronReloadLoopFiresReconcile asserts the periodic loop picks up a
 // new trigger without an explicit Reconcile call.
 func TestCronReloadLoopFiresReconcile(t *testing.T) {

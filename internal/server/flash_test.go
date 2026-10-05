@@ -225,6 +225,8 @@ type tokenRollbackAuth struct {
 	revokedUserID  string
 }
 
+func (*tokenRollbackAuth) HasMFA(context.Context, string) (bool, error) { return false, nil }
+
 func (*tokenRollbackAuth) MintAPIToken(context.Context, string, string, time.Duration) (string, string, error) {
 	return "rtr_raw_one_time_token", "tok_new", nil
 }

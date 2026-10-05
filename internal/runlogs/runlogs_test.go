@@ -34,6 +34,48 @@ func TestRingDropsOldestWhenFull(t *testing.T) {
 	}
 }
 
+func TestByteCapDropsOldestLines(t *testing.T) {
+	t.Parallel()
+	b := New(100, time.Minute)
+	b.maxBytes = 10
+	for _, line := range []string{"1234", "5678", "90", "ab"} {
+		b.Append("run_bytes", line)
+	}
+	got := b.Snapshot("run_bytes")
+	if len(got) != 3 || got[0] != "5678" || got[1] != "90" || got[2] != "ab" {
+		t.Fatalf("byte cap should drop oldest lines, got %v", got)
+	}
+	var total int
+	for _, line := range got {
+		total += len(line)
+	}
+	if total > b.maxBytes {
+		t.Fatalf("buffer uses %d bytes, cap is %d", total, b.maxBytes)
+	}
+}
+
+func TestOversizedLineIsReplacedWithBoundedMarker(t *testing.T) {
+	t.Parallel()
+	b := New(10, time.Minute)
+	b.maxBytes = 10
+	sub := b.Subscribe("run_huge")
+	defer b.Unsubscribe("run_huge", sub)
+	b.Append("run_huge", "this line is far too large")
+
+	got := b.Snapshot("run_huge")
+	if len(got) != 1 || len(got[0]) > b.maxBytes {
+		t.Fatalf("oversized line escaped byte cap: %q", got)
+	}
+	select {
+	case streamed := <-sub:
+		if streamed != got[0] {
+			t.Fatalf("subscriber got %q, snapshot has %q", streamed, got[0])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive bounded line")
+	}
+}
+
 func TestSubscribeReceivesNewLines(t *testing.T) {
 	t.Parallel()
 	b := New(10, time.Minute)
@@ -84,6 +126,71 @@ func TestSubscribeAfterCloseClosesImmediately(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("late subscribe to closed run did not close immediately")
+	}
+}
+
+func TestSubscribeWithSnapshotIncludesTailAndSubscribesAtomically(t *testing.T) {
+	t.Parallel()
+	b := New(10, time.Minute)
+	b.Append("run_atomic", "before")
+	snapshot, sub := b.SubscribeWithSnapshot("run_atomic")
+	defer b.Unsubscribe("run_atomic", sub)
+
+	if len(snapshot) != 1 || snapshot[0] != "before" {
+		t.Fatalf("snapshot = %v, want [before]", snapshot)
+	}
+	b.Append("run_atomic", "after")
+	select {
+	case got := <-sub:
+		if got != "after" {
+			t.Fatalf("subscriber got %q, want after", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("atomic subscriber did not receive line appended after snapshot")
+	}
+}
+
+func TestSubscribeWithSnapshotClosedRunReturnsTailAndClosedChannel(t *testing.T) {
+	t.Parallel()
+	b := New(10, time.Minute)
+	b.Append("run_closed_atomic", "terminal")
+	b.Close("run_closed_atomic")
+
+	snapshot, sub := b.SubscribeWithSnapshot("run_closed_atomic")
+	if len(snapshot) != 1 || snapshot[0] != "terminal" {
+		t.Fatalf("snapshot = %v, want [terminal]", snapshot)
+	}
+	select {
+	case _, ok := <-sub:
+		if ok {
+			t.Fatal("closed run subscriber yielded a live line")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closed run subscriber was not closed")
+	}
+}
+
+func TestBeginReopensClosedRunForRetry(t *testing.T) {
+	t.Parallel()
+	b := New(10, time.Minute)
+	b.Append("run_retry", "first attempt")
+	b.Close("run_retry")
+	b.Begin("run_retry")
+	b.Append("run_retry", "retry attempt")
+	got := b.Snapshot("run_retry")
+	if len(got) != 1 || got[0] != "retry attempt" {
+		t.Fatalf("retry state = %v, want only the new attempt", got)
+	}
+	sub := b.Subscribe("run_retry")
+	defer b.Unsubscribe("run_retry", sub)
+	b.Append("run_retry", "retry tail")
+	select {
+	case line := <-sub:
+		if line != "retry tail" {
+			t.Fatalf("retry subscriber got %q", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry subscriber did not receive new line")
 	}
 }
 

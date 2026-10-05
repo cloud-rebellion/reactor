@@ -20,47 +20,68 @@ const Version = sdkwire.Version
 // MaxFrameBytes caps a single frame; re-exported from sdk/wire.
 const MaxFrameBytes = sdkwire.MaxFrameBytes
 
+// MaxSignalPayloadBytes leaves envelope headroom so a SignalDeliver frame
+// always fits MaxFrameBytes; re-exported from sdk/wire.
+const MaxSignalPayloadBytes = sdkwire.MaxSignalPayloadBytes
+
 // Kind discriminates frame bodies; re-exported from sdk/wire.
 type Kind = sdkwire.Kind
 
 const (
-	KindHello         = sdkwire.KindHello
-	KindStepStart     = sdkwire.KindStepStart
-	KindStepEnd       = sdkwire.KindStepEnd
-	KindStepReply     = sdkwire.KindStepReply
-	KindAck           = sdkwire.KindAck
-	KindSleep         = sdkwire.KindSleep
-	KindAwaitSignal   = sdkwire.KindAwaitSignal
-	KindSignalDeliver = sdkwire.KindSignalDeliver
-	KindSecretFetch   = sdkwire.KindSecretFetch
-	KindSecretReply   = sdkwire.KindSecretReply
-	KindLog           = sdkwire.KindLog
-	KindCancel        = sdkwire.KindCancel
-	KindError         = sdkwire.KindError
+	KindHello            = sdkwire.KindHello
+	KindStepStart        = sdkwire.KindStepStart
+	KindStepEnd          = sdkwire.KindStepEnd
+	KindBlockReceipt     = sdkwire.KindBlockReceipt
+	KindStepReply        = sdkwire.KindStepReply
+	KindAck              = sdkwire.KindAck
+	KindSleep            = sdkwire.KindSleep
+	KindAwaitSignal      = sdkwire.KindAwaitSignal
+	KindSignalDeliver    = sdkwire.KindSignalDeliver
+	KindSecretFetch      = sdkwire.KindSecretFetch
+	KindSecretReply      = sdkwire.KindSecretReply
+	KindConnectorRequest = sdkwire.KindConnectorRequest
+	KindConnectorReply   = sdkwire.KindConnectorReply
+	KindMailSendRequest  = sdkwire.KindMailSendRequest
+	KindMailSendReply    = sdkwire.KindMailSendReply
+	KindLog              = sdkwire.KindLog
+	KindCancel           = sdkwire.KindCancel
+	KindError            = sdkwire.KindError
 )
 
 // Frame + body types re-exported as type aliases so existing call
 // sites compose without conversions.
 type (
-	Frame         = sdkwire.Frame
-	Hello         = sdkwire.Hello
-	StepStart     = sdkwire.StepStart
-	StepReply     = sdkwire.StepReply
-	StepEnd       = sdkwire.StepEnd
-	Sleep         = sdkwire.Sleep
-	AwaitSignal   = sdkwire.AwaitSignal
-	SignalDeliver = sdkwire.SignalDeliver
-	SecretFetch   = sdkwire.SecretFetch
-	SecretReply   = sdkwire.SecretReply
-	Log           = sdkwire.Log
-	Cancel        = sdkwire.Cancel
-	Error         = sdkwire.Error
-	Encoder       = sdkwire.Encoder
-	Decoder       = sdkwire.Decoder
+	Frame            = sdkwire.Frame
+	Hello            = sdkwire.Hello
+	StepStart        = sdkwire.StepStart
+	StepReply        = sdkwire.StepReply
+	StepEnd          = sdkwire.StepEnd
+	BlockReceipt     = sdkwire.BlockReceipt
+	Sleep            = sdkwire.Sleep
+	AwaitSignal      = sdkwire.AwaitSignal
+	SignalDeliver    = sdkwire.SignalDeliver
+	SecretFetch      = sdkwire.SecretFetch
+	SecretReply      = sdkwire.SecretReply
+	ConnectorRequest = sdkwire.ConnectorRequest
+	ConnectorReply   = sdkwire.ConnectorReply
+	MailSendRequest  = sdkwire.MailSendRequest
+	MailSendReply    = sdkwire.MailSendReply
+	MailMessage      = sdkwire.MailMessage
+	Log              = sdkwire.Log
+	Cancel           = sdkwire.Cancel
+	Error            = sdkwire.Error
+	Encoder          = sdkwire.Encoder
+	Decoder          = sdkwire.Decoder
 )
 
 // ErrFrameTooLarge is the sentinel for oversize frames.
 var ErrFrameTooLarge = sdkwire.ErrFrameTooLarge
+
+// ErrMalformedFrame is the value-free sentinel for malformed child output.
+var ErrMalformedFrame = sdkwire.ErrMalformedFrame
+
+// ErrMalformedBody is the value-free sentinel for malformed child body JSON.
+var ErrMalformedBody = sdkwire.ErrMalformedBody
 
 // NewEncoder + NewDecoder + Wrap + Unwrap pass through to sdk/wire.
 func NewEncoder(w io.Writer) *Encoder { return sdkwire.NewEncoder(w) }

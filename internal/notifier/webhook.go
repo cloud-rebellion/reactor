@@ -19,8 +19,8 @@ import (
 //	  "headers": {"X-Auth-Token": "..."}   // optional
 //	}
 //
-// The payload is the full Event struct so a receiver can route on
-// status / workflow / error_text without parsing free text.
+// The payload carries terminal metadata but omits raw step errors, which can
+// contain untrusted data or secrets.
 type WebhookSender struct {
 	Client *http.Client
 }
@@ -58,7 +58,7 @@ func (s *WebhookSender) Send(ctx context.Context, cfg json.RawMessage, ev Event)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("webhook: build request: %w", err)
+		return fmt.Errorf("webhook: invalid request URL")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "reactor-notifier/1.0")
@@ -67,11 +67,13 @@ func (s *WebhookSender) Send(ctx context.Context, cfg json.RawMessage, ev Event)
 	}
 	client := s.Client
 	if client == nil {
-		client = http.DefaultClient
+		// Keep the safety property even when a caller constructs
+		// WebhookSender directly instead of using NewWebhookSender.
+		client = ssrfSafeClient(os.Getenv("REACTOR_WEBHOOK_ALLOW_PRIVATE") == "1")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("webhook: post: %w", err)
+		return safePostError("webhook", err)
 	}
 	defer resp.Body.Close()
 	// Drain (bounded) so the connection can be reused, but do NOT echo the

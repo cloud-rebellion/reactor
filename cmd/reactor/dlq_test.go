@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,6 +78,40 @@ func TestCmdDLQListAndShow(t *testing.T) {
 	}
 	if err := cmdDLQ(context.Background(), discardLogger(), []string{"show", "--db", url, "dlq_missing"}); err == nil {
 		t.Fatal("show missing should error")
+	}
+}
+
+func TestCmdDLQListAndShowLoadFileBackedPayloadKey(t *testing.T) {
+	t.Setenv("REACTOR_MASTER_KEY", "")
+	t.Setenv("ARACHNE_MASTER_KEY", "")
+	t.Setenv("REACTOR_MASTER_KEY_PREVIOUS", "")
+	t.Setenv("ARACHNE_MASTER_KEY_PREVIOUS", "")
+	url, j := newSeededDB(t)
+	ctx := context.Background()
+	master := bytes.Repeat([]byte{0x69}, 32)
+	if err := j.EnablePayloadEncryption(ctx, master, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MoveStepToDeadLetter(ctx, "run_t", "send", "private-keyed-failure", json.RawMessage(`{"private":"keyed"}`)); err != nil {
+		t.Fatal(err)
+	}
+	item, err := j.FindDeadLetterByRun(ctx, "run_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	keyFile := filepath.Join(root, "master.key")
+	if err := os.WriteFile(keyFile, []byte(fmt.Sprintf("%x\n", master)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDLQ(ctx, discardLogger(), []string{"list", "--db", url, "--root", root}); err != nil {
+		t.Fatalf("file-backed keyed DLQ list: %v", err)
+	}
+	if err := cmdDLQ(ctx, discardLogger(), []string{"show", "--db", url, "--master-key-file", keyFile, item.ID}); err != nil {
+		t.Fatalf("file-backed keyed DLQ show: %v", err)
+	}
+	if err := cmdDLQ(ctx, discardLogger(), []string{"list", "--db", url, "--root", t.TempDir()}); err == nil {
+		t.Fatal("keyed DLQ list succeeded without its matching master key")
 	}
 }
 

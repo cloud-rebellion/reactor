@@ -13,11 +13,16 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/safehttp"
 )
 
 // awsIAMHTTPClient is the shared client; bounded timeout prevents a stuck
 // IAM endpoint from holding up the rotation runner.
-var awsIAMHTTPClient = &http.Client{Timeout: 20 * time.Second}
+// APIBase is configurable for private IAM-compatible gateways and tests, so
+// use the shared connect-time SSRF policy. Link-local/metadata destinations
+// remain blocked even when private RFC1918 endpoints are allowed.
+var awsIAMHTTPClient = safehttp.Client(true)
 
 // defaultAWSIAMEndpoint is the global IAM endpoint. Tests inject a custom
 // endpoint via APIBase so concurrent tests never share-mutate state.
@@ -127,7 +132,10 @@ func (p *AWSIAMProvider) createAccessKey(ctx context.Context, signer awsAccessKe
 		return awsAccessKeyPair{}, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readBoundedProviderResponse(resp.Body, maxProviderResponseBytes)
+	if err != nil {
+		return awsAccessKeyPair{}, fmt.Errorf("read response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return awsAccessKeyPair{}, fmt.Errorf("status %d: %s", resp.StatusCode, trim(raw))
 	}
@@ -165,7 +173,10 @@ func (p *AWSIAMProvider) deleteAccessKey(ctx context.Context, signer awsAccessKe
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readBoundedProviderResponse(resp.Body, maxProviderResponseBytes)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("status %d: %s", resp.StatusCode, trim(raw))
 	}

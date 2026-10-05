@@ -18,8 +18,10 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/bright-interaction/reactor/internal/safehttp"
 	"github.com/bright-interaction/reactor/sdk/esign"
 	"github.com/bright-interaction/reactor/sdk/esign/internal/strictjson"
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
 const (
@@ -95,7 +97,13 @@ func NewClient(baseURL, apiKey string, httpClient *http.Client) (*Client, error)
 
 	client := httpClient
 	if client == nil {
-		client = &http.Client{Timeout: defaultTimeout}
+		// Use Reactor's dial-time SSRF guard for the default workflow client.
+		// URL parsing alone cannot prevent a public hostname from rebinding to
+		// a private address between validation and connect. Literal loopback is
+		// retained for local development; metadata and link-local ranges remain
+		// blocked regardless of this development exception.
+		client = safehttp.Client(isLoopback(endpoint.Hostname()))
+		client.Timeout = defaultTimeout
 	} else {
 		clone := *client
 		client = &clone
@@ -116,6 +124,9 @@ func NewClient(baseURL, apiKey string, httpClient *http.Client) (*Client, error)
 // the same idempotency key and byte-equivalent request.
 func (c *Client) CreateAndSend(ctx context.Context, idempotencyKey string, request SignatureRequest) (SignatureResult, error) {
 	var result SignatureResult
+	if ahttp.IsDryRun() {
+		return result, ahttp.ErrDryRun
+	}
 	if c == nil || c.baseURL == nil || c.httpClient == nil {
 		return result, errors.New("hash: nil or uninitialized client")
 	}

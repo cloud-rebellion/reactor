@@ -59,6 +59,32 @@ func TestCreateWebhookTriggerInheritsWorkflowTenant(t *testing.T) {
 	}
 }
 
+func TestCreateWebhookTriggerRefusesCrossTenantSecret(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := j.CreateWorkflowInTenant(ctx, "wf_webhook_owner", "tenant-webhook-owner", "h", "0.1.0", json.RawMessage(`{}`), "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	mustInsert := func(id, tenant string) {
+		t.Helper()
+		if _, err := j.db.ExecContext(ctx, j.bind(`INSERT INTO credentials (id, tenant_id, name, service, provider, blob) VALUES ($1,$2,$3,$4,$5,$6)`), id, tenant, id, "reactor-webhook", "shared-secret", []byte("sentinel")); err != nil {
+			t.Fatalf("insert credential: %v", err)
+		}
+	}
+	mustInsert("cred_webhook_owner", "tenant-a")
+	mustInsert("cred_webhook_foreign", "tenant-b")
+
+	if _, err := j.CreateWebhookTrigger(ctx, "wf_webhook_owner", "whk_foreign", "cred_webhook_foreign", "generic", nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant webhook secret was accepted as %v, want ErrNotFound", err)
+	}
+	if _, err := j.CreateWebhookTrigger(ctx, "wf_webhook_owner", "whk_owner", "cred_webhook_owner", "generic", nil); err != nil {
+		t.Fatalf("same-tenant webhook secret was refused: %v", err)
+	}
+}
+
 func TestCreateWebhookTriggerUnknownWorkflowReturnsNotFound(t *testing.T) {
 	t.Parallel()
 	j, cleanup := newTestJournal(t)
@@ -97,6 +123,30 @@ func TestFindWebhookMissing(t *testing.T) {
 	defer cleanup()
 	if _, err := j.FindWebhookByToken(context.Background(), "whk_missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetActiveWebhookTriggerFencesStateAndTenant(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_webhook_active", "webhook-active", "h", "1", json.RawMessage(`{}`), "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	triggerID, err := j.CreateWebhookTrigger(ctx, "wf_webhook_active", "whk_active_lookup", "cred_active_lookup", "generic", []byte(`{"sync":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := j.GetActiveWebhookTrigger(ctx, triggerID)
+	if err != nil || active.ID != triggerID || active.TenantID != "tenant-a" {
+		t.Fatalf("active webhook = %+v, %v", active, err)
+	}
+	if err := j.SetTriggerState(ctx, triggerID, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.GetActiveWebhookTrigger(ctx, triggerID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled webhook lookup = %v, want ErrNotFound", err)
 	}
 }
 

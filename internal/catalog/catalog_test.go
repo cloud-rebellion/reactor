@@ -20,6 +20,23 @@ func TestCatalogWellFormed(t *testing.T) {
 		if s.AuthScheme == "" || s.Docs == "" || len(s.Ops) == 0 {
 			t.Fatalf("service %q missing auth/docs/ops", s.ID)
 		}
+		switch s.CredentialAccess {
+		case "":
+			if s.BrokerPathPrefix != "" {
+				t.Fatalf("service %q has broker path without broker access", s.ID)
+			}
+		case BrokeredGET:
+			if s.Auth != OAuth || !strings.HasPrefix(s.BrokerPathPrefix, "/") || strings.HasPrefix(s.BrokerPathPrefix, "//") {
+				t.Fatalf("service %q has invalid broker contract", s.ID)
+			}
+			for _, op := range s.Ops {
+				if op.Method != "GET" || !strings.HasPrefix(op.Path, "/") {
+					t.Fatalf("service %q advertises an unsupported broker operation: %+v", s.ID, op)
+				}
+			}
+		default:
+			t.Fatalf("service %q has unknown credential access %q", s.ID, s.CredentialAccess)
+		}
 		switch s.Auth {
 		case OAuth:
 			for _, raw := range []string{s.AuthURL, s.TokenURL} {
@@ -105,9 +122,69 @@ func TestOAuthAndAPIKeySplit(t *testing.T) {
 
 func TestRenderForAI(t *testing.T) {
 	out := RenderForAI()
-	for _, want := range []string{"### CRM", "### Project management", "HubSpot", "api.hubapi.com", "vault.MustGet", "oauth:<connection-id>", "docs:"} {
+	for _, want := range []string{"### CRM", "### Project management", "HubSpot", "api.hubapi.com", "vault.MustGet", "oauth:<connection-id>", "sdk/http.FetchPages", "CredentialOrigin", "PutJSON", "bodyless PUT", "PatchJSON", "Delete", "docs:"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("RenderForAI missing %q", want)
 		}
+	}
+}
+
+func TestRenderForAIBrokeredSalesforceCredential(t *testing.T) {
+	salesforce, ok := ByID("salesforce")
+	if !ok || salesforce.CredentialAccess != BrokeredGET {
+		t.Fatal("Salesforce must use the brokered OAuth contract")
+	}
+	section := renderService(salesforce)
+	for _, want := range []string{
+		"brokered OAuth connection", "never use vault.MustGet or a raw token",
+		"sdk/http.ConnectorGet(ctx, \"oauth:<connection-id>\", \"/services/data<operation-path>\"",
+		"GET `/v60.0/query?q=...`",
+	} {
+		if !strings.Contains(section, want) {
+			t.Fatalf("Salesforce authoring contract missing %q: %s", want, section)
+		}
+	}
+	if strings.Contains(section, "via vault.MustGet(\"oauth:") {
+		t.Fatalf("brokered Salesforce was rendered as raw OAuth: %s", section)
+	}
+	google, ok := ByID("google")
+	if !ok || !strings.Contains(renderService(google), "via vault.MustGet(\"oauth:<connection-id>\")") {
+		t.Fatal("ordinary OAuth credential guidance changed")
+	}
+	if !strings.Contains(RenderForAI(), "brokered OAuth service is different") {
+		t.Fatal("AI lens has no brokered OAuth exception")
+	}
+}
+
+func TestCatalogLookupsDoNotExposeSharedEntries(t *testing.T) {
+	first, ok := ByID("notion")
+	if !ok || len(first.Ops) == 0 || len(first.AuthParams) == 0 {
+		t.Fatal("notion fixture needs operations and OAuth auth params")
+	}
+	wantPath := first.Ops[0].Path
+	wantParam := first.AuthParams["owner"]
+	first.Ops[0].Path = "/modified-by-caller"
+	first.AuthParams["owner"] = "modified-by-caller"
+
+	again, _ := ByID("notion")
+	if again.Ops[0].Path != wantPath || again.AuthParams["owner"] != wantParam {
+		t.Fatalf("ByID leaked caller mutation: operation = %q, auth param = %q", again.Ops[0].Path, again.AuthParams["owner"])
+	}
+
+	all := All()
+	for i := range all {
+		if all[i].ID != "notion" {
+			continue
+		}
+		all[i].Ops[0].Path = "/modified-by-all"
+		all[i].AuthParams["owner"] = "modified-by-all"
+		break
+	}
+	again, _ = ByID("notion")
+	if again.Ops[0].Path != wantPath || again.AuthParams["owner"] != wantParam {
+		t.Fatalf("All leaked caller mutation: operation = %q, auth param = %q", again.Ops[0].Path, again.AuthParams["owner"])
+	}
+	if strings.Contains(RenderForAI(), "/modified-by-") {
+		t.Fatal("AI catalog lens inherited a caller-mutated operation")
 	}
 }

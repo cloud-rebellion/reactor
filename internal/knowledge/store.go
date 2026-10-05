@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 //go:embed seed/*.md
@@ -77,6 +80,18 @@ type Store struct {
 
 	mu sync.RWMutex
 }
+
+const (
+	maxEntryBodyBytes = 1 << 20 // 1 MiB per durable knowledge entry
+	// Read paths must bound the whole file as well as Add's body. A manually
+	// planted or legacy file can otherwise make List/Get allocate an arbitrary
+	// amount before frontmatter validation gets a chance to run.
+	maxEntryFileBytes  = maxEntryBodyBytes + 64<<10
+	maxEntryTitleBytes = 512
+	maxEntryTopicBytes = 128
+	maxEntryListItems  = 64
+	maxEntryListBytes  = 512
+)
 
 // New returns a Store rooted at root. Creates root with mode 0700 if
 // it doesn't exist. Pre-seeds the corpus on a fresh install by walking
@@ -150,8 +165,66 @@ func (s *Store) Add(ctx context.Context, e Entry) (Entry, error) {
 	if e.Body == "" {
 		return Entry{}, errors.New("knowledge: body required")
 	}
-	if findings := s.Redactor.Scan(e.Body); len(findings) > 0 {
-		return Entry{}, &ErrRedacted{Findings: findings, Summary: s.Redactor.Format(findings)}
+	if len(e.Body) > maxEntryBodyBytes {
+		return Entry{}, fmt.Errorf("knowledge: body exceeds %d-byte limit", maxEntryBodyBytes)
+	}
+	if len(e.Frontmatter.Title) > maxEntryTitleBytes {
+		return Entry{}, fmt.Errorf("knowledge: title exceeds %d-byte limit", maxEntryTitleBytes)
+	}
+	if len(e.Frontmatter.Topic) > maxEntryTopicBytes {
+		return Entry{}, fmt.Errorf("knowledge: topic exceeds %d-byte limit", maxEntryTopicBytes)
+	}
+	for name, value := range map[string]string{
+		"title": e.Frontmatter.Title, "topic": e.Frontmatter.Topic,
+		"tenant": e.Frontmatter.Tenant, "created_by": e.Frontmatter.CreatedBy,
+		"id": e.Frontmatter.ID,
+	} {
+		if err := validateMetadataText(name, value); err != nil {
+			return Entry{}, err
+		}
+	}
+	if strings.ContainsAny(e.Frontmatter.Topic, `/\\`) || e.Frontmatter.Topic == "." || e.Frontmatter.Topic == ".." {
+		return Entry{}, fmt.Errorf("knowledge: invalid topic %q", e.Frontmatter.Topic)
+	}
+	if len(e.Frontmatter.Sources) > maxEntryListItems || len(e.Frontmatter.Tags) > maxEntryListItems || len(e.Frontmatter.Supersedes) > maxEntryListItems {
+		return Entry{}, fmt.Errorf("knowledge: sources, tags, and supersedes allow at most %d items", maxEntryListItems)
+	}
+	for _, value := range e.Frontmatter.Sources {
+		if len(value) > maxEntryListBytes {
+			return Entry{}, fmt.Errorf("knowledge: source item exceeds %d-byte limit", maxEntryListBytes)
+		}
+		if err := validateMetadataText("source", value); err != nil {
+			return Entry{}, err
+		}
+	}
+	for _, value := range e.Frontmatter.Tags {
+		if len(value) > maxEntryListBytes {
+			return Entry{}, fmt.Errorf("knowledge: tag item exceeds %d-byte limit", maxEntryListBytes)
+		}
+		if err := validateMetadataText("tag", value); err != nil {
+			return Entry{}, err
+		}
+	}
+	for _, value := range e.Frontmatter.Supersedes {
+		if err := validateMetadataText("supersedes", value); err != nil {
+			return Entry{}, err
+		}
+	}
+	redactor := s.Redactor
+	if redactor == nil {
+		redactor = NewRedactor()
+	}
+	var findings []RedactionFinding
+	for _, value := range []string{e.Body, e.Frontmatter.Title, e.Frontmatter.Topic, e.Frontmatter.Tenant, e.Frontmatter.CreatedBy, e.Frontmatter.ID} {
+		findings = append(findings, redactor.Scan(value)...)
+	}
+	for _, values := range [][]string{e.Frontmatter.Sources, e.Frontmatter.Tags, e.Frontmatter.Supersedes} {
+		for _, value := range values {
+			findings = append(findings, redactor.Scan(value)...)
+		}
+	}
+	if len(findings) > 0 {
+		return Entry{}, &ErrRedacted{Findings: findings, Summary: redactor.Format(findings)}
 	}
 
 	if e.Frontmatter.ID == "" {
@@ -202,6 +275,17 @@ func (s *Store) Add(ctx context.Context, e Entry) (Entry, error) {
 	return e, nil
 }
 
+// validateMetadataText keeps frontmatter safe for both YAML encoding and the
+// prompt metadata line. Bodies may contain markdown/newlines, but IDs, labels,
+// tenant names, topics, tags, and source references must never contain control
+// bytes that can forge a new record or create a surprising path.
+func validateMetadataText(field, value string) error {
+	if !utf8.ValidString(value) || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return fmt.Errorf("knowledge: %s must be valid UTF-8 without control characters", field)
+	}
+	return nil
+}
+
 // withinRoot reports whether path stays inside root after cleaning. It guards
 // caller-controlled path segments (knowledge Topic/ID) that use "../" to escape
 // the knowledge directory.
@@ -211,6 +295,58 @@ func withinRoot(root, path string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func readEntryFile(path string) ([]byte, error) {
+	if _, err := entryFileInfo(path); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+}
+
+const maxEntryFrontmatterBytes = 64 << 10
+
+// readEntryFrontmatter validates the same on-disk boundary as readEntryFile
+// but reads only a bounded prefix. The prefix is enough to parse the fenced
+// metadata; the markdown body is never read into memory.
+func readEntryFrontmatter(path string) (Frontmatter, error) {
+	if _, err := entryFileInfo(path); err != nil {
+		return Frontmatter{}, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return Frontmatter{}, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxEntryFrontmatterBytes))
+	if err != nil {
+		return Frontmatter{}, err
+	}
+	fm, _, err := parseFrontmatter(raw)
+	if err != nil {
+		return Frontmatter{}, err
+	}
+	return fm, nil
+}
+
+func entryFileInfo(path string) (os.FileInfo, error) {
+	// WalkDir does not follow directory symlinks, but it still presents file
+	// symlinks as entries. Use Lstat so an operator-planted link cannot make a
+	// tenant-scoped MCP search read an unrelated file outside the corpus root.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("knowledge: entry %q is a symlink", path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("knowledge: entry %q is not a regular file", path)
+	}
+	if info.Size() > maxEntryFileBytes {
+		return nil, fmt.Errorf("knowledge: entry %q exceeds %d-byte limit", path, maxEntryFileBytes)
+	}
+	return info, nil
 }
 
 // Get returns the entry with id (no topic needed; the store walks).
@@ -235,7 +371,7 @@ func (s *Store) getLocked(id string) (Entry, error) {
 		if base != id {
 			return nil
 		}
-		raw, err := os.ReadFile(path)
+		raw, err := readEntryFile(path)
 		if err != nil {
 			return err
 		}
@@ -256,6 +392,52 @@ func (s *Store) getLocked(id string) (Entry, error) {
 	return found, nil
 }
 
+// getLockedForTenant resolves an ID using a tenant boundary. IDs are normally
+// generated and unique, but Add accepts operator-supplied IDs and permits the
+// same ID in different topic directories. Prefer an exact tenant match over a
+// shared entry; reject ambiguity instead of silently choosing a filesystem
+// walk result. The store read lock must be held by the caller.
+func (s *Store) getLockedForTenant(id, tenant string) (Entry, error) {
+	var shared, owned []Entry
+	err := filepath.WalkDir(s.Root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".md") || strings.TrimSuffix(filepath.Base(path), ".md") != id {
+			return nil
+		}
+		raw, err := readEntryFile(path)
+		if err != nil {
+			return err
+		}
+		fm, body, err := parseFrontmatter(raw)
+		if err != nil {
+			return err
+		}
+		entry := Entry{Frontmatter: fm, Body: string(body), Path: path}
+		if tenant == "" || fm.Tenant == tenant {
+			owned = append(owned, entry)
+		} else if fm.Tenant == "" {
+			shared = append(shared, entry)
+		}
+		return nil
+	})
+	if err != nil {
+		return Entry{}, err
+	}
+	candidates := owned
+	if tenant != "" && len(candidates) == 0 {
+		candidates = shared
+	}
+	if len(candidates) == 0 {
+		return Entry{}, ErrNotFound
+	}
+	if len(candidates) > 1 {
+		return Entry{}, fmt.Errorf("knowledge: entry id %q is ambiguous for tenant %q", id, tenant)
+	}
+	return candidates[0], nil
+}
+
 // List returns every entry, optionally filtered to one topic. Sorted by
 // (topic asc, id asc) for deterministic output.
 func (s *Store) List(ctx context.Context, topic string) ([]Entry, error) {
@@ -265,6 +447,13 @@ func (s *Store) List(ctx context.Context, topic string) ([]Entry, error) {
 	root := s.Root
 	if topic != "" {
 		root = filepath.Join(s.Root, topic)
+		// Topic is exposed by the CLI and is also a reusable store API. Keep
+		// read-side filtering inside the corpus root just like Add keeps
+		// writes inside it; otherwise a value such as ../../tmp can make a
+		// knowledge search walk arbitrary operator-readable directories.
+		if !withinRoot(s.Root, root) {
+			return nil, fmt.Errorf("knowledge: invalid topic %q (escapes the knowledge root)", topic)
+		}
 		if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
@@ -276,7 +465,7 @@ func (s *Store) List(ctx context.Context, topic string) ([]Entry, error) {
 		if d.IsDir() || !strings.HasSuffix(path, ".md") {
 			return nil
 		}
-		raw, err := os.ReadFile(path)
+		raw, err := readEntryFile(path)
 		if err != nil {
 			return err
 		}
@@ -299,13 +488,158 @@ func (s *Store) List(ctx context.Context, topic string) ([]Entry, error) {
 	return out, nil
 }
 
-// Search returns the top-N BM25 hits across the corpus.
-func (s *Store) Search(ctx context.Context, query string, limit int) ([]Hit, error) {
-	entries, err := s.List(ctx, "")
+// ListMetadata returns only parsed frontmatter for every entry, optionally
+// filtered to one topic. It is intended for indexes and graph projections
+// that need identity and ownership but never need the markdown body. The
+// reader stops at the frontmatter fence and retains no entry body, so a
+// rebuild cannot turn a large corpus into an aggregate body allocation.
+func (s *Store) ListMetadata(ctx context.Context, topic string) ([]Frontmatter, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	root := s.Root
+	if topic != "" {
+		root = filepath.Join(s.Root, topic)
+		if !withinRoot(s.Root, root) {
+			return nil, fmt.Errorf("knowledge: invalid topic %q (escapes the knowledge root)", topic)
+		}
+		if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+	}
+	var out []Frontmatter
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		fm, err := readEntryFrontmatter(path)
+		if err != nil {
+			return fmt.Errorf("knowledge: parse %s: %w", path, err)
+		}
+		out = append(out, fm)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return rankEntries(entries, query, limit, s.StaleDays), nil
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Topic != out[j].Topic {
+			return out[i].Topic < out[j].Topic
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// Search returns the top-N BM25 hits across the corpus.
+func (s *Store) Search(ctx context.Context, query string, limit int) ([]Hit, error) {
+	return s.searchForTenant(ctx, query, limit, "")
+}
+
+// SearchForTenant returns global entries plus entries owned by tenant. An
+// empty tenant preserves the unscoped administrator view; callers serving a
+// member or MCP tenant should always pass an explicit tenant.
+func (s *Store) SearchForTenant(ctx context.Context, query string, limit int, tenant string) ([]Hit, error) {
+	return s.searchForTenant(ctx, query, limit, tenant)
+}
+
+func (s *Store) searchForTenant(ctx context.Context, query string, limit int, tenant string) ([]Hit, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	qTokens := tokenize(query)
+	if len(qTokens) == 0 {
+		return nil, nil
+	}
+
+	// BM25 needs corpus-wide document frequencies and average length. Do that
+	// accounting in a first pass, then score a second pass while retaining only
+	// the requested top-N entries. The old ListForTenant path loaded every
+	// body into one slice before ranking; a large or manually planted corpus
+	// could therefore turn a bounded MCP search into an aggregate memory
+	// allocation. Each pass still enforces the per-file read bound.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	df := map[string]int{}
+	totalDocs := 0
+	totalLen := 0
+	walk := func(fn func(path string, fm Frontmatter, body []byte) error) error {
+		return filepath.WalkDir(s.Root, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if d.IsDir() || !strings.HasSuffix(path, ".md") {
+				return nil
+			}
+			raw, err := readEntryFile(path)
+			if err != nil {
+				return err
+			}
+			fm, body, err := parseFrontmatter(raw)
+			if err != nil {
+				return fmt.Errorf("knowledge: parse %s: %w", path, err)
+			}
+			if !visibleToTenant(Entry{Frontmatter: fm}, tenant) {
+				return nil
+			}
+			return fn(path, fm, body)
+		})
+	}
+	if err := walk(func(_ string, fm Frontmatter, body []byte) error {
+		bodyTokens := tokenize(string(body))
+		titleTokens := tokenize(fm.Title)
+		totalDocs++
+		totalLen += len(bodyTokens)
+		seen := map[string]bool{}
+		for _, token := range bodyTokens {
+			if !seen[token] {
+				df[token]++
+				seen[token] = true
+			}
+		}
+		for _, token := range titleTokens {
+			if !seen[token] {
+				df[token]++
+				seen[token] = true
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if totalDocs == 0 {
+		return nil, nil
+	}
+	avgLen := float64(totalLen) / float64(totalDocs)
+	if avgLen == 0 {
+		avgLen = 1
+	}
+
+	hits := make([]Hit, 0, limit)
+	if err := walk(func(path string, fm Frontmatter, body []byte) error {
+		entry := Entry{Frontmatter: fm, Body: string(body), Path: path}
+		score := scoreEntryTokens(entry, tokenize(entry.Body), tokenize(fm.Title), qTokens, df, float64(totalDocs), avgLen, s.StaleDays)
+		if score <= 0 {
+			return nil
+		}
+		hits = append(hits, Hit{Entry: entry, Score: score})
+		sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+		if len(hits) > limit {
+			hits = hits[:limit]
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return hits, nil
 }
 
 // Supersede creates a new entry that points back at oldID via the
@@ -316,13 +650,31 @@ func (s *Store) Supersede(ctx context.Context, oldID string, newEntry Entry, rea
 	if err != nil {
 		return Entry{}, err
 	}
+	return s.supersedeFrom(ctx, old, newEntry, reason)
+}
+
+// SupersedeForTenant resolves the source entry using the same tenant boundary
+// as MCP reads before creating its replacement. Without this method a caller
+// could check GetForTenant and then have Supersede re-resolve a colliding ID
+// from another topic or tenant.
+func (s *Store) SupersedeForTenant(ctx context.Context, oldID, tenant string, newEntry Entry, reason string) (Entry, error) {
+	s.mu.RLock()
+	old, err := s.getLockedForTenant(oldID, tenant)
+	s.mu.RUnlock()
+	if err != nil {
+		return Entry{}, err
+	}
+	return s.supersedeFrom(ctx, old, newEntry, reason)
+}
+
+func (s *Store) supersedeFrom(ctx context.Context, old Entry, newEntry Entry, reason string) (Entry, error) {
 	if newEntry.Frontmatter.Topic == "" {
 		newEntry.Frontmatter.Topic = old.Frontmatter.Topic
 	}
 	if newEntry.Frontmatter.Title == "" {
 		newEntry.Frontmatter.Title = old.Frontmatter.Title
 	}
-	newEntry.Frontmatter.Supersedes = append(newEntry.Frontmatter.Supersedes, oldID)
+	newEntry.Frontmatter.Supersedes = append(newEntry.Frontmatter.Supersedes, old.Frontmatter.ID)
 	if reason != "" {
 		newEntry.Frontmatter.Sources = append(newEntry.Frontmatter.Sources, "supersede-reason:"+reason)
 	}
@@ -447,12 +799,7 @@ func (s *Store) ListForTenant(ctx context.Context, topic, tenant string) ([]Entr
 // permission error) when the entry belongs to another tenant, so guessing an
 // id cannot confirm that it exists.
 func (s *Store) GetForTenant(ctx context.Context, id, tenant string) (Entry, error) {
-	e, err := s.Get(ctx, id)
-	if err != nil {
-		return Entry{}, err
-	}
-	if !visibleToTenant(e, tenant) {
-		return Entry{}, ErrNotFound
-	}
-	return e, nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getLockedForTenant(id, tenant)
 }

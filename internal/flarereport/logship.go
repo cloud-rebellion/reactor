@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/safehttp"
 )
 
 // logShipMinDefault is the default floor for shipping a log line to Flare.
@@ -62,7 +64,7 @@ func installLogShipperOnce(service string) {
 		key:      key,
 		service:  service,
 		ch:       make(chan nativeLogLine, logShipBuffer),
-		client:   &http.Client{Timeout: 5 * time.Second},
+		client:   logShipHTTPClient(),
 	}
 	go sh.run()
 	// slog.SetDefault re-routes the standard log package through the new default
@@ -83,9 +85,25 @@ func installLogShipperOnce(service string) {
 	slog.SetDefault(slog.New(h))
 }
 
+func logShipHTTPClient() *http.Client {
+	// The DSN is operator configuration, but it still controls an off-host
+	// request carrying diagnostic data. Use the shared connect-time guard and
+	// redirect refusal so a rebinding or 302 cannot redirect logs into metadata
+	// or another private service. Private addresses remain available for an
+	// explicitly configured self-hosted Flare instance.
+	client := safehttp.Client(true)
+	client.Timeout = 5 * time.Second
+	return client
+}
+
 // sensitiveLogKeyParts are case-insensitive substrings whose attribute values
 // are redacted before shipping a log record to the shared Flare logs store.
 // Bare "key" is intentionally excluded (too broad: keyboard, monkey, ...).
+//
+// This remains a second line of defence. The primary boundary is the
+// shipSafeLogAttrKeys allowlist below: arbitrary workflow-controlled strings
+// such as errors, URLs, command specs, recipients, and stderr are not sent to
+// the shared log store simply because a caller used a new attribute name.
 var sensitiveLogKeyParts = []string{
 	"password", "passwd", "secret", "token", "authorization", "bearer",
 	"cookie", "credential", "api_key", "apikey", "access_key", "accesskey",
@@ -110,12 +128,52 @@ var sensitiveLogKeyParts = []string{
 	// to invert this denylist into an allowlist of shippable keys.
 }
 
+// shipSafeLogAttrKeys is deliberately small and explicit. Flare is a shared
+// operational store, so forwarding every slog attribute creates a secret and
+// PII egress path whenever a workflow author logs an error, URL, payload, or
+// recipient. Numeric and boolean values under these keys are useful for
+// operations; string values are limited to stable identifiers and bounded
+// state labels. Add a key only after checking that its value cannot carry a
+// credential or arbitrary workflow data.
+var shipSafeLogAttrKeys = map[string]struct{}{
+	"service": {}, "release": {}, "component": {},
+	"tenant_id": {}, "workflow_id": {}, "workflow_slug": {}, "run_id": {},
+	"step": {}, "step_name": {}, "status": {}, "state": {}, "phase": {},
+	"kind": {}, "type": {}, "trigger": {}, "trigger_kind": {},
+	"operation": {}, "method": {}, "route": {}, "path": {}, "code": {},
+	"reason": {}, "event": {}, "source": {}, "target": {},
+	"count": {}, "limit": {}, "offset": {}, "attempt": {}, "attempts": {},
+	"duration_ms": {}, "elapsed_ms": {}, "timeout_ms": {},
+	"queue": {}, "queued": {}, "running": {}, "desired": {}, "min": {}, "max": {},
+	"version": {}, "worker": {}, "worker_id": {}, "server_id": {}, "command_id": {},
+	"channel": {}, "channel_id": {}, "channel_kind": {},
+	"admission_status": {}, "artifact_status": {}, "source_integrity": {},
+	"runtime_reconciled": {}, "dispatchable_now": {}, "durable_ready": {},
+	"point_in_time": {}, "enabled": {}, "created": {}, "deleted": {},
+	"replayed": {}, "idempotent": {}, "dry_run": {}, "scope": {},
+}
+
 func isSensitiveLogKey(key string) bool {
 	k := strings.ToLower(key)
 	for _, s := range sensitiveLogKeyParts {
 		if strings.Contains(k, s) {
 			return true
 		}
+	}
+	return false
+}
+
+func isShipSafeLogKey(key string) bool {
+	if isSensitiveLogKey(key) {
+		return false
+	}
+	key = strings.ToLower(key)
+	if _, ok := shipSafeLogAttrKeys[key]; ok {
+		return true
+	}
+	if dot := strings.LastIndexByte(key, '.'); dot >= 0 {
+		_, ok := shipSafeLogAttrKeys[key[dot+1:]]
+		return ok
 	}
 	return false
 }
@@ -144,12 +202,25 @@ func parseDSNForLogs(dsn string) (endpoint, key string, ok bool) {
 	if err != nil || u.User == nil || u.Host == "" {
 		return "", "", false
 	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "https" && !(scheme == "http" && literalLoopbackHost(u.Hostname())) {
+		return "", "", false
+	}
 	k := u.User.Username()
 	id := strings.Trim(u.Path, "/")
 	if k == "" || id == "" {
 		return "", "", false
 	}
-	return u.Scheme + "://" + u.Host + "/api/" + id + "/logs", k, true
+	return scheme + "://" + u.Host + "/api/" + id + "/logs", k, true
+}
+
+func literalLoopbackHost(host string) bool {
+	switch strings.ToLower(strings.Trim(host, "[]")) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 type nativeLogLine struct {
@@ -284,19 +355,29 @@ func (h *flareSlogHandler) ship(r slog.Record) {
 		}
 		key := pfx + a.Key
 		if key == "trace_id" {
-			traceID = a.Value.String()
+			if a.Value.Kind() == slog.KindString {
+				candidate := strings.TrimSpace(a.Value.String())
+				if validTraceID(candidate) {
+					traceID = strings.ToLower(candidate)
+				}
+			}
 			return
 		}
-		// Redact sensitive attribute values before they leave the process for the
-		// shared Flare logs store. Log records are an egress boundary just like the
-		// sentry event path (which BeforeSend already scrubs); a stray
-		// slog.Error("...", "token", t) must not ship the token. Key-based so it
-		// stays cheap and never touches legit values.
-		if isSensitiveLogKey(key) {
-			m[key] = "[redacted]"
+		// Only stable operational fields cross the shared Flare boundary. A
+		// denylist is insufficient here: workflow-controlled values commonly
+		// arrive under "error", "url", "to", "spec", or a new attribute name.
+		// Keep the value-level scrub below as defence in depth for allowed strings.
+		if !isShipSafeLogKey(key) {
 			return
 		}
-		m[key] = a.Value.Any()
+		switch a.Value.Kind() {
+		case slog.KindBool, slog.KindInt64, slog.KindUint64, slog.KindFloat64,
+			slog.KindDuration, slog.KindTime, slog.KindString:
+			m[key] = a.Value.Any()
+		default:
+			// KindAny and LogValuer may contain errors, URLs, payloads, or
+			// arbitrary workflow objects. Do not serialize them at this boundary.
+		}
 	}
 	for _, a := range h.attrs {
 		addAttr(prefix, a)
@@ -318,6 +399,18 @@ func (h *flareSlogHandler) ship(r slog.Record) {
 		TraceID:    traceID,
 		Timestamp:  r.Time.UTC().Format(time.RFC3339),
 	})
+}
+
+func validTraceID(value string) bool {
+	if len(value) != 16 && len(value) != 32 {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *flareSlogHandler) WithAttrs(as []slog.Attr) slog.Handler {

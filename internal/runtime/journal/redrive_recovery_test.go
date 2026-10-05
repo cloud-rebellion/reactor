@@ -60,12 +60,32 @@ func TestRecoverOwnedPendingDeadLetterRedriveRestoresExactAuthorization(t *testi
 	if err := j.ExtendLease(ctx, "run_1", leases[0].Owner, time.Minute); !errors.Is(err, ErrLeaseOwnershipLost) {
 		t.Fatalf("recovery left owned lease: %v", err)
 	}
+	effects, err := j.ClaimTerminalEffects(ctx, 10, time.Minute)
+	if err != nil || len(effects) != 1 || effects[0].RunID != "run_1" || effects[0].Status != "failed_dlq" {
+		t.Fatalf("recovered redrive terminal effect = %+v, %v; want failed_dlq receipt", effects, err)
+	}
 
 	// The same exact item is operator-visible and can authorize a fresh attempt
 	// again; no manual database repair is needed after the launch failure.
 	claimed, err = j.StartDeadLetterRetryQueuedItem(ctx, "run_1", item.ID)
 	if err != nil || !claimed {
 		t.Fatalf("re-authorize recovered exact redrive = %v, %v", claimed, err)
+	}
+}
+
+func TestLocalInterruptedFailureEnqueuesTerminalEffect(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	status, err := j.RecoverLocalInterruptedRun(ctx, "run_1", false)
+	if err != nil || status != "failed" {
+		t.Fatalf("local interrupted recovery = %q, %v; want failed", status, err)
+	}
+	effects, err := j.ClaimTerminalEffects(ctx, 10, time.Minute)
+	if err != nil || len(effects) != 1 || effects[0].RunID != "run_1" || effects[0].Status != "failed" {
+		t.Fatalf("local interrupted terminal effect = %+v, %v; want failed receipt", effects, err)
 	}
 }
 

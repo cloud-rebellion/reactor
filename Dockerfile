@@ -24,13 +24,13 @@
 # Build single-arch (host):
 #   docker build -t reactor:latest .
 #
-# Run (mount a volume for state + the master key):
-#   docker run -d --name reactor -p 7777:7777 \
+# Run (Linux local-only path; host networking preserves a loopback bind):
+#   docker run -d --name reactor --network host \
 #     -v reactor-state:/var/lib/reactor \
 #     -e REACTOR_DB_URL=sqlite:///var/lib/reactor/reactor.db \
 #     -e REACTOR_BASIC_AUTH_USER=admin \
 #     -e REACTOR_BASIC_AUTH_PASSWORD_SHA256=<sha256-hex> \
-#     reactor:latest serve --root /var/lib/reactor
+#     reactor:latest serve --root /var/lib/reactor --addr 127.0.0.1:7777
 
 # Keep this in lockstep with ciGoToolchain in hephaestus/userworkflows/ci_go.go.
 # It was once golang:1.26.4-alpine while CI compiled and govulnchecked reactor
@@ -97,9 +97,10 @@ ENV REACTOR_SDK_REPLACE=/opt/reactor-src \
 # SDK source (go build may touch go.sum); the module cache is world-readable.
 RUN mkdir -p /var/lib/reactor/.gocache \
     && chown -R reactor:reactor /var/lib/reactor /opt/reactor-src \
+    && chmod 0700 /var/lib/reactor /var/lib/reactor/.gocache \
     && chmod -R a+rX /go/pkg/mod
 VOLUME ["/var/lib/reactor"]
 EXPOSE 7777
 USER reactor
 ENTRYPOINT ["/usr/local/bin/reactor"]
-CMD ["serve"]
+CMD ["serve", "--addr", "127.0.0.1:7777"]

@@ -137,8 +137,9 @@ func (s *Server) tenantsUpsert(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/tenants", http.StatusSeeOther)
 }
 
-// tenantsDelete removes a tenant (admin-only). The default tenant is
-// protected by the journal layer; surface its refusal as a 409.
+// tenantsDelete removes an empty tenant (admin-only). The journal refuses
+// deletion while users, workflows, credentials, runs, or other durable
+// tenant-owned records remain, preserving quota and disabled-state policy.
 func (s *Server) tenantsDelete(w http.ResponseWriter, r *http.Request) {
 	if !requireAdmin(w, r) {
 		return
@@ -279,7 +280,7 @@ func tenantActions(t journal.Tenant, _ []journal.Plan) string {
 	if t.TenantID == "default" {
 		return export + " " + erase + ` <span class="muted">(default)</span>`
 	}
-	del := fmt.Sprintf(`<form method="POST" action="/tenants/%s/delete" class="form-inline" data-confirm="Delete tenant %s? Its runs keep their tenant id and revert to unlimited defaults."><button type="submit" class="btn-link">delete</button></form>`,
+	del := fmt.Sprintf(`<form method="POST" action="/tenants/%s/delete" class="form-inline" data-confirm="Delete empty tenant %s? Tenants with users, workflows, credentials, runs, or other durable records must be cleaned up first."><button type="submit" class="btn-link">delete</button></form>`,
 		urlEsc(t.TenantID), template.HTMLEscapeString(t.TenantID))
 	return export + " " + erase + " " + del
 }

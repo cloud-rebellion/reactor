@@ -55,6 +55,7 @@ import (
 
 	"github.com/bright-interaction/reactor/internal/dispatcher"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
+	"github.com/bright-interaction/reactor/internal/runtime/wire"
 	"github.com/bright-interaction/reactor/internal/vault"
 	hashesign "github.com/bright-interaction/reactor/sdk/esign/hash"
 )
@@ -63,6 +64,13 @@ import (
 // exhaust host memory. Larger payloads should ride object storage with a
 // reference; webhooks themselves stay small.
 const MaxBodyBytes = 1 << 20 // 1 MiB
+
+// MaxSignalBodyBytes is the public signal ingress limit. Signal payloads are
+// replayed inside a SignalDeliver wire frame, so this is deliberately below
+// MaxBodyBytes and leaves envelope headroom for names, tokens, and reply ids.
+// It is derived from the canonical wire budget rather than duplicating a
+// transport limit in the HTTP receiver.
+const MaxSignalBodyBytes = wire.MaxSignalPayloadBytes
 
 // defaultDeliveryLease bounds the pre-completion ownership window. It exceeds
 // the maximum 120-second synchronous webhook timeout so a normal sync run does
@@ -190,6 +198,7 @@ func (r *Receiver) Handler() http.HandlerFunc { return r.handle }
 func (r *Receiver) SignalHandler() http.HandlerFunc { return r.handleSignal }
 
 func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
+	setNoStoreResponseHeaders(w)
 	if r.Log == nil {
 		r.Log = slog.Default()
 	}
@@ -337,6 +346,31 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// The token lookup and durable delivery claim are separate operations. An
+	// operator can disable or rotate the trigger between them, so resolve the
+	// active binding again before choosing sync/async mode or dispatching. A
+	// changed verifier/config is intentionally retried under the new policy;
+	// releasing this claim avoids acknowledging a request that never ran.
+	fresh, freshErr := r.Journal.GetActiveWebhookTrigger(ctx, trig.ID)
+	if freshErr != nil {
+		r.releaseClaim(ctx, trig, provider, deliveryID, claim.ClaimToken)
+		if errors.Is(freshErr, journal.ErrNotFound) {
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "webhook trigger changed; retry later", http.StatusServiceUnavailable)
+			return
+		}
+		r.Log.Error("webhook: resolve active trigger before dispatch", "trigger_id", trig.ID, "err", freshErr)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if fresh.TenantID != trig.TenantID || fresh.WorkflowID != trig.WorkflowID || fresh.SecretID != trig.SecretID || fresh.Provider != trig.Provider || !bytes.Equal(fresh.Config, trig.Config) {
+		r.releaseClaim(ctx, trig, provider, deliveryID, claim.ClaimToken)
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "webhook trigger changed; retry later", http.StatusServiceUnavailable)
+		return
+	}
+	trig = fresh
+
 	// Synchronous trigger: run the workflow and return its result to the
 	// caller (request/response API), instead of fire-and-forget.
 	// automation-v1 and hash-v1 are deliberately receipt-based and asynchronous.
@@ -354,8 +388,10 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 				http.Error(w, "workflow disabled; retry later", http.StatusServiceUnavailable)
 				return
 			}
-			if errors.Is(derr, dispatcher.ErrRateLimited) || errors.Is(derr, dispatcher.ErrCapacity) {
+			var quotaErr *journal.QuotaError
+			if errors.Is(derr, dispatcher.ErrRateLimited) || errors.Is(derr, dispatcher.ErrCapacity) || errors.As(derr, &quotaErr) {
 				r.releaseClaim(ctx, trig, provider, deliveryID, claim.ClaimToken)
+				w.Header().Set("Retry-After", "30")
 				http.Error(w, "rate limited; retry later", http.StatusTooManyRequests)
 				return
 			}
@@ -408,7 +444,9 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 		}
 		// Rate-limit / capacity are backpressure, not server faults: 429 tells
 		// the sender to retry later rather than alarming on a 500.
-		if errors.Is(err, dispatcher.ErrRateLimited) || errors.Is(err, dispatcher.ErrCapacity) {
+		var quotaErr *journal.QuotaError
+		if errors.Is(err, dispatcher.ErrRateLimited) || errors.Is(err, dispatcher.ErrCapacity) || errors.As(err, &quotaErr) {
+			w.Header().Set("Retry-After", "30")
 			http.Error(w, "rate limited; retry later", http.StatusTooManyRequests)
 			return
 		}
@@ -442,6 +480,16 @@ func writeDeliveryReceipt(w http.ResponseWriter, status int, deduped bool, runID
 	})
 }
 
+// setNoStoreResponseHeaders keeps public trigger receipts and error responses
+// out of browser or intermediary caches. The response can contain a run id
+// tied to a bearer webhook capability, and caching it after the capability is
+// rotated would expose stale execution metadata to a later caller.
+func setNoStoreResponseHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+}
+
 type deliveryStatusResponse struct {
 	RunID      string          `json:"run_id"`
 	Status     string          `json:"status"`
@@ -464,9 +512,7 @@ type safeHashResult struct {
 func (r *Receiver) handleDeliveryStatus(w http.ResponseWriter, req *http.Request) {
 	// Apply on every response, including malformed/auth failures, so a shared
 	// proxy or browser never retains a signed status lookup.
-	w.Header().Set("Cache-Control", "no-store, max-age=0")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
+	setNoStoreResponseHeaders(w)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	if r.Log == nil {
@@ -547,18 +593,24 @@ func (r *Receiver) handleDeliveryStatus(w http.ResponseWriter, req *http.Request
 	}
 	statusCode := http.StatusAccepted
 	if terminal {
-		steps, err := r.Journal.ListSteps(ctx, run.RunID)
-		if err != nil {
-			r.Log.Error("webhook: status step lookup", "run_id", run.RunID, "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
 		// Only a successful workflow may publish the Hash step projection as a
 		// completed producer result. A later failed/cancelled workflow can still
 		// be inspected by operators, but its public delivery capability must not
 		// present an intermediate side effect as successful completion.
 		if run.Status == "succeeded" {
-			response.HashResult = findSafeHashResult(steps)
+			// The public status token is an invocation capability, not an
+			// operator timeline. Read only the one bounded Hash result row so a
+			// run with a large retry history cannot turn status polling into an
+			// unbounded database/memory read.
+			step, stepErr := r.Journal.LatestSuccessfulStepOutputBounded(ctx, run.RunID, "hash-create-and-send", 4<<10)
+			if stepErr != nil && !errors.Is(stepErr, journal.ErrNotFound) {
+				r.Log.Error("webhook: status step lookup", "run_id", run.RunID, "err", stepErr)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			if stepErr == nil && !step.OutputTruncated {
+				response.HashResult = findSafeHashResult([]journal.StepRow{step})
+			}
 		}
 		statusCode = http.StatusOK
 	}
@@ -699,17 +751,19 @@ func (r *Receiver) completeClaim(
 // workflows can embed the URL in approval emails before suspending.
 //
 // HMAC is not enforced here. The token is the auth gate; brute-forcing
-// 128 bits of randomness via 1 MiB-bounded HTTP requests is infeasible
+// 128 bits of randomness via bounded HTTP requests is infeasible
 // inside the sub-day windows typical for human-in-the-loop signals.
 //
 // Status codes:
 //
 //	202 Accepted  payload recorded; scheduler will resume the run on next tick
 //	404 Not Found token doesn't match any active signal schedule
-//	410 Gone      a prior delivery already won; idempotent retry
-//	413 Payload Too Large body exceeded MaxBodyBytes
+//	410 Gone      a prior delivery won or the signal deadline elapsed
+//	413 Payload Too Large body exceeded MaxSignalBodyBytes
+//	400 Bad Request body was empty or not valid JSON
 //	500           journal write failed; client may retry
 func (r *Receiver) handleSignal(w http.ResponseWriter, req *http.Request) {
+	setNoStoreResponseHeaders(w)
 	if r.Log == nil {
 		r.Log = slog.Default()
 	}
@@ -720,7 +774,11 @@ func (r *Receiver) handleSignal(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, MaxBodyBytes))
+	// A signal payload is sent back to the workflow in a single
+	// SignalDeliver frame. Use the stricter wire-derived cap here so an
+	// accepted callback can never be persisted and then fail to resume solely
+	// because its reply frame is too large.
+	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, MaxSignalBodyBytes))
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -732,11 +790,28 @@ func (r *Receiver) handleSignal(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		// SignalDeliver carries json.RawMessage. Reject malformed or empty
+		// bodies before FireSignal stores them; otherwise a callback would be
+		// acknowledged and the scheduler would later be unable to marshal the
+		// persisted bytes into the workflow's resume frame.
+		r.Log.Warn("signal: payload is not valid JSON", "bytes", len(body))
+		http.Error(w, "signal payload must be valid JSON", http.StatusBadRequest)
+		return
+	}
+	body = trimmed
 
 	runID, signalName, err := r.Journal.FireSignal(req.Context(), token, body)
 	switch {
 	case errors.Is(err, journal.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	case errors.Is(err, journal.ErrSignalExpired):
+		// A late capability must not revive a timed-out AwaitSignal. Keep the
+		// response indistinguishable from a consumed capability while making the
+		// retry outcome explicit to compliant callers.
+		http.Error(w, "signal expired", http.StatusGone)
 		return
 	case errors.Is(err, journal.ErrAlreadyFired):
 		http.Error(w, "already delivered", http.StatusGone)
@@ -771,6 +846,14 @@ func (r *Receiver) verifyHMAC(ctx context.Context, trig journal.Trigger, provide
 	if trig.SecretID == "" {
 		return errors.New("no secret bound to trigger")
 	}
+	// Trigger rows from older installations (or a direct database restore) can
+	// carry a secret id whose credential belongs to another tenant. Vault.Get is
+	// intentionally id-only, so ownership must be checked at this boundary
+	// before the secret is read. Unknown metadata is denied as well: a
+	// vault-only id cannot prove which tenant owns the HMAC key.
+	if err := r.verifyTriggerSecretTenant(ctx, trig); err != nil {
+		return err
+	}
 	sec, err := r.Vault.Get(ctx, trig.SecretID)
 	if err != nil {
 		return fmt.Errorf("vault get: %w", err)
@@ -791,6 +874,89 @@ func (r *Receiver) verifyHMAC(ctx context.Context, trig journal.Trigger, provide
 	default:
 		return fmt.Errorf("unsupported webhook provider %q", provider)
 	}
+}
+
+// VerifySignedPayload exposes the provider-specific HMAC contract to the
+// dedicated command-webhook receiver. It deliberately accepts only the
+// already-resolved key bytes and performs no tenant lookup; callers must
+// enforce the owning trigger's tenant before obtaining the key.
+func VerifySignedPayload(provider string, h http.Header, body, key []byte, now time.Time) error {
+	switch provider {
+	case ProviderAutomationV1:
+		return verifyAutomationV1(h, body, key, now)
+	case ProviderHashV1:
+		return verifyHashV1(h, body, key, now)
+	case "stripe":
+		return verifyStripe(h.Get("Stripe-Signature"), body, key, now)
+	case "github":
+		return verifyGitHub(h.Get("X-Hub-Signature-256"), body, key)
+	case "generic":
+		return verifyGeneric(h.Get("X-Webhook-Signature"), body, key)
+	default:
+		return fmt.Errorf("unsupported webhook provider %q", provider)
+	}
+}
+
+// RequireAutomationJSONContentType retains automation-v1's strict media-type
+// contract for other authenticated ingress surfaces.
+func RequireAutomationJSONContentType(values []string) error {
+	return requireAutomationJSONContentType(values)
+}
+
+// ValidateAutomationEventID binds the signed automation-v1 delivery header to
+// exactly one top-level event_id without retaining or projecting the body.
+func ValidateAutomationEventID(body []byte, deliveryID string) error {
+	return validateAutomationEventID(body, deliveryID)
+}
+
+// HashEventID returns Hash's authenticated event identity for command ingress.
+func HashEventID(body []byte) (string, error) { return hashEventID(body) }
+
+// PickDeliveryID returns the provider's stable deduplication identity. The
+// helper is safe only after signature verification and provider-specific body
+// validation; command ingress follows that order.
+func PickDeliveryID(provider string, h http.Header, body []byte) string {
+	return pickDeliveryID(provider, h, body)
+}
+
+// PickCommandDeliveryID returns a replay-resistant identity for the
+// dedicated command ingress. Generic and GitHub delivery headers are useful
+// provider metadata, but they are not covered by those providers' body HMAC;
+// accepting them here would let a holder of one valid signed body mint a new
+// run by changing only an unsigned header. The authenticated body hash is
+// therefore the identity for those providers. Providers with a signed or
+// canonical body-bound identity retain their existing contract.
+func PickCommandDeliveryID(provider string, h http.Header, body []byte) string {
+	switch provider {
+	case "generic", "github":
+		return sha256Hex(body)
+	default:
+		return pickDeliveryID(provider, h, body)
+	}
+}
+
+// ValidateDeliveryID applies the bounded, control-free identity contract used
+// by the durable webhook-delivery lease table.
+func ValidateDeliveryID(deliveryID string) error { return validateDeliveryID(deliveryID) }
+
+// verifyTriggerSecretTenant is the runtime half of the webhook secret
+// ownership fence. Creation validates known metadata, but this check also
+// protects legacy/corrupt rows and closes the race between authoring and
+// delivery. It returns only a generic ownership error to keep secret and
+// tenant details out of the unauthenticated HTTP response.
+func (r *Receiver) verifyTriggerSecretTenant(ctx context.Context, trig journal.Trigger) error {
+	if r.Journal == nil {
+		return errors.New("webhook secret ownership unavailable")
+	}
+	wf, err := r.Journal.GetWorkflow(ctx, trig.WorkflowID)
+	if err != nil {
+		return errors.New("webhook workflow ownership unavailable")
+	}
+	secretTenant, err := r.Journal.SecretTenant(ctx, trig.SecretID)
+	if err != nil || secretTenant != wf.TenantID {
+		return errors.New("webhook secret ownership mismatch")
+	}
+	return nil
 }
 
 // verifyHashV1 validates Hash's strict, timestamped lifecycle-callback

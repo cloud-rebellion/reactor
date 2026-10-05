@@ -37,23 +37,58 @@ Cases are evaluated in order; the first match wins. Put the most specific cases
 first. Use `blocks.SwitchValue` to map straight to a value (a price tier, a
 queue name) instead of a label.
 
-## Merging (the set ways)
+## Merging
 
-There are exactly three correct shapes; pick by how the two sides relate:
+Pick a mode from the relationship between the two sides. Do not let an
+unmatched or duplicate row disappear by accident:
 
-- **By matching key** -> `blocks.MergeByKey(left, right, key, combine)`. Left-join:
-  every left row is kept; a matching right row enriches it; unmatched left rows
-  pass through unchanged (no silent drops, unlike n8n's default). Use this to
-  attach data fetched for each item (e.g. enrich contacts with CRM details).
-- **By position** -> `blocks.Zip(a, b, fn)`. Pairs index 0 with 0, etc., stopping
-  at the shorter slice. Use only when both sides are already aligned.
-- **Just concatenate** -> `blocks.Append(setA, setB, ...)`. Use when the sets are
-  independent and order is "all of A then all of B".
-- **Two objects/maps** -> `blocks.MergeMaps(base, override)`. Later maps win on
-  key collisions.
+- **Append** -> `blocks.Merge(left, right)` or `blocks.Append(sets...)`. Output
+  is all of the left side followed by all of the right side.
+- **Key join with duplicate matches** ->
+  `blocks.JoinByKey(left, right, leftKey, rightKey, blocks.JoinFull, maxRows)`.
+  Choose `JoinInner`, `JoinLeft`, `JoinRight`, or `JoinFull` deliberately. The
+  result carries `HasLeft` and `HasRight` flags so a genuine zero-valued record
+  is distinguishable from an absent side. Every matching pair is included in
+  stable input order. `maxRows` is required and stops explosive joins.
+- **Legacy one-right-row enrichment** -> `blocks.MergeByKey(left, right, key,
+  combine)`. Every left row stays, but the *last* right row for a duplicate key
+  wins. Use this only when that duplicate policy is intended.
+- **Position** -> `blocks.ZipAll(left, right, maxRows)` keeps the longer side's
+  unmatched tail with presence flags. `blocks.Zip(a, b, fn)` deliberately stops
+  at the shorter side. Never pair by position when the sides can be out of
+  order.
+- **All combinations** -> `blocks.CrossJoin(left, right, maxRows)` with an
+  explicit bound. Avoid this for large data sets; partition the operation or
+  perform it in a database.
+- **Objects/maps** -> `blocks.MergeMaps(base, override)`. Later maps win on key
+  collisions.
 
-Never merge by zipping when the sides can be out of order: that silently
-mispairs rows. Merge by key whenever a stable id exists.
+The ordinary merge helpers are pure operations inside a durable Step. A `visual_flow` merge
+block should declare the matching `mode` (`full_join`, `position_keep_all`,
+`append`, and so on), a non-sensitive `key` for a key join, and the same literal
+`max_rows` bound used by `JoinByKey`, `ZipAll`, or `CrossJoin`. The annotation
+alone is not a runtime receipt.
+
+When the customer needs a value-free observation for a key join, call
+`blocks.JoinByKeyObserved(stepCtx, "join", left, right, leftKey, rightKey,
+blocks.JoinFull, 1000)` directly inside the matching durable Step. Its literal
+block ID, join mode, and bound must match a typed `visual_flow` merge block in
+that same Step. Reactor rejects observed calls without the declaration. The
+supervised SDK reports only row counts and a bounded outcome and waits for a
+durable host acknowledgment. This remains an SDK-reported receipt, not proof
+that arbitrary authored Go performed the join. For `NewInProcFlow` tests, bind
+a recording `blocks.JoinObserver` with `blocks.WithJoinObserver` on the input
+context; without an observer the helper fails closed. Use `JoinByKey` when an
+operation receipt was not requested.
+
+For a value-free item-loop observation, declare a matching `iterate` block
+and call `blocks.IterateObserved(stepCtx, "each", rows, mapFn)` directly in its
+Step closure. For a fold, declare a matching `aggregate` block and call
+`blocks.AggregateObserved(stepCtx, "total", rows, initial, foldFn)` there.
+Both helpers accept at most 100,000 input items and wait for a durable host
+acknowledgment. Receipts contain only input/output counts (one aggregate
+output accumulator), not item values. They cannot verify the mapping or fold.
+Use ordinary `Iterate` or `Aggregate` when no block receipt is needed.
 
 ## Item-list transforms
 

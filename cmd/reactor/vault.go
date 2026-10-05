@@ -132,6 +132,7 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 	service := fs.String("service", "", "logical service tag (e.g. stripe, resend)")
 	provider := fs.String("provider", "manual", "rotator provider (manual, shared-secret, ...)")
 	autoRotate := fs.Bool("auto-rotate", false, "enable scheduled rotation")
+	allowLocalMint := fs.Bool("allow-local-mint", false, "acknowledge that a local-mint provider may replace the stored value")
 	intervalDays := fs.Int("interval-days", 0, "rotation interval in days (auto-rotate must be set)")
 	value := fs.String("value", "", "literal secret value (or use --value-file)")
 	valueFile := fs.String("value-file", "", "path to file containing the secret value")
@@ -150,6 +151,9 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 	}
 	if *autoRotate && *intervalDays <= 0 {
 		return errors.New("--auto-rotate requires --interval-days > 0")
+	}
+	if p, perr := rotators.Get(*provider); perr == nil && rotators.MintsValueLocally(p) && *autoRotate && !*allowLocalMint {
+		return fmt.Errorf("provider %q mints replacement values locally; --auto-rotate requires --allow-local-mint acknowledgement", *provider)
 	}
 	if *value == "" && *valueFile == "" {
 		return errors.New("missing --value or --value-file")
@@ -188,6 +192,7 @@ func cmdVaultAdd(ctx context.Context, _ *slog.Logger, args []string) error {
 		TenantID:             *tenantID,
 		Service:              *service,
 		Provider:             *provider,
+		AllowLocalMint:       *allowLocalMint,
 		AutoRotate:           *autoRotate,
 		RotationIntervalDays: *intervalDays,
 	}); err != nil {
@@ -251,6 +256,7 @@ func cmdVaultRotate(ctx context.Context, log *slog.Logger, args []string) error 
 	fs := flag.NewFlagSet("vault rotate", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
 	masterHex := fs.String("master-key", envFirst("REACTOR_MASTER_KEY", "ARACHNE_MASTER_KEY"), "32-byte hex-encoded master key")
+	allowLocalMint := fs.Bool("allow-local-mint", false, "acknowledge that a local-mint provider will replace the stored value")
 	if err := fs.Parse(reorderArgs(args)); err != nil {
 		return err
 	}
@@ -277,7 +283,7 @@ func cmdVaultRotate(ctx context.Context, log *slog.Logger, args []string) error 
 		Vault: store,
 		Log:   log,
 	}
-	if err := runner.RotateOne(ctx, id); err != nil {
+	if err := runner.RotateOneWithLocalMintAck(ctx, id, *allowLocalMint); err != nil {
 		return err
 	}
 	fmt.Printf("rotated %s\n", id)
@@ -398,15 +404,21 @@ func cmdVaultGrant(ctx context.Context, _ *slog.Logger, args []string) error {
 	return nil
 }
 
-// cmdVaultRevoke removes a grant.
+// cmdVaultRevoke removes a grant. The tenant is explicit so duplicate slugs
+// cannot resolve to another tenant's workflow.
 func cmdVaultRevoke(ctx context.Context, _ *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("vault revoke", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
+	tenantID := fs.String("tenant", journal.DefaultTenant, "tenant that owns the workflow and credential")
 	if err := fs.Parse(reorderArgs(args)); err != nil {
 		return err
 	}
 	if *dbURL == "" {
 		return errors.New("vault revoke: missing --db (or $REACTOR_DB_URL)")
+	}
+	*tenantID = strings.TrimSpace(*tenantID)
+	if *tenantID == "" {
+		return errors.New("vault revoke: missing --tenant")
 	}
 	if fs.NArg() != 2 {
 		return errors.New("vault revoke: usage: <workflow-slug> <credential-id>")
@@ -419,12 +431,12 @@ func cmdVaultRevoke(ctx context.Context, _ *slog.Logger, args []string) error {
 	}
 	defer closer()
 
-	wfID, err := j.WorkflowIDBySlug(ctx, slug)
+	wfID, err := j.WorkflowIDBySlugInTenant(ctx, slug, *tenantID)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
-			return fmt.Errorf("vault revoke: workflow %q not registered", slug)
+			return fmt.Errorf("vault revoke: workflow %q not registered in tenant %q", slug, *tenantID)
 		}
-		return fmt.Errorf("vault revoke: resolve workflow %q: %w", slug, err)
+		return fmt.Errorf("vault revoke: resolve workflow %q in tenant %q: %w", slug, *tenantID, err)
 	}
 	if err := j.RevokeSecret(ctx, wfID, credID); err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
@@ -440,10 +452,12 @@ func cmdVaultRevoke(ctx context.Context, _ *slog.Logger, args []string) error {
 	return nil
 }
 
-// cmdVaultGrants lists every grant or filters to one workflow.
+// cmdVaultGrants lists every grant or filters to one workflow. The optional
+// tenant makes a filtered lookup deterministic when two tenants reuse a slug.
 func cmdVaultGrants(ctx context.Context, _ *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("vault grants", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
+	tenantID := fs.String("tenant", journal.DefaultTenant, "tenant that owns the filtered workflow")
 	asJSON := fs.Bool("json", false, "emit JSON")
 	workflow := fs.String("workflow", "", "filter to one workflow slug")
 	if err := fs.Parse(reorderArgs(args)); err != nil {
@@ -451,6 +465,10 @@ func cmdVaultGrants(ctx context.Context, _ *slog.Logger, args []string) error {
 	}
 	if *dbURL == "" {
 		return errors.New("vault grants: missing --db (or $REACTOR_DB_URL)")
+	}
+	*tenantID = strings.TrimSpace(*tenantID)
+	if *tenantID == "" {
+		return errors.New("vault grants: missing --tenant")
 	}
 
 	j, closer, err := openJournal(*dbURL)
@@ -461,9 +479,9 @@ func cmdVaultGrants(ctx context.Context, _ *slog.Logger, args []string) error {
 
 	var grants []journal.Grant
 	if *workflow != "" {
-		wfID, err := j.WorkflowIDBySlug(ctx, *workflow)
+		wfID, err := j.WorkflowIDBySlugInTenant(ctx, *workflow, *tenantID)
 		if err != nil {
-			return fmt.Errorf("vault grants: resolve workflow %q: %w", *workflow, err)
+			return fmt.Errorf("vault grants: resolve workflow %q in tenant %q: %w", *workflow, *tenantID, err)
 		}
 		grants, err = j.ListGrantsForWorkflow(ctx, wfID)
 		if err != nil {
@@ -485,7 +503,7 @@ func cmdVaultGrants(ctx context.Context, _ *slog.Logger, args []string) error {
 		return enc.Encode(grants)
 	}
 	if len(grants) == 0 {
-		fmt.Println("(no grants; supervisor runs in permissive mode)")
+		fmt.Println("(no grants; strict mode denies secret fetches; legacy permissive mode allows same-tenant fetches)")
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)

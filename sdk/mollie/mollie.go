@@ -17,12 +17,14 @@ package mollie
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
-// BaseURL is a var so tests can point it at a fake server.
-var BaseURL = "https://api.mollie.com/v2"
+// baseURL is package-owned so workflow input cannot redirect a Mollie key to
+// another origin. Tests in this package can point it at a fake server.
+var baseURL = "https://api.mollie.com/v2"
 
 // Client holds the Mollie API key (test_... or live_...).
 type Client struct {
@@ -88,8 +90,11 @@ func (c *Client) CreatePayment(ctx context.Context, p PaymentParams) (Payment, e
 		body["webhookUrl"] = p.WebhookURL
 	}
 	var raw rawPayment
-	hc := &ahttp.Client{Bearer: c.Key}
-	if err := hc.PostJSON(ctx, BaseURL+"/payments", body, &raw); err != nil {
+	hc, err := credentialClient(c.Key)
+	if err != nil {
+		return Payment{}, err
+	}
+	if err := hc.PostJSON(ctx, baseURL+"/payments", body, &raw); err != nil {
 		return Payment{}, fmt.Errorf("mollie: create payment: %w", err)
 	}
 	return raw.toPayment(), nil
@@ -101,8 +106,11 @@ func (c *Client) GetPayment(ctx context.Context, id string) (Payment, error) {
 		return Payment{}, fmt.Errorf("mollie: payment id is required")
 	}
 	var raw rawPayment
-	hc := &ahttp.Client{Bearer: c.Key}
-	if err := hc.Get(ctx, BaseURL+"/payments/"+id, &raw); err != nil {
+	hc, err := credentialClient(c.Key)
+	if err != nil {
+		return Payment{}, err
+	}
+	if err := hc.Get(ctx, baseURL+"/payments/"+id, &raw); err != nil {
 		return Payment{}, fmt.Errorf("mollie: get payment: %w", err)
 	}
 	return raw.toPayment(), nil
@@ -118,9 +126,20 @@ func (c *Client) CreateRefund(ctx context.Context, paymentID string, amount Amou
 		body["amount"] = amount
 	}
 	var out Refund
-	hc := &ahttp.Client{Bearer: c.Key}
-	if err := hc.PostJSON(ctx, BaseURL+"/payments/"+paymentID+"/refunds", body, &out); err != nil {
+	hc, err := credentialClient(c.Key)
+	if err != nil {
+		return Refund{}, err
+	}
+	if err := hc.PostJSON(ctx, baseURL+"/payments/"+paymentID+"/refunds", body, &out); err != nil {
 		return Refund{}, fmt.Errorf("mollie: create refund: %w", err)
 	}
 	return out, nil
+}
+
+func credentialClient(key string) (*ahttp.Client, error) {
+	base, err := url.Parse(baseURL)
+	if err != nil || base == nil || base.Scheme == "" || base.Host == "" {
+		return nil, fmt.Errorf("mollie: invalid API base URL")
+	}
+	return &ahttp.Client{Bearer: key, CredentialOrigin: base.Scheme + "://" + base.Host}, nil
 }

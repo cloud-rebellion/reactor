@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // FinalizeOwnedRun persists a distributed worker's outcome and releases the
@@ -28,7 +29,8 @@ func (j *Journal) FinalizeOwnedRun(ctx context.Context, runID, owner, status str
 	}
 	defer tx.Rollback()
 
-	if err := j.lockOwnedLease(ctx, tx, runID, owner); err != nil {
+	leaseDeadline, err := j.lockOwnedLease(ctx, tx, runID, owner)
+	if err != nil {
 		return err
 	}
 
@@ -80,6 +82,11 @@ func (j *Journal) FinalizeOwnedRun(ctx context.Context, runID, owner, status str
 			return fmt.Errorf("journal: clear dead letters for owned success: %w", err)
 		}
 	}
+	if current == "running" {
+		if err := j.enqueueTerminalEffectTx(ctx, tx, runID, status); err != nil {
+			return err
+		}
+	}
 
 	res, err := tx.ExecContext(ctx, j.bind(`DELETE FROM leases WHERE run_id = $1 AND worker_id = $2`), runID, owner)
 	if err != nil {
@@ -87,6 +94,9 @@ func (j *Journal) FinalizeOwnedRun(ctx context.Context, runID, owner, status str
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("%w: finalize run=%s", ErrLeaseOwnershipLost, runID)
+	}
+	if err := checkOwnedLeaseDeadline(runID, leaseDeadline); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("journal: commit owned run finalization: %w", err)
@@ -97,30 +107,55 @@ func (j *Journal) FinalizeOwnedRun(ctx context.Context, runID, owner, status str
 	return nil
 }
 
-func (j *Journal) lockOwnedLease(ctx context.Context, tx *sql.Tx, runID, owner string) error {
+func (j *Journal) lockOwnedLease(ctx context.Context, tx *sql.Tx, runID, owner string) (time.Time, error) {
+	var expiresAt time.Time
 	if j.engine == EnginePostgres {
-		var lockedOwner string
-		err := tx.QueryRowContext(ctx, j.bind(`SELECT worker_id FROM leases
-			WHERE run_id = $1 AND worker_id = $2 FOR UPDATE`), runID, owner).Scan(&lockedOwner)
+		err := tx.QueryRowContext(ctx, `SELECT expires_at FROM leases
+			WHERE run_id = $1 AND worker_id = $2 FOR UPDATE`, runID, owner).Scan(&expiresAt)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: finalize run=%s", ErrLeaseOwnershipLost, runID)
+			return time.Time{}, fmt.Errorf("%w: lock run=%s", ErrLeaseOwnershipLost, runID)
 		}
 		if err != nil {
-			return fmt.Errorf("journal: lock owned lease: %w", err)
+			return time.Time{}, fmt.Errorf("journal: lock owned lease: %w", err)
 		}
-		return nil
+	} else {
+		// A no-op write acquires SQLite's single-writer lock before any run
+		// state is inspected, matching the PostgreSQL lock order.
+		var rawExpiry string
+		err := tx.QueryRowContext(ctx, j.bind(`UPDATE leases SET worker_id = worker_id
+			WHERE run_id = $1 AND worker_id = $2 RETURNING expires_at`), runID, owner).Scan(&rawExpiry)
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, fmt.Errorf("%w: lock run=%s", ErrLeaseOwnershipLost, runID)
+		}
+		if err != nil {
+			return time.Time{}, fmt.Errorf("journal: lock owned lease: %w", err)
+		}
+		expiresAt, err = j.parseTime(rawExpiry)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("journal: parse owned lease deadline: %w", err)
+		}
 	}
 
-	// A no-op write acquires SQLite's single-writer lock before any run state
-	// is inspected, making the test/local engine representative of the
-	// production PostgreSQL lock ordering.
-	res, err := tx.ExecContext(ctx, j.bind(`UPDATE leases SET worker_id = worker_id
-		WHERE run_id = $1 AND worker_id = $2`), runID, owner)
-	if err != nil {
-		return fmt.Errorf("journal: lock owned lease: %w", err)
+	// Ownership ends at the lease deadline, not when the reaper happens to
+	// delete the row. Check the deadline after acquiring the row/writer lock:
+	// a finalizer that waited behind another transaction must observe a lease
+	// that expired or was renewed while it waited. Use the same application
+	// clock as ClaimQueuedRuns, ExtendLease, and ReapExpiredLeases rather than
+	// mixing in the database server's possibly different clock.
+	if err := checkOwnedLeaseDeadline(runID, expiresAt); err != nil {
+		return time.Time{}, err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("%w: finalize run=%s", ErrLeaseOwnershipLost, runID)
+	return expiresAt, nil
+}
+
+// checkOwnedLeaseDeadline is also called immediately before committing each
+// owned transaction. Later run/step locks may have made the work wait past
+// the deadline even though the lease was live when lockOwnedLease returned.
+// The captured deadline remains authoritative because the transaction holds
+// the exact lease generation's lock through the commit attempt.
+func checkOwnedLeaseDeadline(runID string, expiresAt time.Time) error {
+	if !expiresAt.After(time.Now().UTC()) {
+		return fmt.Errorf("%w: deadline run=%s", ErrLeaseOwnershipLost, runID)
 	}
 	return nil
 }

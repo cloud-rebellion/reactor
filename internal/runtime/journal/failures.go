@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/runtime/payloadcrypto"
 )
 
 // FailedRun is one failed execution for the error log: the run plus the error
@@ -29,13 +31,23 @@ func (j *Journal) ListFailedRuns(ctx context.Context, tenantID string, limit int
 	if limit <= 0 {
 		limit = 100
 	}
-	// Correlated subqueries (not LATERAL) keep this portable across Postgres +
-	// SQLite. The error log is a bounded list, so the per-row lookup is fine.
-	q := `SELECT r.id, r.workflow_id, r.tenant_id, r.status, r.started_at, r.finished_at,
-		COALESCE((SELECT step_name FROM steps WHERE run_id = r.id AND status = 'failed' ORDER BY started_at DESC LIMIT 1), ''),
-		COALESCE((SELECT error_text FROM steps WHERE run_id = r.id AND status = 'failed' ORDER BY started_at DESC LIMIT 1), '')
-		FROM runs r
-		WHERE r.status LIKE 'failed%'`
+	if limit > 500 {
+		limit = 500
+	}
+	// The exact failed step is selected in one join, so its encrypted error
+	// cannot be accidentally attributed to a different attempt. The UI only
+	// displays a short preview; SQL omits larger fields before materialization.
+	const maxFailurePreviewBytes = 4096
+	q := fmt.Sprintf(`SELECT r.id, r.workflow_id, r.tenant_id, r.status, r.started_at, r.finished_at,
+		COALESCE(steps.step_name, ''), COALESCE(steps.seq, 0), COALESCE(steps.attempt, 0),
+		COALESCE(steps.payload_crypto_version, 0), steps.error_plaintext_bytes, %s,
+		COALESCE(steps.error_text IS NOT NULL, false)
+		FROM runs r LEFT JOIN steps ON steps.run_id = r.id AND
+			(steps.step_name, steps.seq, steps.attempt) =
+			(SELECT s.step_name, s.seq, s.attempt FROM steps s
+			 WHERE s.run_id = r.id AND s.status = 'failed'
+			 ORDER BY s.started_at DESC, s.seq DESC, s.attempt DESC LIMIT 1)
+		WHERE r.status LIKE 'failed%%'`, stepErrorValue(j.engine, maxFailurePreviewBytes))
 	args := []any{}
 	pos := 1
 	if tenantID != "" {
@@ -56,10 +68,36 @@ func (j *Journal) ListFailedRuns(ctx context.Context, tenantID string, limit int
 		var (
 			fr                FailedRun
 			started, finished sql.NullString
+			seq               int64
+			attempt           int
+			version           int
+			plainBytes        sql.NullInt64
+			storedError       sql.NullString
+			errorPresent      bool
 		)
 		if err := rows.Scan(&fr.RunID, &fr.WorkflowID, &fr.TenantID, &fr.Status,
-			&started, &finished, &fr.StepName, &fr.Error); err != nil {
+			&started, &finished, &fr.StepName, &seq, &attempt, &version, &plainBytes,
+			&storedError, &errorPresent); err != nil {
 			return nil, fmt.Errorf("journal: scan failed run: %w", err)
+		}
+		if version == 1 && j.payloadKey == nil {
+			return nil, payloadcrypto.ErrKeyRequired
+		}
+		if version != 0 && version != 1 || version == 1 &&
+			(errorPresent != plainBytes.Valid || plainBytes.Int64 < 0 || plainBytes.Int64 > maxStepPayloadPlaintextBytes) {
+			return nil, payloadcrypto.ErrInvalidEnvelope
+		}
+		if storedError.Valid {
+			fr.Error, err = j.openStepError(fr.TenantID, fr.RunID, fr.StepName, seq, attempt,
+				version, plainBytes, storedError.String)
+			if err != nil {
+				return nil, err
+			}
+		} else if errorPresent {
+			if version == 1 && plainBytes.Int64 <= maxFailurePreviewBytes {
+				return nil, payloadcrypto.ErrInvalidEnvelope
+			}
+			fr.Error = "[step error omitted: exceeds preview limit]"
 		}
 		if started.Valid {
 			if t, err := j.parseTime(started.String); err == nil {

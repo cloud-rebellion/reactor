@@ -75,6 +75,51 @@ func TestScheduledResumeArtifactFenceFailsClosedBeforeQueueOrSpawn(t *testing.T)
 	}
 }
 
+func TestScheduledResumeIntegrityFenceFailsBeforeQueueOrSpawn(t *testing.T) {
+	_, j, closeDB := newTestSupervisorEnv(t, "run_resume_integrity_fenced")
+	defer closeDB()
+	ctx := context.Background()
+	if err := j.SetRunStatus(ctx, "run_resume_integrity_fenced", "suspended"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.ScheduleSleep(ctx, "run_resume_integrity_fenced", "wait", time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	terminals := 0
+	sched := &Scheduler{
+		Journal: j, Now: time.Now, Batch: 10,
+		ArtifactPath: func(string, string) (string, error) { return "/immutable/workflow", nil },
+		IntegrityCheck: func(_ context.Context, slug string, version journal.WorkflowVersion) error {
+			if slug != "test-replay" || version.Version != 1 {
+				t.Fatalf("integrity callback received slug=%q version=%+v", slug, version)
+			}
+			return &journal.WorkflowArtifactFenceError{
+				WorkflowID: "wf_test", Version: version.Version,
+				PinnedDigest: version.ArtifactSHA256, Reason: "retained source mismatch",
+			}
+		},
+		OnTerminal: func(_ context.Context, info TerminalInfo) {
+			terminals++
+			if info.Status != "failed" || info.ErrorText != journal.WorkflowArtifactFenceRunLog {
+				t.Errorf("terminal = %+v", info)
+			}
+		},
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if terminals != 1 {
+		t.Fatalf("integrity fence terminal callbacks = %d, want 1", terminals)
+	}
+	run, err := j.GetRun(ctx, "run_resume_integrity_fenced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "failed" || run.FinishedAt.IsZero() {
+		t.Fatalf("integrity-fenced resumed run = %+v", run)
+	}
+}
+
 func TestScheduledSleepAndSignalArtifactAvailabilityStayPending(t *testing.T) {
 	for _, kind := range []string{journal.KindSleep, journal.KindSignal} {
 		for _, enqueue := range []bool{false, true} {
@@ -141,6 +186,72 @@ func TestScheduledSleepAndSignalArtifactAvailabilityStayPending(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDistributedScheduledResumeWaitsForWorkerArtifactTree(t *testing.T) {
+	const runID = "run_worker_artifact_wait"
+	_, j, closeDB := newTestSupervisorEnv(t, runID)
+	defer closeDB()
+	ctx := context.Background()
+	if err := j.SetRunStatus(ctx, runID, "suspended"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	scheduleID, err := j.ScheduleSleep(ctx, runID, "wait", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerReady := false
+	checks := 0
+	sched := &Scheduler{
+		Journal: j,
+		Now:     func() time.Time { return now },
+		ArtifactPath: func(string, string) (string, error) {
+			return "/immutable/workflow", nil
+		},
+		QueueArtifactCheck: func(context.Context, string, journal.WorkflowVersion) error {
+			checks++
+			if !workerReady {
+				return errors.New("worker PVC artifact missing")
+			}
+			return nil
+		},
+		Enqueue: true,
+		Batch:   10,
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 1 {
+		t.Fatalf("worker artifact checks = %d, want one", checks)
+	}
+	if run, err := j.GetRun(ctx, runID); err != nil || run.Status != "suspended" || !run.FinishedAt.IsZero() {
+		t.Fatalf("missing worker artifact consumed or failed continuation: %+v, %v", run, err)
+	}
+	if due, err := j.FindDueSchedules(ctx, now, 10); err != nil || len(due) != 0 {
+		t.Fatalf("missing worker artifact did not back off schedule: %+v, %v", due, err)
+	}
+	workerReady = true
+	now = now.Add(2 * time.Minute)
+	if due, err := j.FindDueSchedules(ctx, now, 10); err != nil || len(due) != 1 || due[0].ID != scheduleID {
+		t.Fatalf("worker artifact outage lost exact schedule: %+v, %v", due, err)
+	}
+	if err := sched.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 2 {
+		t.Fatalf("recovered worker artifact checks = %d, want two", checks)
+	}
+	if run, err := j.GetRun(ctx, runID); err != nil || run.Status != "queued" || !run.FinishedAt.IsZero() {
+		t.Fatalf("repaired worker artifact did not re-enqueue exact continuation: %+v, %v", run, err)
+	}
+	if due, err := j.FindDueSchedules(ctx, now, 10); err != nil || len(due) != 0 {
+		t.Fatalf("repaired schedule remained due: %+v, %v", due, err)
+	}
+	logs, err := j.GetRunLogs(ctx, runID)
+	if err != nil || len(logs) != 1 || logs[0] != journal.WorkflowArtifactFenceRunLog {
+		t.Fatalf("worker artifact outage marker = %v, %v", logs, err)
 	}
 }
 

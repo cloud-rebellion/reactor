@@ -13,8 +13,9 @@ import (
 
 // Key derives a stable hex-encoded SHA-256 over the workflow slug, step
 // name, and the canonical-ordered key/value parts. Use this as
-// StepOpts.IdempotencyKey on every side-effecting step so a replay
-// after partial failure doesn't double-send.
+// StepOpts.IdempotencyKey on every side-effecting step so a completed step
+// can be reused on replay. A provider mutation accepted before its result
+// is journaled may still be repeated; this is not provider-side exactly once.
 //
 //	idem := idempotency.Key("welcome-customer", "send-email",
 //	    "customer_id", req.CustomerID, "template", "welcome-v3")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +41,20 @@ type Scheduler struct {
 	// ArtifactPath resolves the immutable executable pinned on the run. Resume
 	// paths must never fall through to BinaryPath's mutable current pointer.
 	ArtifactPath func(workflowSlug, artifactSHA256 string) (string, error)
+	// ArtifactPathForTenant is the tenant-aware immutable artifact boundary.
+	// Production wiring supplies it so a resumed same-slug run cannot execute
+	// another tenant's bytes; ArtifactPath remains for legacy/in-memory tests.
+	ArtifactPathForTenant func(tenant, workflowSlug, artifactSHA256 string) (string, error)
+
+	// IntegrityCheck revalidates the retained source, manifest, and visual DAG
+	// immediately before a suspended run is resumed. The dispatcher performs
+	// the same check for new and queued runs; keeping it here closes the direct
+	// scheduler wake-up path.
+	IntegrityCheck func(ctx context.Context, workflowSlug string, version journal.WorkflowVersion) error
+	// QueueArtifactCheck verifies the worker-visible artifact tree before a
+	// distributed wake-up is re-enqueued. Missing or corrupt copies defer the
+	// exact schedule; they do not invalidate the run's durable identity.
+	QueueArtifactCheck func(ctx context.Context, workflowSlug string, version journal.WorkflowVersion) error
 
 	// Now overrides the clock for tests. Defaults to time.Now.
 	Now func() time.Time
@@ -47,6 +62,14 @@ type Scheduler struct {
 	// Tick interval for the polling loop. Defaults to 5 seconds; tests
 	// can drop to milliseconds for fast iteration.
 	TickInterval time.Duration
+
+	// MaxConsecutiveTickErrors bounds how long a scheduler may continue
+	// advertising a healthy daemon while its durable schedule query is
+	// failing. A transient database error is tolerated so one blip does not
+	// restart the service, but a persistent failure returns from Run and lets
+	// the daemon withdraw readiness and restart under its service manager.
+	// Zero uses the production default.
+	MaxConsecutiveTickErrors int
 
 	// Batch caps schedules processed per tick. Defaults to 50.
 	Batch int
@@ -82,6 +105,8 @@ type Scheduler struct {
 	stopped bool
 }
 
+const defaultMaxConsecutiveTickErrors = 3
+
 // TerminalInfo is the payload OnTerminal receives when a resumed run
 // finishes. Mirrors dispatcher.TerminalEvent's fields but is declared
 // here to avoid an import cycle (dispatcher imports supervisor).
@@ -96,15 +121,40 @@ type TerminalInfo struct {
 }
 
 // Run blocks, ticking the scheduler at TickInterval until ctx is cancelled
-// or Stop is called. Safe for one Run per Scheduler.
+// or Stop is called. Short-lived tick failures are retried, but persistent
+// failures return so the daemon can withdraw readiness instead of silently
+// serving a live HTTP endpoint with no schedule processing. Safe for one Run
+// per Scheduler.
 func (s *Scheduler) Run(ctx context.Context) error {
 	s.applyDefaults()
 	t := time.NewTicker(s.TickInterval)
 	defer t.Stop()
+	maxTickErrors := s.MaxConsecutiveTickErrors
+	if maxTickErrors <= 0 {
+		maxTickErrors = defaultMaxConsecutiveTickErrors
+	}
+	consecutiveTickErrors := 0
+	runTick := func() error {
+		if err := s.Tick(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			consecutiveTickErrors++
+			s.Log.Error("scheduler tick failed", "err", err,
+				"consecutive_failures", consecutiveTickErrors,
+				"failure_limit", maxTickErrors)
+			if consecutiveTickErrors >= maxTickErrors {
+				return fmt.Errorf("scheduler: %d consecutive tick failures: %w", consecutiveTickErrors, err)
+			}
+			return nil
+		}
+		consecutiveTickErrors = 0
+		return nil
+	}
 
 	// Tick once immediately so a fresh process picks up any past-due
 	// schedules without waiting for the first interval.
-	if err := s.Tick(ctx); err != nil {
+	if err := runTick(); err != nil {
 		return err
 	}
 
@@ -115,8 +165,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-s.stop:
 			return nil
 		case <-t.C:
-			if err := s.Tick(ctx); err != nil {
-				s.Log.Error("scheduler tick failed", "err", err)
+			if err := runTick(); err != nil {
+				return err
 			}
 		}
 	}
@@ -190,7 +240,8 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 		// a transient database error into a durable business failure.
 		return fmt.Errorf("scheduler: resolve workflow slug: %w", slugErr)
 	}
-	if _, err := s.Journal.ValidateRunWorkflowArtifact(ctx, run); err != nil {
+	version, err := s.Journal.ValidateRunWorkflowArtifact(ctx, run)
+	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -202,14 +253,43 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 		// mismatch. Operational query errors retain the unfired schedule.
 		return fmt.Errorf("scheduler: validate workflow artifact: %w", err)
 	}
-	if s.ArtifactPath == nil {
+	if s.ArtifactPath == nil && s.ArtifactPathForTenant == nil {
 		return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
 			fmt.Errorf("%w: immutable artifact lookup is not configured", journal.ErrWorkflowArtifactFence))
 	}
-	binary, err := s.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	var binary string
+	if s.ArtifactPathForTenant != nil {
+		tenant := strings.TrimSpace(run.TenantID)
+		if tenant == "" {
+			tenant, err = s.Journal.WorkflowTenant(ctx, run.WorkflowID)
+			if err != nil {
+				return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
+					fmt.Errorf("%w: resolve workflow tenant: %v", journal.ErrWorkflowArtifactFence, err))
+			}
+		}
+		binary, err = s.ArtifactPathForTenant(tenant, slug, run.WorkflowArtifactSHA256)
+	} else {
+		binary, err = s.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	}
 	if err != nil {
 		return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
 			fmt.Errorf("%w: immutable artifact failed verification", journal.ErrWorkflowArtifactFence))
+	}
+	if s.IntegrityCheck != nil {
+		if err := s.IntegrityCheck(ctx, slug, version); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			var fence *journal.WorkflowArtifactFenceError
+			if errors.As(err, &fence) {
+				return s.failArtifactFencedSchedule(ctx, sched, run, slug, false, err)
+			}
+			// Missing or temporarily unavailable retained source must leave the
+			// exact continuation pending for a later repair/retry. A source proof
+			// mismatch is returned as the typed fence above and is terminalized.
+			return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
+				fmt.Errorf("workflow source proof unavailable: %w", err))
+		}
 	}
 
 	// Distributed mode: don't resume in-process. Claim the schedule (CAS)
@@ -218,6 +298,15 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 	// (FindLatestSleepSchedule still finds it; only FindDueSchedules
 	// filters fired) acks the past-due sleep/signal and resumes.
 	if s.Enqueue {
+		if s.QueueArtifactCheck != nil {
+			if err := s.QueueArtifactCheck(ctx, slug, version); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return s.failArtifactFencedSchedule(ctx, sched, run, slug, true,
+					fmt.Errorf("worker artifact unavailable for queued resume: %w", err))
+			}
+		}
 		claimed, err := s.Journal.ClaimScheduleResume(ctx, sched.ID, true)
 		if err != nil {
 			return err
@@ -245,7 +334,7 @@ func (s *Scheduler) dispatch(ctx context.Context, sched journal.Schedule) error 
 	sup.BinaryPath = binary
 	sup.WorkflowSlug = slug
 	sup.RunID = sched.RunID
-	sup.Input = run.TriggerMeta
+	sup.Input = run.ExecutionInput()
 	sup.Journal = s.Journal
 	sup.Vault = s.Vault
 	if sup.Log == nil {

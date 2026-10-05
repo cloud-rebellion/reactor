@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bright-interaction/reactor/internal/knowledge"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
@@ -38,6 +39,24 @@ var (
 type promptSanitizer struct {
 	redactor *knowledge.Redactor
 	values   []string
+}
+
+// promptField renders run metadata as one bounded, quoted value. The journal
+// normally supplies slugs/step names from validated workflow source, but old
+// rows and hand-built SDK workflows are still untrusted at an external model
+// boundary. Quoting prevents newlines/fences from forging post-mortem sections;
+// the sanitizer removes known PII before the value is encoded.
+func (s promptSanitizer) promptField(text string) string {
+	text = s.scrub(text)
+	const maxBytes = 256
+	if len(text) > maxBytes {
+		text = text[:maxBytes]
+		for len(text) > 0 && !utf8.ValidString(text) {
+			text = text[:len(text)-1]
+		}
+		text += "...(truncated)"
+	}
+	return strconv.Quote(text)
 }
 
 func newPromptSanitizer(run journal.RunInfo, steps []journal.StepRow) promptSanitizer {

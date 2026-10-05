@@ -1,18 +1,15 @@
-// Package email is the workflow-side email connector. AI-generated workflows
-// call email.Send (or the provider-specific SendGmail / SendOutlook) from
-// inside a Step closure to send through a connected Google or Microsoft
-// account. The access token comes from the vault at run time:
+// Package email is the workflow-side email connector. Connected Google and
+// Microsoft accounts use SendConnected inside a durable Step closure:
 //
-//	tok := vault.MustGet("oauth:" + connectionID) // resolved + auto-refreshed by the host
-//	id, err := email.SendGmail(ctx, string(tok.Reveal()), email.Message{
+//	id, err := email.SendConnected(ctx, "oauth:"+connectionID, email.Message{
 //		From: "me@example.com", To: []string{"customer@acme.com"},
 //		Subject: "Welcome", Text: "Thanks for signing up.",
 //	})
 //
-// The token never reaches the AI builder: codegen only sees the credential
-// metadata (the connection name), and the real value is exposed only while the
-// workflow runs. Sending is a side effect, so wrap these calls in a Step with a
-// non-empty IdempotencyKey.
+// The host fixes the provider endpoint and attaches the token without
+// releasing it to workflow code. Use one send and no other side effects per
+// Step, with a nonempty IdempotencyKey. An uncertain provider outcome requires
+// manual reconciliation.
 package email
 
 import (
@@ -25,7 +22,9 @@ import (
 	"fmt"
 	"mime"
 	"mime/quotedprintable"
+	"net/url"
 	"strings"
+	"sync/atomic"
 
 	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
@@ -57,6 +56,95 @@ type Message struct {
 	HTML    string // optional HTML body
 }
 
+// ErrMailBrokerUnavailable means the workflow host does not support
+// token-free connected-account sends. There is no raw-token fallback.
+var ErrMailBrokerUnavailable = errors.New("email: host mail broker is unavailable")
+
+// MailSenderFunc is bound by sdk/runtime after the host advertises its mail
+// broker. The credential reference and structured message cross the pipe;
+// the OAuth token and provider URL stay on the host.
+type MailSenderFunc func(context.Context, string, Message) (string, error)
+
+type mailSenderBinding struct{ send MailSenderFunc }
+
+var mailSender atomic.Pointer[mailSenderBinding]
+
+// BrokerError contains only a stable host refusal code and HTTP status. It
+// never includes a provider response body, URL, recipient, or token.
+type BrokerError struct {
+	Code   string
+	Status int
+}
+
+func (e *BrokerError) Error() string {
+	if e == nil {
+		return "email: host mail broker refused request"
+	}
+	code := e.Code
+	if code == "" || len(code) > 64 || strings.IndexFunc(code, func(r rune) bool {
+		return r != '_' && (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	}) >= 0 {
+		code = "broker_failure"
+	}
+	if code == "ambiguous" {
+		return "email: mail send outcome uncertain; reconcile with provider before redrive"
+	}
+	return "email: host mail broker refused request: " + code
+}
+
+func BindMailSender(send MailSenderFunc) func() {
+	var binding *mailSenderBinding
+	if send != nil {
+		binding = &mailSenderBinding{send: send}
+	}
+	previous := mailSender.Swap(binding)
+	return func() { mailSender.Store(previous) }
+}
+
+// SendConnected sends through a tenant-owned Google or Microsoft connection
+// without exposing its access token to workflow code. Gmail returns the
+// provider message ID; Microsoft Graph returns an empty ID on HTTP 202.
+// Place one send inside a durable Step with an idempotency key and no other
+// side effects. The host does not retry an ambiguous provider POST.
+func SendConnected(ctx context.Context, credentialID string, msg Message) (string, error) {
+	if ahttp.IsDryRun() {
+		return "", ahttp.ErrDryRun
+	}
+	if ctx == nil {
+		return "", errors.New("email: context is required")
+	}
+	if !strings.HasPrefix(credentialID, "oauth:") || len(credentialID) <= len("oauth:") || len(credentialID) > 256 ||
+		strings.IndexFunc(credentialID, func(r rune) bool { return r < 0x21 || r == 0x7f }) >= 0 {
+		return "", errors.New("email: invalid connected-account reference")
+	}
+	if err := msg.Validate(); err != nil {
+		return "", err
+	}
+	binding := mailSender.Load()
+	if binding == nil || binding.send == nil {
+		return "", ErrMailBrokerUnavailable
+	}
+	return binding.send(ctx, credentialID, msg)
+}
+
+// Validate checks the fields shared by the Gmail and Microsoft adapters.
+func (m Message) Validate() error {
+	if m.From == "" || len(m.To) == 0 || (m.Text == "" && m.HTML == "") {
+		return errors.New("email: From, To, and Text or HTML are required")
+	}
+	return m.validateHeaders()
+}
+
+// GmailPayload and OutlookPayload are also used by the host broker so both
+// sending paths encode the same validated message shape.
+func (m Message) GmailPayload() ([]byte, error) { return m.rfc822() }
+func (m Message) OutlookPayload() (map[string]any, error) {
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	return graphPayload(m), nil
+}
+
 // Send dispatches to the right provider. It is the convenience entry point when
 // the workflow already knows the connection's provider; otherwise call
 // SendGmail / SendOutlook directly. Returns the provider message id when one is
@@ -82,7 +170,10 @@ func SendGmail(ctx context.Context, accessToken string, msg Message) (string, er
 	if err != nil {
 		return "", err
 	}
-	c := &ahttp.Client{Bearer: accessToken}
+	c, err := credentialClient(accessToken, gmailSendURL)
+	if err != nil {
+		return "", err
+	}
 	body := map[string]string{"raw": base64.URLEncoding.EncodeToString(raw)}
 	var out struct {
 		ID string `json:"id"`
@@ -102,11 +193,25 @@ func SendOutlook(ctx context.Context, accessToken string, msg Message) error {
 	if msg.From == "" || len(msg.To) == 0 {
 		return errors.New("email: From and at least one To are required")
 	}
-	c := &ahttp.Client{Bearer: accessToken}
+	if err := msg.validateHeaders(); err != nil {
+		return err
+	}
+	c, err := credentialClient(accessToken, graphSendURL)
+	if err != nil {
+		return err
+	}
 	if err := c.PostJSON(ctx, graphSendURL, graphPayload(msg), nil); err != nil {
 		return fmt.Errorf("email: outlook send: %w", err)
 	}
 	return nil
+}
+
+func credentialClient(token, endpoint string) (*ahttp.Client, error) {
+	base, err := url.Parse(endpoint)
+	if err != nil || base == nil || base.Scheme == "" || base.Host == "" {
+		return nil, errors.New("email: invalid provider endpoint")
+	}
+	return &ahttp.Client{Bearer: token, CredentialOrigin: base.Scheme + "://" + base.Host}, nil
 }
 
 // graphPayload builds the Microsoft Graph sendMail JSON body.
@@ -140,14 +245,8 @@ func recipients(addrs []string) []map[string]any {
 // rfc822 builds an RFC 2822 message (CRLF line endings, UTF-8 quoted-printable
 // bodies) suitable for Gmail's raw send.
 func (m Message) rfc822() ([]byte, error) {
-	if m.From == "" {
-		return nil, errors.New("email: From is required")
-	}
-	if len(m.To) == 0 {
-		return nil, errors.New("email: at least one To recipient is required")
-	}
-	if m.Text == "" && m.HTML == "" {
-		return nil, errors.New("email: Text or HTML body is required")
+	if err := m.Validate(); err != nil {
+		return nil, err
 	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "From: %s\r\n", m.From)
@@ -175,6 +274,36 @@ func (m Message) rfc822() ([]byte, error) {
 		writeQP(&b, m.Text)
 	}
 	return b.Bytes(), nil
+}
+
+// validateHeaders rejects line breaks and NULs in values that are serialized
+// into RFC 822 headers or mirrored into provider recipient fields. Without
+// this check an address such as "victim@example.com\r\nBcc: attacker@evil"
+// can add a recipient header to a Gmail raw message.
+func (m Message) validateHeaders() error {
+	check := func(name, value string) error {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("email: %s contains forbidden header control characters", name)
+		}
+		return nil
+	}
+	if err := check("From", m.From); err != nil {
+		return err
+	}
+	if err := check("Subject", m.Subject); err != nil {
+		return err
+	}
+	for _, addr := range m.To {
+		if err := check("To", addr); err != nil {
+			return err
+		}
+	}
+	for _, addr := range m.Cc {
+		if err := check("Cc", addr); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writePart(b *bytes.Buffer, boundary, contentType, content string) {

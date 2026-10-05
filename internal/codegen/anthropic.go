@@ -23,8 +23,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -38,6 +41,8 @@ const DefaultMessagesURL = "https://api.anthropic.com/v1/messages"
 
 // DefaultAPIVersion pins the anthropic-version header.
 const DefaultAPIVersion = "2023-06-01"
+
+const maxAnthropicResponseBytes = 8 << 20
 
 // AnthropicClient is the thin HTTP client. Safe for concurrent use; the
 // underlying http.Client owns its connection pool.
@@ -64,11 +69,39 @@ func NewAnthropicFromEnv() (*AnthropicClient, error) {
 	if c.BaseURL == "" {
 		c.BaseURL = "https://api.anthropic.com"
 	}
+	if err := validateAnthropicBaseURL(c.BaseURL); err != nil {
+		return nil, err
+	}
 	if c.Version == "" {
 		c.Version = DefaultAPIVersion
 	}
-	c.HTTPClient = &http.Client{Timeout: 120 * time.Second}
+	c.HTTPClient = &http.Client{
+		Timeout: 120 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	return c, nil
+}
+
+// A codegen request carries both an API credential and the authoring prompt.
+// Only TLS endpoints may receive either, except a literal loopback address
+// used by a local development gateway or test server.
+func validateAnthropicBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return errors.New("codegen: model base URL must be an absolute HTTPS URL without userinfo, query, or fragment")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		ip := net.ParseIP(u.Hostname())
+		if ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return errors.New("codegen: model base URL must use HTTPS or literal loopback HTTP")
 }
 
 // MessagesRequest is the subset of the Messages API we use. Tools forces a
@@ -137,6 +170,9 @@ type Usage struct {
 // responses surface as APIError so callers can act on the status code +
 // API error type (rate limit, invalid request, overloaded, etc.).
 func (c *AnthropicClient) SendMessages(ctx context.Context, req MessagesRequest) (*MessagesResponse, error) {
+	if err := validateAnthropicBaseURL(c.BaseURL); err != nil {
+		return nil, err
+	}
 	if req.Model == "" {
 		req.Model = DefaultModel
 	}
@@ -164,9 +200,12 @@ func (c *AnthropicClient) SendMessages(ctx context.Context, req MessagesRequest)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAnthropicResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("codegen: read body: %w", err)
+	}
+	if len(respBody) > maxAnthropicResponseBytes {
+		return nil, fmt.Errorf("codegen: response exceeds %d-byte limit", maxAnthropicResponseBytes)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -175,12 +214,12 @@ func (c *AnthropicClient) SendMessages(ctx context.Context, req MessagesRequest)
 			apiErr.StatusCode = resp.StatusCode
 			return nil, &apiErr
 		}
-		return nil, fmt.Errorf("codegen: anthropic %d: %s", resp.StatusCode, snippet(respBody))
+		return nil, fmt.Errorf("codegen: anthropic %d", resp.StatusCode)
 	}
 
 	var out MessagesResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("codegen: decode response: %w (raw=%s)", err, snippet(respBody))
+		return nil, fmt.Errorf("codegen: decode response: %w", err)
 	}
 	return &out, nil
 }
@@ -199,7 +238,9 @@ type ErrorBody struct {
 
 // Error implements error.
 func (e *APIError) Error() string {
-	return fmt.Sprintf("anthropic %d: %s: %s", e.StatusCode, e.Body.Type, e.Body.Message)
+	// Provider messages can echo submitted prompts or gateway headers. Keep
+	// the typed body for retry decisions but never promote it into logs or UI.
+	return fmt.Sprintf("anthropic %d", e.StatusCode)
 }
 
 // IsRateLimited reports whether the error is a 429 / overloaded response.
@@ -208,13 +249,4 @@ func (e *APIError) IsRateLimited() bool {
 	return e.StatusCode == 429 ||
 		e.Body.Type == "rate_limit_error" ||
 		e.Body.Type == "overloaded_error"
-}
-
-// snippet returns up to 200 bytes of a body for log + error messages.
-func snippet(b []byte) string {
-	const max = 200
-	if len(b) <= max {
-		return string(b)
-	}
-	return string(b[:max]) + "..."
 }

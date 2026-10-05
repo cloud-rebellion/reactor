@@ -9,6 +9,51 @@ import (
 	"time"
 )
 
+func TestOldestQueuedAgeTracksEligibleBacklog(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if age, err := j.OldestQueuedAge(ctx); err != nil || age != 0 {
+		t.Fatalf("empty queue age = %s, %v; want zero", age, err)
+	}
+	if err := j.CreateWorkflow(ctx, "wf_queue_age", "queue-age", "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, runID := range []string{"run_age_old", "run_age_new"} {
+		if err := j.CreateQueuedRun(ctx, runID, "wf_queue_age", "manual", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	for _, item := range []struct {
+		id  string
+		age time.Duration
+	}{{"run_age_old", 90 * time.Second}, {"run_age_new", 20 * time.Second}} {
+		if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET created_at = $1 WHERE id = $2`), j.formatTime(now.Add(-item.age)), item.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertAge := func(want time.Duration) {
+		t.Helper()
+		age, err := j.OldestQueuedAge(ctx)
+		if err != nil || age < want-time.Second || age > want+5*time.Second {
+			t.Fatalf("oldest queue age = %s, %v; want about %s", age, err, want)
+		}
+	}
+	assertAge(90 * time.Second)
+	if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET cancel_requested = $1 WHERE id = $2`), j.boolValue(true), "run_age_old"); err != nil {
+		t.Fatal(err)
+	}
+	assertAge(20 * time.Second)
+	if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET cancel_requested = $1 WHERE id = $2`), j.boolValue(true), "run_age_new"); err != nil {
+		t.Fatal(err)
+	}
+	if age, err := j.OldestQueuedAge(ctx); err != nil || age != 0 {
+		t.Fatalf("cancelled-only queue age = %s, %v; want zero", age, err)
+	}
+}
+
 func TestQueueClaimLeaseReap(t *testing.T) {
 	t.Parallel()
 	j, cleanup := newTestJournal(t)
@@ -28,6 +73,10 @@ func TestQueueClaimLeaseReap(t *testing.T) {
 	if n, _ := j.CountQueued(ctx); n != 2 {
 		t.Fatalf("CountQueued = %d, want 2", n)
 	}
+	initialRunning, err := j.CountRunning(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Claim one: FIFO (run_a first), flips to running, writes a lease.
 	ids, err := j.ClaimQueuedRuns(ctx, "worker-1", 1, time.Minute)
@@ -39,6 +88,9 @@ func TestQueueClaimLeaseReap(t *testing.T) {
 	}
 	if info, _ := j.GetRun(ctx, "run_a"); info.Status != "running" {
 		t.Fatalf("claimed run status = %q, want running", info.Status)
+	}
+	if n, _ := j.CountRunning(ctx); n != initialRunning+1 {
+		t.Fatalf("CountRunning after claim = %d, want %d", n, initialRunning+1)
 	}
 	if n, _ := j.CountQueued(ctx); n != 1 {
 		t.Fatalf("CountQueued after one claim = %d, want 1", n)
@@ -71,12 +123,77 @@ func TestQueueClaimLeaseReap(t *testing.T) {
 	if n, _ := j.CountQueued(ctx); n != 1 {
 		t.Fatalf("CountQueued after reap = %d, want 1", n)
 	}
+	// Releasing a lease does not terminalize its run; the executor owns that
+	// transition. The reaped run is queued again, so the first claimed row is
+	// the only new running row left here.
+	if n, _ := j.CountRunning(ctx); n != initialRunning+1 {
+		t.Fatalf("CountRunning after reap = %d, want %d", n, initialRunning+1)
+	}
 
 	// An empty queue claim returns nothing, no error.
 	_, _ = j.ClaimQueuedRuns(ctx, "w", 10, time.Minute) // drains run_b
 	got, err := j.ClaimQueuedRuns(ctx, "w", 10, time.Minute)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("empty claim = %v, %v; want nil/nil", got, err)
+	}
+}
+
+func TestReturnUnstartedLeaseImmediatelyRequeuesExactClaim(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateQueuedRun(ctx, "run_unstarted", "wf_1", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := j.ClaimQueuedRuns(ctx, "stopping-worker", 1, time.Hour)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first claim = %+v, %v", first, err)
+	}
+	if err := j.ReturnUnstartedLease(ctx, first[0].RunID, first[0].Owner); err != nil {
+		t.Fatal(err)
+	}
+	if run, err := j.GetRun(ctx, first[0].RunID); err != nil || run.Status != "queued" {
+		t.Fatalf("returned run = %+v, %v; want queued", run, err)
+	}
+	if err := j.ExtendLease(ctx, first[0].RunID, first[0].Owner, time.Minute); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("old claim retained lease: %v", err)
+	}
+	second, err := j.ClaimQueuedRuns(ctx, "replacement-worker", 1, time.Minute)
+	if err != nil || len(second) != 1 || second[0].RunID != first[0].RunID || second[0].Owner == first[0].Owner {
+		t.Fatalf("immediate replacement = %+v, %v", second, err)
+	}
+	if err := j.ReturnUnstartedLease(ctx, first[0].RunID, first[0].Owner); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("stale return changed replacement claim: %v", err)
+	}
+	if err := j.ExtendLease(ctx, second[0].RunID, second[0].Owner, time.Minute); err != nil {
+		t.Fatalf("replacement lost lease: %v", err)
+	}
+}
+
+func TestReturnUnstartedLeaseHonorsAcceptedCancellation(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateQueuedRun(ctx, "run_unstarted_cancel", "wf_1", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := j.ClaimQueuedRuns(ctx, "stopping-worker", 1, time.Hour)
+	if err != nil || len(claim) != 1 {
+		t.Fatalf("claim = %+v, %v", claim, err)
+	}
+	if outcome, err := j.RequestRunCancel(ctx, claim[0].RunID); err != nil || outcome != CancelRequested {
+		t.Fatalf("cancel = %q, %v", outcome, err)
+	}
+	if err := j.ReturnUnstartedLease(ctx, claim[0].RunID, claim[0].Owner); err != nil {
+		t.Fatal(err)
+	}
+	if run, err := j.GetRun(ctx, claim[0].RunID); err != nil || run.Status != "cancelled" || run.FinishedAt.IsZero() {
+		t.Fatalf("returned cancelled run = %+v, %v", run, err)
+	}
+	if next, err := j.ClaimQueuedRuns(ctx, "replacement-worker", 1, time.Minute); err != nil || len(next) != 0 {
+		t.Fatalf("cancelled run became claimable = %+v, %v", next, err)
 	}
 }
 
@@ -126,6 +243,138 @@ func TestLeaseGenerationFencesStaleWorkerTerminalAndRelease(t *testing.T) {
 	}
 	if run, err := j.GetRun(ctx, "run_fenced"); err != nil || run.Status != "succeeded" || run.FinishedAt.IsZero() {
 		t.Fatalf("replacement terminal state = %+v, %v", run, err)
+	}
+}
+
+func TestExpiredLeaseCannotBeRenewedBeforeReap(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateQueuedRun(ctx, "run_expired_renew", "wf_1", "webhook", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := j.ClaimQueuedRuns(ctx, "paused-worker", 1, -time.Minute)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("expired claim = %v, %v", claims, err)
+	}
+
+	// A worker that wakes after its deadline must not be able to revive its
+	// generation merely because the reaper has not observed it yet. The
+	// replacement boundary is the lease timestamp itself, not reaper timing.
+	if err := j.ExtendLease(ctx, "run_expired_renew", claims[0].Owner, time.Minute); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("expired lease renewal = %v, want ErrLeaseOwnershipLost", err)
+	}
+	if err := j.VerifyLeaseOwner(ctx, "run_expired_renew", claims[0].Owner); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("expired lease verification = %v, want ErrLeaseOwnershipLost", err)
+	}
+	if n, err := j.ReapExpiredLeases(ctx); err != nil || n != 1 {
+		t.Fatalf("expired lease reap = %d, %v", n, err)
+	}
+	if run, err := j.GetRun(ctx, "run_expired_renew"); err != nil || run.Status != "queued" {
+		t.Fatalf("expired lease run state = %+v, %v; want queued", run, err)
+	}
+}
+
+func TestLeaseRenewalWaitingPastDeadlineCannotReviveClaim(t *testing.T) {
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const runID = "run_waiting_renew"
+	if err := j.CreateQueuedRun(ctx, runID, "wf_1", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := j.ClaimQueuedRuns(ctx, "waiting-worker", 1, 750*time.Millisecond)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim = %+v, %v", claims, err)
+	}
+
+	// Hold the only database connection until the claim expires. The former
+	// single UPDATE captured its comparison time before waiting for this
+	// connection, so it could revive the claim after the deadline.
+	j.db.SetMaxOpenConns(1)
+	holder, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback()
+	var rawDeadline string
+	if err := holder.QueryRowContext(ctx, j.bind(`SELECT expires_at FROM leases WHERE run_id = $1`), runID).Scan(&rawDeadline); err != nil {
+		t.Fatal(err)
+	}
+	deadline, err := j.parseTime(rawDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Until(deadline) < 300*time.Millisecond {
+		t.Fatalf("claim deadline too near for blocked renewal test: %s", time.Until(deadline))
+	}
+	beforeWait := j.db.Stats().WaitCount
+	renewed := make(chan error, 1)
+	go func() { renewed <- j.ExtendLease(ctx, runID, claims[0].Owner, time.Minute) }()
+	for j.db.Stats().WaitCount == beforeWait {
+		if time.Until(deadline) < 100*time.Millisecond {
+			t.Fatal("renewal did not reach the held connection before the deadline")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if wait := time.Until(deadline.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := holder.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-renewed:
+		if !errors.Is(err, ErrLeaseOwnershipLost) {
+			t.Fatalf("renewal after connection wait = %v, want ownership loss", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("renewal did not return: %v", ctx.Err())
+	}
+	if n, err := j.ReapExpiredLeases(ctx); err != nil || n != 1 {
+		t.Fatalf("reap expired claim = %d, %v; want one", n, err)
+	}
+	if replacement, err := j.ClaimQueuedRuns(ctx, "replacement", 1, time.Minute); err != nil || len(replacement) != 1 || replacement[0].RunID != runID {
+		t.Fatalf("replacement claim = %+v, %v", replacement, err)
+	}
+}
+
+func TestExpiredLeaseCannotFinalizeBeforeReap(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateQueuedRun(ctx, "run_expired_finalizer", "wf_1", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := j.ClaimQueuedRuns(ctx, "paused-worker", 1, -time.Minute)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("expired claim = %v, %v", claims, err)
+	}
+	owner := claims[0].Owner
+	if err := j.FinalizeOwnedRun(ctx, "run_expired_finalizer", owner, "succeeded"); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("expired finalization = %v, want ownership loss", err)
+	}
+	if _, err := j.FailLeasedRunArtifactFenceStatus(ctx, "run_expired_finalizer", owner); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("expired artifact-fence finalization = %v, want ownership loss", err)
+	}
+	if _, err := j.RecoverOwnedPendingDeadLetterRedrive(ctx, "run_expired_finalizer", owner); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("expired redrive recovery = %v, want ownership loss", err)
+	}
+	if run, err := j.GetRun(ctx, "run_expired_finalizer"); err != nil || run.Status != "running" || !run.FinishedAt.IsZero() {
+		t.Fatalf("expired worker changed run = %+v, %v", run, err)
+	}
+	if n, err := j.ReapExpiredLeases(ctx); err != nil || n != 1 {
+		t.Fatalf("reap expired claim = %d, %v", n, err)
+	}
+	replacement, err := j.ClaimQueuedRuns(ctx, "replacement", 1, time.Minute)
+	if err != nil || len(replacement) != 1 || replacement[0].RunID != "run_expired_finalizer" {
+		t.Fatalf("replacement claim = %+v, %v", replacement, err)
+	}
+	if err := j.FinalizeOwnedRun(ctx, "run_expired_finalizer", replacement[0].Owner, "succeeded"); err != nil {
+		t.Fatalf("replacement finalization: %v", err)
 	}
 }
 
@@ -273,6 +522,25 @@ func TestFairClaimSkipsCancelRequestedQueuedRun(t *testing.T) {
 	}
 	if outcome, err := j.RequestRunCancel(ctx, "run_flagged_queued"); err != nil || outcome != CancelDone {
 		t.Fatalf("flagged queued cleanup = %q, %v", outcome, err)
+	}
+}
+
+func TestQueueDepthExcludesCancelRequestedRows(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateQueuedRun(ctx, "run_count_cancelled", "wf_1", "webhook", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := j.CountQueued(ctx); err != nil || n != 1 {
+		t.Fatalf("initial queue depth = %d, %v; want 1", n, err)
+	}
+	if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET cancel_requested = $1 WHERE id = $2`), j.boolValue(true), "run_count_cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := j.CountQueued(ctx); err != nil || n != 0 {
+		t.Fatalf("cancel-requested queue depth = %d, %v; want 0", n, err)
 	}
 }
 

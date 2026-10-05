@@ -43,9 +43,9 @@ func main() {
 	}
 }
 
-// TestLintAllowsOrdinaryOsUse keeps the rule narrow: banning the os package
-// wholesale would break normal workflow code.
-func TestLintAllowsOrdinaryOsUse(t *testing.T) {
+// TestLintBansOrdinaryOsUse closes the filesystem and environment escape,
+// including code nested inside a Step closure.
+func TestLintBansOrdinaryOsUse(t *testing.T) {
 	t.Parallel()
 
 	src := `package main
@@ -61,9 +61,7 @@ func main() {
 }
 `
 	issues := Lint([]byte(src), "main.go")
-	for _, is := range issues {
-		if strings.Contains(is.Message, "os.Open") || strings.Contains(is.Message, "os.StartProcess") {
-			t.Fatalf("ordinary os use was flagged: %v", is)
-		}
+	if len(issues) == 0 {
+		t.Fatal("direct os import should be rejected")
 	}
 }

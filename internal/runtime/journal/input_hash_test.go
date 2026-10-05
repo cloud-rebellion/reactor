@@ -92,6 +92,29 @@ func TestDeleteWorkflowRefusesActiveRuns(t *testing.T) {
 	}
 }
 
+func TestDeleteWorkflowIfDisabledRequiresAtomicPause(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := j.DeleteWorkflowIfDisabled(ctx, "wf_1"); !errors.Is(err, ErrWorkflowEnabled) {
+		t.Fatalf("enabled delete err = %v, want ErrWorkflowEnabled", err)
+	}
+	if err := j.SetWorkflowEnabled(ctx, "wf_1", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.DeleteWorkflowIfDisabled(ctx, "wf_1"); !errors.Is(err, ErrWorkflowBusy) {
+		t.Fatalf("disabled workflow with active run err = %v, want ErrWorkflowBusy", err)
+	}
+	if err := j.MarkRunFinished(ctx, "run_1", "succeeded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.DeleteWorkflowIfDisabled(ctx, "wf_1"); err != nil {
+		t.Fatalf("disabled terminal workflow delete: %v", err)
+	}
+}
+
 // TestStepSeqSeparatesLoopIterations is the data-layer half of the loop fix.
 // Three calls to one step name in a run must occupy three rows carrying three
 // outputs. Keyed on (run_id, step_name, attempt) the second and third inserts
@@ -165,5 +188,50 @@ func TestFindCachedOutputBySeqSurfacesRecordedStepName(t *testing.T) {
 	// An ordinal the run never reached is simply not cached.
 	if _, _, err := j.FindCachedOutputBySeq(ctx, "run_1", 99); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unreached ordinal = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFindCachedOutputBySeqForInputReturnsReplayIdentity(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := j.RecordStepStartSeq(ctx, "run_1", "send", 1, 1, "idem-v1", "hash-v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordStepEndSeq(ctx, "run_1", "send", 1, 1, json.RawMessage(`{"sent":true}`), ""); err != nil {
+		t.Fatal(err)
+	}
+	out, step, idem, inputHash, err := j.FindCachedOutputBySeqForInput(ctx, "run_1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"sent":true}` || step != "send" || idem != "idem-v1" || inputHash != "hash-v1" {
+		t.Fatalf("ordinal cache identity = output=%s step=%q idem=%q hash=%q", out, step, idem, inputHash)
+	}
+}
+
+func TestFindRecordedStepNameBySeqIncludesUnsuccessfulAttempts(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := j.RecordStepStartSeq(ctx, "run_1", "charge", 3, 1, "idem", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	// Leave the attempt running. The identity lookup must still report it;
+	// there is intentionally no successful cache row to consult.
+	name, err := j.FindRecordedStepNameBySeq(ctx, "run_1", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "charge" {
+		t.Fatalf("recorded step = %q, want charge", name)
+	}
+
+	if _, err := j.FindRecordedStepNameBySeq(ctx, "run_1", 4); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unreached ordinal err = %v, want ErrNotFound", err)
 	}
 }

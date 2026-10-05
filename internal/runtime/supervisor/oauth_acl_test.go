@@ -8,10 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/bright-interaction/reactor/internal/migrate"
+	"github.com/bright-interaction/reactor/internal/oauth"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/wire"
 	"github.com/bright-interaction/reactor/internal/vault"
@@ -24,6 +26,15 @@ import (
 type stubOAuthResolver struct {
 	token      string
 	wantTenant string
+	provider   string
+	origin     string
+	accountKey string
+}
+
+type noRawTokenResolver struct{ *oauth.Store }
+
+func (noRawTokenResolver) RawToken(context.Context, string, string) (string, error) {
+	panic("raw token resolution must not run for a Salesforce provider alias")
 }
 
 func (s stubOAuthResolver) Token(_ context.Context, _, tenantID string) (string, error) {
@@ -31,6 +42,75 @@ func (s stubOAuthResolver) Token(_ context.Context, _, tenantID string) (string,
 		return "", sql.ErrNoRows
 	}
 	return s.token, nil
+}
+
+func (s stubOAuthResolver) RawToken(ctx context.Context, connectionID, tenantID string) (string, error) {
+	allowed, err := s.RawTokenAllowed(ctx, connectionID, tenantID)
+	if err != nil {
+		return "", err
+	}
+	if !allowed {
+		return "", oauth.ErrRawTokenDenied
+	}
+	return s.Token(ctx, connectionID, tenantID)
+}
+
+func (s stubOAuthResolver) ConnectionProvider(_ context.Context, _, tenantID string) (string, error) {
+	if tenantID != s.wantTenant {
+		return "", sql.ErrNoRows
+	}
+	if s.provider != "" {
+		return s.provider, nil
+	}
+	return "google", nil
+}
+
+func (s stubOAuthResolver) RawTokenAllowed(_ context.Context, _, tenantID string) (bool, error) {
+	if tenantID != s.wantTenant {
+		return false, sql.ErrNoRows
+	}
+	return s.provider != "salesforce", nil
+}
+
+func (s stubOAuthResolver) SalesforceSession(_ context.Context, _, tenantID string) (string, string, error) {
+	if tenantID != s.wantTenant || s.provider != "salesforce" {
+		return "", "", sql.ErrNoRows
+	}
+	return s.token, s.origin, nil
+}
+
+func (s stubOAuthResolver) SalesforceBrokerSession(_ context.Context, _, tenantID string) (string, string, string, error) {
+	if tenantID != s.wantTenant || s.provider != "salesforce" {
+		return "", "", "", sql.ErrNoRows
+	}
+	key := s.accountKey
+	if key == "" {
+		key = strings.Repeat("a", 64)
+	}
+	return s.token, s.origin, key, nil
+}
+
+func (s stubOAuthResolver) SalesforceBrokerSessionCurrent(_ context.Context, _, tenantID, token, origin, accountKey string) (bool, error) {
+	if tenantID != s.wantTenant || s.provider != "salesforce" {
+		return false, nil
+	}
+	key := s.accountKey
+	if key == "" {
+		key = strings.Repeat("a", 64)
+	}
+	return token == s.token && origin == s.origin && accountKey == key, nil
+}
+
+func (s stubOAuthResolver) GenericBrokerSession(context.Context, string, string) (oauth.BrokerSession, error) {
+	return oauth.BrokerSession{}, oauth.ErrBrokerPolicyUnavailable
+}
+
+func (s stubOAuthResolver) BrokerPolicyCurrent(context.Context, oauth.BrokerSession) (bool, error) {
+	return false, nil
+}
+
+func (s stubOAuthResolver) ConnectionActive(_ context.Context, tenantID, _, providerID string) (bool, error) {
+	return tenantID == s.wantTenant && providerID == s.provider, nil
 }
 
 // oauthACLFixture builds a migrated db with one workflow + run in wfTenant and
@@ -57,12 +137,12 @@ func oauthACLFixture(t *testing.T, wfTenant, connTenant string) (*journal.Journa
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO oauth_providers (provider_id, name, auth_url, token_url) VALUES (?,?,?,?)`,
+		`INSERT INTO oauth_providers (provider_id, name, auth_url, token_url, enabled) VALUES (?,?,?,?,1)`,
 		"google", "Google", "https://example.test/auth", "https://example.test/token"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO oauth_connections (id, tenant_id, provider_id, name, token_encrypted) VALUES (?,?,?,?,?)`,
+		`INSERT INTO oauth_connections (id, tenant_id, provider_id, name, token_encrypted, token_access_mode, legacy_raw_reason) VALUES (?,?,?,?,?,'legacy_raw','grandfathered')`,
 		"conn_abc", connTenant, "google", "work", []byte("sealed")); err != nil {
 		t.Fatal(err)
 	}
@@ -123,6 +203,7 @@ func TestOAuthSecretFetchWorksUnderStrictACL(t *testing.T) {
 	sup := &Supervisor{
 		WorkflowSlug:  "mailer",
 		RunID:         "run_1",
+		Mode:          "live",
 		Journal:       j,
 		Vault:         v,
 		OAuthTokens:   stubOAuthResolver{token: "ya29.LIVE", wantTenant: "tenant-a"},
@@ -154,6 +235,7 @@ func TestOAuthSecretFetchDeniedWithoutGrant(t *testing.T) {
 	sup := &Supervisor{
 		WorkflowSlug:  "mailer",
 		RunID:         "run_1",
+		Mode:          "live",
 		Journal:       j,
 		Vault:         v,
 		OAuthTokens:   stubOAuthResolver{token: "ya29.LIVE", wantTenant: "tenant-a"},
@@ -162,6 +244,36 @@ func TestOAuthSecretFetchDeniedWithoutGrant(t *testing.T) {
 	}
 	if sr := fetchSecret(t, sup, "oauth:conn_abc"); !sr.NotFound {
 		t.Fatalf("ungranted oauth fetch was ALLOWED (value=%q); the fix must not exempt oauth ids from the grant check", string(sr.Value))
+	}
+}
+
+func TestOAuthSecretFetchDeniesExistingSalesforceProviderAlias(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j, db := oauthACLFixture(t, "tenant-a", "tenant-a")
+	if err := j.GrantSecret(ctx, "wf_1", "oauth:conn_abc", "admin", ""); err != nil {
+		t.Fatal(err)
+	}
+	// This row represents a provider configured before alias registration was
+	// refused. The live boundary must reject it even with a workflow grant.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE oauth_providers SET auth_url = ? WHERE provider_id = 'google'`,
+		"https://login.salesforce.com/services/oauth2/authorize"); err != nil {
+		t.Fatal(err)
+	}
+	masterKey := make([]byte, 32)
+	v, err := vault.NewStore(vault.NewMemoryBackend(), masterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup := &Supervisor{
+		WorkflowSlug: "mailer", RunID: "run_1", Mode: "live",
+		Journal: j, Vault: v,
+		OAuthTokens: noRawTokenResolver{oauth.New(db, oauth.EngineSQLite, masterKey)},
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if sr := fetchSecret(t, sup, "oauth:conn_abc"); !sr.NotFound || len(sr.Value) != 0 {
+		t.Fatalf("Salesforce alias returned raw token: %+v", sr)
 	}
 }
 
@@ -194,6 +306,7 @@ func TestOAuthSecretFetchDeniedAcrossTenants(t *testing.T) {
 	sup := &Supervisor{
 		WorkflowSlug: "mailer",
 		RunID:        "run_1",
+		Mode:         "live",
 		Journal:      j,
 		Vault:        v,
 		// Deliberately permissive stub: if the ACL lets the call through, the

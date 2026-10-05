@@ -7,6 +7,47 @@ import (
 	"testing"
 )
 
+func TestLintRejectsSDKTestBindingsInWorkflowSource(t *testing.T) {
+	for _, tc := range []struct {
+		name, source, want string
+	}{
+		{"mail binding reference", `package main
+import "github.com/bright-interaction/reactor/sdk/email"
+var _ = email.BindMailSender`, "test-binding hook"},
+		{"aliased connector binding", `package main
+import connector "github.com/bright-interaction/reactor/sdk/http"
+func f() { _ = connector.BindConnectorRequester }`, "test-binding hook"},
+		{"vault binding", `package main
+import "github.com/bright-interaction/reactor/sdk/vault"
+func f() { vault.BindFunc(nil) }`, "test-binding hook"},
+		{"observed block override", `package main
+import "github.com/bright-interaction/reactor/sdk/blocks"
+func f() { _ = blocks.WithJoinObserver }`, "test-binding hook"},
+		{"dot import of mail test hooks", `package main
+import . "github.com/bright-interaction/reactor/sdk/email"
+var _ = BindMailSender`, "test-binding hook"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			issues := Lint([]byte(tc.source), "workflow.go")
+			if len(issues) == 0 || !strings.Contains(issues[0].Message, tc.want) {
+				t.Fatalf("lint issues = %+v, want %q", issues, tc.want)
+			}
+		})
+	}
+	clean := `package main
+import "github.com/bright-interaction/reactor/sdk/email"
+var _ = email.SendConnected`
+	if issues := Lint([]byte(clean), "workflow.go"); len(issues) != 0 {
+		t.Fatalf("connected-mail authoring was rejected: %+v", issues)
+	}
+	dotClean := `package main
+import . "github.com/bright-interaction/reactor/sdk/email"
+var _ = SendConnected`
+	if issues := Lint([]byte(dotClean), "workflow.go"); len(issues) != 0 {
+		t.Fatalf("ordinary dot-imported email call was rejected: %+v", issues)
+	}
+}
+
 func writeGo(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
@@ -18,12 +59,36 @@ func writeGo(t *testing.T, dir, name, body string) {
 // pseudo-import and the process/memory-reach stdlib packages must be refused
 // even though they parse as "standard library" (no dot in the first segment).
 func TestCheckAllowedImportsRejectsDangerousStdlib(t *testing.T) {
-	for _, imp := range []string{"C", "unsafe", "plugin", "os/exec", "syscall", "os/signal"} {
+	for _, imp := range []string{
+		"C", "unsafe", "plugin", "os", "os/exec", "syscall", "os/signal",
+		"net", "net/http", "net/smtp", "net/rpc", "net/rpc/jsonrpc", "crypto/tls",
+		"io/ioutil", "go/parser", "text/template", "html/template",
+		"debug/elf", "debug/macho", "debug/pe", "debug/plan9obj", "log/syslog",
+	} {
 		dir := t.TempDir()
 		writeGo(t, dir, "main.go", "package main\nimport _ \""+imp+"\"\nfunc main() {}\n")
 		if err := CheckAllowedImports(dir); err == nil {
 			t.Errorf("import %q should be rejected by the allowlist denylist", imp)
 		}
+	}
+}
+
+// TestCheckAllowedImportsRejectsDangerousStdlibSubpackages guards the
+// segment-aware prefix fence. Checking only exact package names would let a
+// workflow import net/http/httptest or os/user even though those packages
+// pull in the raw network/filesystem surfaces the authoring boundary forbids.
+func TestCheckAllowedImportsRejectsDangerousStdlibSubpackages(t *testing.T) {
+	t.Parallel()
+	for _, imp := range []string{"net/http/httptest", "net/http/httputil", "net/rpc/jsonrpc", "os/user", "syscall/js", "crypto/tls"} {
+		imp := imp
+		t.Run(imp, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			writeGo(t, dir, "main.go", "package main\nimport _ \""+imp+"\"\nfunc main() {}\n")
+			if err := CheckAllowedImports(dir); err == nil {
+				t.Fatalf("import %q should be rejected by the denied package-prefix fence", imp)
+			}
+		})
 	}
 }
 
@@ -93,9 +158,10 @@ func TestCheckAllowedImportsAllowsStdlibAndSDK(t *testing.T) {
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"github.com/bright-interaction/reactor/sdk"
 )
-func main() { _ = context.Background(); fmt.Println(sdk.Version) }
+func main() { _ = context.Background(); _, _ = url.Parse("https://example.com"); fmt.Println(sdk.Version) }
 `)
 	if err := CheckAllowedImports(dir); err != nil {
 		t.Fatalf("stdlib + SDK imports should pass, got: %v", err)

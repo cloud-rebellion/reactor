@@ -3,11 +3,16 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/reactor/internal/credentials"
+	"github.com/bright-interaction/reactor/internal/runtime/journal"
 )
 
 // newPostClient returns a redirect-following-disabled client + a
@@ -46,7 +51,43 @@ func TestNotificationsPageRendersAddForm(t *testing.T) {
 	}
 }
 
-func TestNotificationsCreateRejectsBadSlackURL(t *testing.T) {
+func TestNotificationPagesUseBoundedTenantScopedChannelMetadata(t *testing.T) {
+	t.Parallel()
+	srv, j, _ := newTestServer(t)
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_channel_meta", "channel-meta", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= notificationPageSize; i++ {
+		name := fmt.Sprintf("acme-channel-%03d", i)
+		if _, err := j.CreateNotificationChannelInTenant(ctx, "acme", name, journal.ChannelKindGenericWebhook, json.RawMessage(`{"url":"https://example.invalid/hook"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.CreateNotificationChannelInTenant(ctx, "globex", "zz-foreign-channel", journal.ChannelKindGenericWebhook, json.RawMessage(`{"url":"https://example.invalid/foreign"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	adminFirst := string(getBody(t, srv.URL+"/notifications"))
+	if !strings.Contains(adminFirst, "acme-channel-099") || strings.Contains(adminFirst, "acme-channel-100") || !strings.Contains(adminFirst, `/notifications?page=1`) {
+		t.Fatal("admin first page did not bound and link the channel inventory")
+	}
+	adminSecond := string(getBody(t, srv.URL+"/notifications?page=1"))
+	if !strings.Contains(adminSecond, "acme-channel-100") || !strings.Contains(adminSecond, "zz-foreign-channel") || !strings.Contains(adminSecond, `/notifications?page=0`) {
+		t.Fatal("admin second page did not preserve the install-wide inventory")
+	}
+
+	workflowFirst := string(getBody(t, srv.URL+"/workflows/channel-meta?tenant=acme"))
+	if !strings.Contains(workflowFirst, "acme-channel-099") || strings.Contains(workflowFirst, "acme-channel-100") || strings.Contains(workflowFirst, "zz-foreign-channel") || !strings.Contains(workflowFirst, `/workflows/channel-meta?tenant=acme&channel_page=1`) {
+		t.Fatal("workflow first picker page was not bounded or tenant-scoped")
+	}
+	workflowSecond := string(getBody(t, srv.URL+"/workflows/channel-meta?tenant=acme&channel_page=1"))
+	if !strings.Contains(workflowSecond, "acme-channel-100") || strings.Contains(workflowSecond, "zz-foreign-channel") || !strings.Contains(workflowSecond, `/workflows/channel-meta?tenant=acme&channel_page=0`) {
+		t.Fatal("workflow second picker page lost tenant scope or pagination")
+	}
+}
+
+func TestNotificationsCreateRejectsPlaintextSlackURL(t *testing.T) {
 	t.Parallel()
 	srv, _, _ := newTestServer(t)
 	form := url.Values{
@@ -63,11 +104,14 @@ func TestNotificationsCreateRejectsBadSlackURL(t *testing.T) {
 
 func TestNotificationsCreateSlackHappyPath(t *testing.T) {
 	t.Parallel()
-	srv, _, _ := newTestServer(t)
+	srv, j, creds := newTestServer(t)
+	if err := creds.Create(context.Background(), credentials.CreateParams{ID: "cred_slack", Name: "Slack webhook", TenantID: journal.DefaultTenant}); err != nil {
+		t.Fatal(err)
+	}
 	form := url.Values{
-		"name":      {"ops"},
-		"kind":      {"slack_webhook"},
-		"slack_url": {"https://hooks.slack.com/services/X/Y/Z"},
+		"name":                    {"ops"},
+		"kind":                    {"slack_webhook"},
+		"slack_url_credential_id": {"cred_slack"},
 	}
 	resp := postSameOrigin(t, srv.URL+"/notifications", form)
 	if resp.StatusCode != http.StatusSeeOther {
@@ -77,6 +121,54 @@ func TestNotificationsCreateSlackHappyPath(t *testing.T) {
 	body := getBody(t, srv.URL+"/notifications")
 	if !strings.Contains(string(body), "ops") {
 		t.Fatal("created channel not listed on /notifications")
+	}
+	channels, err := j.ListNotificationChannels(context.Background())
+	if err != nil || len(channels) != 1 {
+		t.Fatalf("stored channels = %d, err = %v", len(channels), err)
+	}
+	if strings.Contains(string(channels[0].ConfigJSON), "hooks.slack.com") || !strings.Contains(string(channels[0].ConfigJSON), "cred_slack") {
+		t.Fatalf("channel config was not a vault reference: %s", channels[0].ConfigJSON)
+	}
+}
+
+func TestNotificationsCreateRejectsCrossTenantCredential(t *testing.T) {
+	t.Parallel()
+	srv, j, creds := newTestServer(t)
+	if err := creds.Create(context.Background(), credentials.CreateParams{ID: "cred_other", Name: "Other webhook", TenantID: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	resp := postSameOrigin(t, srv.URL+"/notifications", url.Values{
+		"name":                    {"ops"},
+		"kind":                    {"slack_webhook"},
+		"slack_url_credential_id": {"cred_other"},
+	})
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	channels, err := j.ListNotificationChannels(context.Background())
+	if err != nil || len(channels) != 0 {
+		t.Fatalf("stored channels = %d, err = %v", len(channels), err)
+	}
+}
+
+func TestNotificationFormRejectsInlineSecrets(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, kind string
+		form       url.Values
+	}{
+		{"Slack webhook URL", journal.ChannelKindSlackWebhook, url.Values{"slack_url": {"https://hooks.slack.com/services/X/Y/Z"}}},
+		{"webhook URL userinfo", journal.ChannelKindGenericWebhook, url.Values{"webhook_url": {"https://user:synthetic-secret@example.com/hook"}}},
+		{"generic auth header", journal.ChannelKindGenericWebhook, url.Values{"webhook_url": {"https://example.com/hook"}, "webhook_header_name": {"X-Auth"}, "webhook_header_value": {"synthetic-secret"}}},
+		{"SMTP password", journal.ChannelKindEmailSMTP, url.Values{"smtp_host": {"smtp.example.com"}, "smtp_from": {"a@example.com"}, "smtp_to": {"b@example.com"}, "smtp_password": {"synthetic-secret"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/notifications", strings.NewReader(tc.form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if _, _, err := parseChannelConfig(tc.kind, req); err == nil {
+				t.Fatal("inline secret was accepted")
+			}
+		})
 	}
 }
 
@@ -147,6 +239,44 @@ func TestWorkflowNotificationRouteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWorkflowNotificationAttachFormPreservesTenantScope(t *testing.T) {
+	t.Parallel()
+	html := renderNotificationRoutesSectionForTenant(
+		"shared",
+		nil,
+		[]journal.NotificationChannelMetadata{{ID: "ch_acme", Name: "ops", Kind: journal.ChannelKindGenericWebhook}},
+		false,
+		"?tenant=acme",
+	)
+	want := `action="/workflows/shared/notifications?tenant=acme"`
+	if !strings.Contains(html, want) {
+		t.Fatalf("attach form lost tenant selector: missing %q in %s", want, html)
+	}
+}
+
+func TestWorkflowNotificationAttachRedirectPreservesTenantScope(t *testing.T) {
+	t.Parallel()
+	srv, j, _ := newTestServer(t)
+	ctx := context.Background()
+	for _, tenant := range []string{"acme", "globex"} {
+		if err := j.CreateWorkflowInTenant(ctx, "wf_shared_"+tenant, "shared", "h", "0.1.0", json.RawMessage(`{}`), tenant); err != nil {
+			t.Fatal(err)
+		}
+	}
+	channelID, err := j.CreateNotificationChannelInTenant(ctx, "acme", "ops", journal.ChannelKindGenericWebhook, json.RawMessage(`{"url":"https://example.com/hook"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := postSameOrigin(t, srv.URL+"/workflows/shared/notifications?tenant=acme", url.Values{"channel_id": {channelID}})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("attach status = %d, want 303", resp.StatusCode)
+	}
+	if got, want := resp.Header.Get("Location"), "/workflows/shared?tenant=acme"; got != want {
+		t.Fatalf("attach redirect = %q, want %q", got, want)
+	}
+}
+
 // TestDuplicateChannelNameGivesAnActionableError covers the operator half of the
 // per-tenant name change (migration 0027). The create handler used to pass
 // err.Error() straight to the page, so a duplicate name rendered
@@ -155,11 +285,14 @@ func TestWorkflowNotificationRouteRoundTrip(t *testing.T) {
 // it leaks the schema and tells the operator nothing about what to do next.
 func TestDuplicateChannelNameGivesAnActionableError(t *testing.T) {
 	t.Parallel()
-	srv, _, _ := newTestServer(t)
+	srv, _, creds := newTestServer(t)
+	if err := creds.Create(context.Background(), credentials.CreateParams{ID: "cred_slack", Name: "Slack webhook", TenantID: journal.DefaultTenant}); err != nil {
+		t.Fatal(err)
+	}
 	form := url.Values{
-		"name":      {"ops-slack"},
-		"kind":      {"slack_webhook"},
-		"slack_url": {"https://hooks.slack.com/services/X/Y/Z"},
+		"name":                    {"ops-slack"},
+		"kind":                    {"slack_webhook"},
+		"slack_url_credential_id": {"cred_slack"},
 	}
 	if resp := postSameOrigin(t, srv.URL+"/notifications", form); resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("first create = %d, want 303", resp.StatusCode)

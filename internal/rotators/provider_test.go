@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSharedSecretProducesHexBytes(t *testing.T) {
@@ -119,5 +120,15 @@ func TestCloudflareValidate(t *testing.T) {
 	ok, err := (&CloudflareProvider{APIBase: srv.URL + "/client/v4"}).Validate(context.Background(), "any", nil)
 	if err != nil || !ok {
 		t.Fatalf("validate failed: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestCloudflareProviderRejectsLinkLocalAPIBase(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := (&CloudflareProvider{APIBase: "http://169.254.169.254"}).Validate(ctx, "any", nil)
+	if err == nil || !strings.Contains(err.Error(), "ssrf") {
+		t.Fatalf("metadata API base error = %v, want SSRF refusal", err)
 	}
 }

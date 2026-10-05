@@ -3,19 +3,37 @@ package mollie
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
+
+func TestDryRunBlocksPaymentConnectorBeforeNetwork(t *testing.T) {
+	t.Setenv("REACTOR_MODE", "dry_run")
+	old := baseURL
+	baseURL = "http://127.0.0.1:1/v2"
+	t.Cleanup(func() { baseURL = old })
+	c := &Client{Key: "test_abc"}
+	params := PaymentParams{Amount: Amount{Currency: "EUR", Value: "10.00"}, Description: "Order", RedirectURL: "https://example.test/return"}
+	if _, err := c.CreatePayment(context.Background(), params); !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("payment dry-run error = %v, want ErrDryRun", err)
+	}
+	if _, err := c.CreateRefund(context.Background(), "tr_1", Amount{}); !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("refund dry-run error = %v, want ErrDryRun", err)
+	}
+}
 
 func fake(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	old := BaseURL
-	BaseURL = srv.URL
-	t.Cleanup(func() { BaseURL = old })
+	old := baseURL
+	baseURL = srv.URL
+	t.Cleanup(func() { baseURL = old })
 	return &Client{Key: "test_abc"}
 }
 

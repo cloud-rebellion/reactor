@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +37,46 @@ type Engine string
 const (
 	EngineSQLite   Engine = "sqlite"
 	EnginePostgres Engine = "postgres"
+
+	// A distributed serve process holds one dedicated advisory-lock connection.
+	// Leave at least one other connection for the journal and HTTP requests.
+	postgresDefaultMaxOpenConns = 8
+	postgresDefaultMaxIdleConns = 4
+	postgresMaxOpenConnsLimit   = 256
 )
+
+type postgresPoolConfig struct {
+	maxOpen int
+	maxIdle int
+}
+
+// postgresPoolFromEnv validates limits before opening a network connection.
+// database/sql treats maxOpen=0 as unlimited and silently clamps maxIdle, so
+// reject those unsafe/misleading operator values instead of passing them on.
+func postgresPoolFromEnv(lookupEnv func(string) (string, bool)) (postgresPoolConfig, error) {
+	cfg := postgresPoolConfig{
+		maxOpen: postgresDefaultMaxOpenConns,
+		maxIdle: postgresDefaultMaxIdleConns,
+	}
+	if raw, ok := lookupEnv("REACTOR_DB_MAX_OPEN_CONNS"); ok {
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || n < 2 || n > postgresMaxOpenConnsLimit {
+			return postgresPoolConfig{}, fmt.Errorf("REACTOR_DB_MAX_OPEN_CONNS must be an integer between 2 and %d", postgresMaxOpenConnsLimit)
+		}
+		cfg.maxOpen = n
+		if cfg.maxIdle > n {
+			cfg.maxIdle = n
+		}
+	}
+	if raw, ok := lookupEnv("REACTOR_DB_MAX_IDLE_CONNS"); ok {
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || n < 0 || n > cfg.maxOpen {
+			return postgresPoolConfig{}, fmt.Errorf("REACTOR_DB_MAX_IDLE_CONNS must be an integer between 0 and REACTOR_DB_MAX_OPEN_CONNS (%d)", cfg.maxOpen)
+		}
+		cfg.maxIdle = n
+	}
+	return cfg, nil
+}
 
 // EngineFromURL infers the engine from a database URL.
 //
@@ -66,6 +107,13 @@ func Open(rawURL string) (*sql.DB, Engine, error) {
 	engine, err := EngineFromURL(rawURL)
 	if err != nil {
 		return nil, "", err
+	}
+	var pgPool postgresPoolConfig
+	if engine == EnginePostgres {
+		pgPool, err = postgresPoolFromEnv(os.LookupEnv)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	// driverName is the stdlib database/sql registration string. modernc's
 	// sqlite registers as "sqlite"; pgx's stdlib bridge registers as "pgx",
@@ -98,12 +146,21 @@ func Open(rawURL string) (*sql.DB, Engine, error) {
 		// pool so a held write transaction can't starve the next query.
 		db.SetMaxOpenConns(4)
 		db.SetConnMaxIdleTime(5 * time.Minute)
+	} else {
+		configurePostgresPool(db, pgPool)
 	}
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, "", fmt.Errorf("ping db: %w", err)
 	}
 	return db, engine, nil
+}
+
+func configurePostgresPool(db *sql.DB, cfg postgresPoolConfig) {
+	db.SetMaxOpenConns(cfg.maxOpen)
+	db.SetMaxIdleConns(cfg.maxIdle)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxLifetime(30 * time.Minute)
 }
 
 // sqliteDSNWithPragmas appends the durability + concurrency pragmas every

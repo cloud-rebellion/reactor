@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/bright-interaction/reactor/internal/safehttp"
 )
 
 // defaultp.apiBase() is the production endpoint. Tests construct
@@ -17,7 +17,11 @@ const defaultCloudflareAPIBase = "https://api.cloudflare.com/client/v4"
 
 // cloudflareHTTPClient is the shared client; bounded timeout prevents a
 // stuck Cloudflare endpoint from holding up the rotation runner.
-var cloudflareHTTPClient = &http.Client{Timeout: 15 * time.Second}
+// The API base is operator-configurable for tests and private enterprise
+// gateways. Keep the provider client behind the same connect-time SSRF guard
+// as webhook delivery so a bad base can never reach link-local metadata (or
+// follow a redirect there) while carrying the current bearer token.
+var cloudflareHTTPClient = safehttp.Client(true)
 
 // CloudflareProvider rotates a Cloudflare API token in place via the
 // "roll" endpoint (PUT /user/tokens/{id}/value) so existing token id
@@ -63,10 +67,14 @@ func (p *CloudflareProvider) Validate(ctx context.Context, key string, _ map[str
 		return false, err
 	}
 	defer resp.Body.Close()
+	body, err := readBoundedProviderResponse(resp.Body, maxProviderResponseBytes)
+	if err != nil {
+		return false, err
+	}
 	var out struct {
 		Success bool `json:"success"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(body, &out); err != nil {
 		return false, err
 	}
 	return out.Success, nil
@@ -83,7 +91,10 @@ func (p *CloudflareProvider) getTokenID(ctx context.Context, token string) (stri
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readBoundedProviderResponse(resp.Body, maxProviderResponseBytes)
+	if err != nil {
+		return "", err
+	}
 	var out struct {
 		Success bool `json:"success"`
 		Result  struct {
@@ -111,7 +122,10 @@ func (p *CloudflareProvider) rollToken(ctx context.Context, currentToken, tokenI
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := readBoundedProviderResponse(resp.Body, maxProviderResponseBytes)
+	if err != nil {
+		return "", err
+	}
 	var out struct {
 		Success bool   `json:"success"`
 		Result  string `json:"result"`

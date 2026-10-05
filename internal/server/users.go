@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,6 +72,8 @@ type AuthAdmin interface {
 	ConsumeRecoveryCode(ctx context.Context, userID, code string) (bool, error)
 	CountUnusedRecoveryCodes(ctx context.Context, userID string) (int, error)
 }
+
+const defaultAPITokenTTL = 90 * 24 * time.Hour
 
 // sessionStoreAdapter narrows AuthAdmin to the subset SessionAuth needs.
 // Trivial pass-through; defined here so the server package can wire
@@ -253,15 +256,33 @@ func (s *Server) usersCreate(w http.ResponseWriter, r *http.Request) {
 	if role == "" {
 		role = auth.RoleMember
 	}
+	tenant := strings.TrimSpace(r.PostFormValue("tenant_id"))
+	if tenant == "" {
+		tenant = "default"
+	}
+	// Validate the tenant before creating the user. SetUserTenant also checks
+	// this at the auth boundary, but preflight avoids leaving a newly-created
+	// user behind when the form names a tenant that no longer exists.
+	if s.Journal != nil {
+		if _, err := s.Journal.GetTenant(r.Context(), tenant); err != nil {
+			s.usersError(w, r, fmt.Sprintf("tenant %q is unavailable: %v", tenant, err))
+			return
+		}
+	}
 	id, err := s.Auth.CreateUser(r.Context(), username, password, role)
 	if err != nil {
 		s.usersError(w, r, err.Error())
 		return
 	}
-	if tenant := strings.TrimSpace(r.PostFormValue("tenant_id")); tenant != "" {
-		if tErr := s.Auth.SetUserTenant(r.Context(), id, tenant); tErr != nil {
-			s.Log.Warn("usersCreate: set tenant failed", "id", id, "err", tErr)
+	if tErr := s.Auth.SetUserTenant(r.Context(), id, tenant); tErr != nil {
+		// Do not report success with a user stranded in the schema default.
+		// Roll back the identity because the user was not created in the
+		// tenant the operator selected.
+		if rollbackErr := s.Auth.DeleteUser(r.Context(), id); rollbackErr != nil && s.Log != nil {
+			s.Log.Warn("usersCreate: rollback after tenant assignment failure failed", "id", id, "err", rollbackErr)
 		}
+		s.usersError(w, r, fmt.Sprintf("assign tenant %q: %v", tenant, tErr))
+		return
 	}
 	http.Redirect(w, r, "/users", http.StatusSeeOther)
 }
@@ -418,6 +439,9 @@ func (s *Server) tokensCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not signed in", http.StatusUnauthorized)
 		return
 	}
+	if !s.requireStepUp(w, r, me, false) {
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form: "+err.Error(), http.StatusBadRequest)
 		return
@@ -427,7 +451,16 @@ func (s *Server) tokensCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "name is required", http.StatusBadRequest)
 		return
 	}
-	raw, tokenID, err := s.Auth.MintAPIToken(r.Context(), me.ID, name, 0)
+	ttl := defaultAPITokenTTL
+	if rawDays := strings.TrimSpace(r.PostFormValue("ttl_days")); rawDays != "" {
+		parsed, parseErr := strconv.Atoi(rawDays)
+		if parseErr != nil || parsed < 1 || parsed > 3650 {
+			http.Error(w, "ttl_days must be between 1 and 3650", http.StatusBadRequest)
+			return
+		}
+		ttl = time.Duration(parsed) * 24 * time.Hour
+	}
+	raw, tokenID, err := s.Auth.MintAPIToken(r.Context(), me.ID, name, ttl)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -603,7 +636,7 @@ func tokensBody(list []auth.APIToken, flashRaw string) string {
 	if len(list) == 0 {
 		b.WriteString(`<p class="muted">No tokens yet. Mint one below for CI scripts or third-party integrations.</p>`)
 	} else {
-		b.WriteString(`<table><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead><tbody>`)
+		b.WriteString(`<table><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th>Expires</th><th>Status</th><th></th></tr></thead><tbody>`)
 		for _, t := range list {
 			status := `<span class="tag tag-on">active</span>`
 			if t.Revoked {
@@ -613,16 +646,20 @@ func tokensBody(list []auth.APIToken, flashRaw string) string {
 			if t.LastUsedAt != nil {
 				lastUsed = t.LastUsedAt.UTC().Format("2006-01-02 15:04Z")
 			}
+			expires := "-"
+			if t.ExpiresAt != nil {
+				expires = t.ExpiresAt.UTC().Format("2006-01-02")
+			}
 			actions := ""
 			if !t.Revoked {
 				actions = fmt.Sprintf(`<form method="POST" action="/tokens/%s/revoke" class="form-inline" data-confirm="Revoke token %s? CI scripts using it will start failing."><button type="submit" class="btn-link">revoke</button></form>`,
 					// HTML attribute now (see the delete-user site above).
 					template.URLQueryEscaper(t.ID), template.HTMLEscapeString(t.Name))
 			}
-			fmt.Fprintf(&b, `<tr><td>%s</td><td class="muted">%s</td><td class="muted">%s</td><td>%s</td><td>%s</td></tr>`,
+			fmt.Fprintf(&b, `<tr><td>%s</td><td class="muted">%s</td><td class="muted">%s</td><td class="muted">%s</td><td>%s</td><td>%s</td></tr>`,
 				template.HTMLEscapeString(t.Name),
 				t.CreatedAt.UTC().Format("2006-01-02 15:04Z"),
-				lastUsed, status, actions,
+				lastUsed, expires, status, actions,
 			)
 		}
 		b.WriteString(`</tbody></table>`)
@@ -630,7 +667,8 @@ func tokensBody(list []auth.APIToken, flashRaw string) string {
 	b.WriteString(`<h2>Mint a token</h2>`)
 	b.WriteString(`<form method="POST" action="/tokens" class="form">
   <label>Name <input type="text" name="name" required autocomplete="off" placeholder="ci-deploy, laptop, integration-test"></label>
-  <p class="muted">The token is shown once on the next page load; copy it immediately. It has the same permissions your user account has.</p>
+  <label>Lifetime <select name="ttl_days"><option value="30">30 days</option><option value="90" selected>90 days</option><option value="365">1 year</option><option value="3650">10 years</option></select></label>
+  <p class="muted">The token expires automatically and is shown once on the next page load; copy it immediately. It has the same permissions your user account has.</p>
   <button type="submit" class="btn-primary">Mint token</button>
 </form>`)
 	return b.String()

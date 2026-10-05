@@ -2,20 +2,37 @@ package stripe
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
+
+func TestDryRunBlocksPaymentConnectorBeforeNetwork(t *testing.T) {
+	t.Setenv("REACTOR_MODE", "dry_run")
+	old := baseURL
+	baseURL = "http://127.0.0.1:1/v1"
+	t.Cleanup(func() { baseURL = old })
+	c := &Client{Key: "sk_test_123"}
+	if _, err := c.CreateCheckoutSession(context.Background(), CheckoutParams{LineItems: []LineItem{{Price: "price_x", Quantity: 1}}}, "idem"); !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("checkout dry-run error = %v, want ErrDryRun", err)
+	}
+	if _, err := c.CreateRefund(context.Background(), "pi_1", 0, "idem"); !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("refund dry-run error = %v, want ErrDryRun", err)
+	}
+}
 
 func fake(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	old := BaseURL
-	BaseURL = srv.URL
-	t.Cleanup(func() { BaseURL = old })
+	old := baseURL
+	baseURL = srv.URL
+	t.Cleanup(func() { baseURL = old })
 	return &Client{Key: "sk_test_123"}
 }
 
@@ -103,6 +120,22 @@ func TestNon2xxErrors(t *testing.T) {
 	_, err := c.CreateCustomer(context.Background(), CustomerParams{Email: "x@y.com"}, "")
 	if err == nil || !strings.Contains(err.Error(), "402") {
 		t.Fatalf("want 402 error, got %v", err)
+	}
+}
+
+func TestProviderErrorBodyStaysOutOfStripeStepError(t *testing.T) {
+	const private = "provider-echoed-customer-and-secret-canary"
+	c := fake(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = io.WriteString(w, `{"error":{"message":"`+private+`"}}`)
+	})
+	_, err := c.CreateCustomer(context.Background(), CustomerParams{Email: "customer@example.test"}, "idem")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusPaymentRequired {
+		t.Fatalf("provider failure classification = %v, want typed HTTP 402", err)
+	}
+	if strings.Contains(err.Error(), private) {
+		t.Fatal("provider response body leaked into loggable Step error")
 	}
 }
 

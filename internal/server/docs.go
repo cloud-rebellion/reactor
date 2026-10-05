@@ -37,28 +37,30 @@ var docsOrder = []string{
 	"codegen",
 	"rotation",
 	"operations",
+	"internal-readiness",
 	"security",
 }
 
 // docTitles overrides the default humanised filename per page. Drives
 // the sidebar link text + the <title> tag.
 var docTitles = map[string]string{
-	"README":            "Overview",
-	"dashboard":         "Dashboard pages + endpoints",
-	"api":               "REST API reference",
-	"mcp":               "MCP server + tool reference",
-	"notifications":     "Notifications (Slack + webhook + email)",
-	"connections":       "OAuth connections",
-	"chaining":          "Workflow chaining",
-	"hash-esign-bridge": "Hash e-signature bridge",
-	"teams":             "Teams, users, sessions, API tokens",
-	"architecture":      "Architecture",
-	"scaling":           "Scaling (distributed mode + workers)",
-	"sdk":               "SDK reference",
-	"codegen":           "Codegen pipeline",
-	"rotation":          "Credential rotation",
-	"operations":        "Operations runbook",
-	"security":          "Security threat model",
+	"README":             "Overview",
+	"dashboard":          "Dashboard pages + endpoints",
+	"api":                "REST API reference",
+	"mcp":                "MCP server + tool reference",
+	"notifications":      "Notifications (Slack + webhook + email)",
+	"connections":        "OAuth connections",
+	"chaining":           "Workflow chaining",
+	"hash-esign-bridge":  "Hash e-signature bridge",
+	"teams":              "Teams, users, sessions, API tokens",
+	"architecture":       "Architecture",
+	"scaling":            "Scaling (distributed mode + workers)",
+	"sdk":                "SDK reference",
+	"codegen":            "Codegen pipeline",
+	"rotation":           "Credential rotation",
+	"operations":         "Operations runbook",
+	"internal-readiness": "Internal readiness runbook",
+	"security":           "Security threat model",
 }
 
 // docsIndex serves the index page listing every embedded doc.

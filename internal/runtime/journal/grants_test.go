@@ -3,6 +3,7 @@ package journal
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -198,5 +199,73 @@ func TestListGrantsByWorkflow(t *testing.T) {
 	}
 	if len(scoped) != 2 {
 		t.Fatalf("ListGrantsForWorkflow(wf_a) got %d, want 2", len(scoped))
+	}
+}
+
+// TestGrantReadsFenceLegacyCrossTenantRows protects workflow-scoped MCP
+// inventory and review receipts against relation rows restored from a legacy
+// database. Current GrantSecret rejects this topology, but a stale row must
+// not make another tenant's credential identifier visible through a read.
+func TestGrantReadsFenceLegacyCrossTenantRows(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := j.CreateWorkflowInTenant(ctx, "wf_grant_scope", "grant-scope", "h", "0.1.0", []byte(`{}`), "tenant-a"); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range [][2]string{{"cred_same", "tenant-a"}, {"cred_foreign", "tenant-b"}} {
+		if _, err := j.db.ExecContext(ctx, j.bind(
+			`INSERT INTO credentials (id, tenant_id, name, service, blob) VALUES ($1,$2,$3,$4,$5)`),
+			row[0], row[1], row[0], "svc", []byte("x")); err != nil {
+			t.Fatalf("seed credential %s: %v", row[0], err)
+		}
+	}
+	// Bypass GrantSecret deliberately to model a restored legacy relation.
+	for _, credentialID := range []string{"cred_same", "cred_foreign"} {
+		if _, err := j.db.ExecContext(ctx, j.bind(
+			`INSERT INTO workflow_secret_grants (workflow_id, credential_id, granted_by, note) VALUES ($1,$2,$3,$4)`),
+			"wf_grant_scope", credentialID, "legacy", "should not cross MCP"); err != nil {
+			t.Fatalf("seed grant %s: %v", credentialID, err)
+		}
+	}
+
+	all, err := j.ListGrantsForWorkflow(ctx, "wf_grant_scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].CredentialID != "cred_same" {
+		t.Fatalf("unpaged grant read = %+v, want only same-tenant grant", all)
+	}
+	page, more, err := j.ListGrantsForWorkflowPage(ctx, "wf_grant_scope", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if more || len(page) != 1 || page[0].CredentialID != "cred_same" {
+		t.Fatalf("paged grant read = %+v more=%v, want only same-tenant grant", page, more)
+	}
+}
+
+func TestGrantMetadataPageOmitsLegacyNote(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_grant_metadata", "grant-metadata", "h", "0.1.0", []byte(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.ExecContext(ctx, j.bind(`INSERT INTO credentials (id, tenant_id, name, service, blob) VALUES ($1,$2,$3,$4,$5)`), "cred_grant_metadata", "acme", "grant", "svc", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.ExecContext(ctx, j.bind(`INSERT INTO workflow_secret_grants (workflow_id, credential_id, granted_by, note) VALUES ($1,$2,$3,$4)`), "wf_grant_metadata", "cred_grant_metadata", "legacy", strings.Repeat("n", 4<<20)); err != nil {
+		t.Fatal(err)
+	}
+	rows, more, err := j.ListGrantsForWorkflowPageMetadata(ctx, "wf_grant_metadata", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if more || len(rows) != 1 || rows[0].CredentialID != "cred_grant_metadata" || rows[0].Note != "" {
+		t.Fatalf("metadata grants = %+v more=%v", rows, more)
 	}
 }

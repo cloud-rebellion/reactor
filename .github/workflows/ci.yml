@@ -36,8 +36,41 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Keep the CI stdlib aligned with the Docker and release pins.
+          # go-version-file reads the `go` language directive and may select
+          # the older 1.25.x minimum instead of the security-patched toolchain.
+          go-version: "1.26.6"
           cache: true
 
       - name: All checks (build, vet, test, gofmt, licenses, secrets, vulnerabilities)
         run: bash scripts/ci.sh
+
+  postgres-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: reactor_test
+          POSTGRES_PASSWORD: reactor_test
+          POSTGRES_DB: reactor_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U reactor_test -d reactor_ci_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: PostgreSQL migrations, journal contracts, HTTP MCP worker, and bounded queue probe
+        env:
+          REACTOR_TEST_POSTGRES_URL: postgres://reactor_test:reactor_test@127.0.0.1:5432/reactor_ci_test?sslmode=disable
+        run: bash scripts/ci-postgres.sh

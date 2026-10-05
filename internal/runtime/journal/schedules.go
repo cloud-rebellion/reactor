@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/runtime/payloadcrypto"
 )
 
 // Schedule represents a pending wake-up: workflow subprocess was suspended
@@ -24,6 +26,153 @@ type Schedule struct {
 	SignalPayload []byte
 	Fired         bool
 	CreatedAt     time.Time
+	// These presence bits are populated by metadata-only control-plane reads
+	// so callers can describe signal state without loading bearer tokens or
+	// arbitrary delivered payloads.
+	SignalTokenPresent   bool `json:"-"`
+	SignalPayloadPresent bool `json:"-"`
+}
+
+// Keep execution reads on one shape so the signal envelope is authenticated
+// before a token or delivered payload can reach the supervisor. Metadata-only
+// MCP reads use a separate projection below.
+const scheduleSelectFields = `s.id, s.run_id, s.step_name, s.kind, s.wake_at,
+	s.signal_name, s.signal_token, s.signal_payload, s.fired, s.created_at,
+	s.signal_crypto_version, s.signal_token_ciphertext, s.signal_token_sha256,
+	s.signal_token_plaintext_bytes, s.signal_payload_plaintext_bytes, s.seq, r.tenant_id`
+
+// ListPendingSchedulesForRunTenant returns only unfired wake-ups for a run
+// owned by tenantID. Callers that present this to an operator must omit the
+// signal token and payload: the token is a bearer capability and the payload
+// may contain workflow/customer data.
+func (j *Journal) ListPendingSchedulesForRunTenant(ctx context.Context, runID, tenantID string) ([]Schedule, error) {
+	q := `SELECT ` + scheduleSelectFields + ` FROM schedules s JOIN runs r ON r.id = s.run_id
+		WHERE s.run_id = $1 AND s.fired = $2
+			AND ($3 = '' OR r.tenant_id = $3)
+		ORDER BY s.wake_at ASC, s.created_at ASC, s.id ASC`
+	args := []any{runID, j.boolValue(false), tenantID}
+	if j.engine == EngineSQLite {
+		// The SQLite placeholder rewriter does not preserve PostgreSQL's
+		// repeated $3 reference, so bind the tenant predicate twice.
+		args = append(args, tenantID)
+	}
+	rows, err := j.db.QueryContext(ctx, j.bind(q), args...)
+	if err != nil {
+		return nil, fmt.Errorf("journal: list pending schedules: %w", err)
+	}
+	defer rows.Close()
+	var out []Schedule
+	for rows.Next() {
+		s, scanErr := scanScheduleRow(rows.Scan, j)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("journal: list pending schedules rows: %w", err)
+	}
+	return out, nil
+}
+
+// ListPendingSchedulesForRunTenantPage returns one bounded page of unfired
+// wake-ups for a tenant-owned run. The MCP read model uses this method so a
+// workflow that has accumulated many suspended iterations cannot turn one
+// inspection request into an unbounded database read or response.
+func (j *Journal) ListPendingSchedulesForRunTenantPage(ctx context.Context, runID, tenantID string, limit, offset int) ([]Schedule, bool, error) {
+	if limit <= 0 {
+		return nil, false, fmt.Errorf("journal: list pending schedules: page limit must be positive")
+	}
+	if limit > 500 {
+		return nil, false, fmt.Errorf("journal: list pending schedules: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, fmt.Errorf("journal: list pending schedules: negative offset")
+	}
+	q := `SELECT ` + scheduleSelectFields + ` FROM schedules s JOIN runs r ON r.id = s.run_id
+		WHERE s.run_id = $1 AND s.fired = $2
+			AND ($3 = '' OR r.tenant_id = $3)
+		ORDER BY s.wake_at ASC, s.created_at ASC, s.id ASC
+		LIMIT $4 OFFSET $5`
+	args := []any{runID, j.boolValue(false), tenantID, limit + 1, offset}
+	if j.engine == EngineSQLite {
+		// SQLite's placeholder rewriter expands the repeated $3 predicate to
+		// two positional placeholders, unlike PostgreSQL's numbered binding.
+		args = []any{runID, j.boolValue(false), tenantID, tenantID, limit + 1, offset}
+	}
+	rows, err := j.db.QueryContext(ctx, j.bind(q), args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list pending schedule page: %w", err)
+	}
+	defer rows.Close()
+	var out []Schedule
+	for rows.Next() {
+		s, scanErr := scanScheduleRow(rows.Scan, j)
+		if scanErr != nil {
+			return nil, false, scanErr
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("journal: list pending schedule page rows: %w", err)
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// ListPendingSchedulesForRunTenantPageMetadata is the MCP/read-model variant
+// of ListPendingSchedulesForRunTenantPage. It projects only schedule metadata
+// and two presence bits; signal tokens and delivered payloads never cross the
+// SQL boundary into the control plane.
+func (j *Journal) ListPendingSchedulesForRunTenantPageMetadata(ctx context.Context, runID, tenantID string, limit, offset int) ([]Schedule, bool, error) {
+	if limit <= 0 || limit > 500 || offset < 0 {
+		return nil, false, fmt.Errorf("journal: invalid pending schedule metadata page")
+	}
+	var tokenPresent, payloadPresent string
+	if j.engine == EnginePostgres {
+		tokenPresent = "CASE WHEN schedules.signal_token IS NOT NULL AND octet_length(schedules.signal_token) > 0 OR schedules.signal_token_ciphertext IS NOT NULL THEN TRUE ELSE FALSE END"
+		payloadPresent = "CASE WHEN schedules.signal_payload IS NOT NULL AND octet_length(schedules.signal_payload) > 0 THEN TRUE ELSE FALSE END"
+	} else {
+		tokenPresent = "CASE WHEN schedules.signal_token IS NOT NULL AND length(CAST(schedules.signal_token AS BLOB)) > 0 OR schedules.signal_token_ciphertext IS NOT NULL THEN 1 ELSE 0 END"
+		payloadPresent = "CASE WHEN schedules.signal_payload IS NOT NULL AND length(CAST(schedules.signal_payload AS BLOB)) > 0 THEN 1 ELSE 0 END"
+	}
+	q := fmt.Sprintf(`SELECT schedules.id, schedules.run_id, schedules.step_name, schedules.kind, schedules.wake_at, schedules.signal_name,
+		%s, %s, schedules.fired, schedules.created_at
+		FROM schedules JOIN runs ON runs.id = schedules.run_id
+		WHERE schedules.run_id = $1 AND schedules.fired = $2`, tokenPresent, payloadPresent)
+	args := []any{runID, j.boolValue(false)}
+	position := 3
+	if tenantID != "" {
+		q += fmt.Sprintf(" AND runs.tenant_id = $%d", position)
+		args = append(args, tenantID)
+		position++
+	}
+	q += fmt.Sprintf(" ORDER BY schedules.wake_at ASC, schedules.created_at ASC, schedules.id ASC LIMIT $%d OFFSET $%d", position, position+1)
+	args = append(args, limit+1, offset)
+	rows, err := j.db.QueryContext(ctx, j.bind(q), args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list pending schedule metadata page: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Schedule, 0, limit)
+	for rows.Next() {
+		item, scanErr := scanScheduleMetadataRow(rows.Scan, j)
+		if scanErr != nil {
+			return nil, false, scanErr
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("journal: list pending schedule metadata rows: %w", err)
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }
 
 // ScheduleKind values.
@@ -37,6 +186,12 @@ const (
 // ErrAlreadyFired is returned by FireSignal when the token's schedule row
 // has already been delivered. Callers map this to HTTP 410 Gone.
 var ErrAlreadyFired = errors.New("journal: schedule already fired")
+
+// ErrSignalExpired is returned when a signal capability is presented after
+// its durable wake_at deadline. The scheduler owns timeout resumption; a late
+// delivery must never race that path and turn an expired approval into a live
+// payload.
+var ErrSignalExpired = errors.New("journal: signal schedule expired")
 
 // ScheduleSleep persists a sleep schedule. The supervisor calls this when a
 // workflow's Sleep frame's UntilUnix is past the suspend threshold; the
@@ -81,10 +236,33 @@ func (j *Journal) ScheduleSignalSeq(ctx context.Context, runID, stepName string,
 	if err != nil {
 		return "", err
 	}
-	const q = `INSERT INTO schedules (id, run_id, step_name, seq, kind, wake_at, signal_name, signal_token, fired)
-		VALUES ($1, $2, $3, $4, 'signal', $5, $6, $7, $8)`
+	if err := j.requireSignalPayloadKey(ctx, j.db); err != nil {
+		return "", err
+	}
+	var tenantID string
+	if err := j.db.QueryRowContext(ctx, j.bind(`SELECT tenant_id FROM runs WHERE id = $1`), runID).Scan(&tenantID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("journal: resolve signal tenant: %w", err)
+	}
+	var storedToken any = token
+	var cipher, digest, tokenBytes any
+	version := 0
+	if j.payloadKey != nil {
+		sealed, hash, err := j.sealSignalToken(tenantID, runID, id, stepName, signalName, seq, token)
+		if err != nil {
+			return "", err
+		}
+		storedToken, cipher, digest, tokenBytes, version = nil, sealed, hash, len(token), 1
+	}
+	const q = `INSERT INTO schedules (id, run_id, step_name, seq, kind, wake_at, signal_name,
+		signal_token, signal_token_ciphertext, signal_token_sha256,
+		signal_crypto_version, signal_token_plaintext_bytes, fired)
+		VALUES ($1, $2, $3, $4, 'signal', $5, $6, $7, $8, $9, $10, $11, $12)`
 	_, err = j.db.ExecContext(ctx, j.bind(q),
-		id, runID, stepName, seq, j.formatTime(expiresAt), signalName, token, j.boolValue(false),
+		id, runID, stepName, seq, j.formatTime(expiresAt), signalName,
+		storedToken, cipher, digest, version, tokenBytes, j.boolValue(false),
 	)
 	if err != nil {
 		return "", fmt.Errorf("journal: schedule signal: %w", err)
@@ -97,12 +275,31 @@ func (j *Journal) ScheduleSignalSeq(ctx context.Context, runID, stepName string,
 // column is the delivery marker (a NULL payload column means pending,
 // a non-NULL payload means delivered awaiting resume). wake_at is bumped
 // to now so FindDueSchedules surfaces the row immediately rather than
-// waiting for the original timeout.
+// waiting for the original timeout. This unscoped form is retained for the
+// public /signal/{token} capability endpoint, where the token itself is the
+// authorization boundary.
 //
 // Returns ErrNotFound when the token doesn't match any signal schedule,
 // and ErrAlreadyFired when the schedule already has a payload (idempotent
 // retry semantics).
 func (j *Journal) FireSignal(ctx context.Context, token string, payload []byte) (runID, signalName string, err error) {
+	return j.fireSignal(ctx, "", token, payload)
+}
+
+// FireSignalForTenant is the MCP/control-plane variant of FireSignal. The
+// caller must already possess the bearer signal token, but the matching run
+// is additionally required to belong to tenantID. This prevents a tenant-
+// scoped MCP client that is handed a token for another tenant from learning
+// or waking that run. Signal tokens and payloads are never returned by this
+// method.
+func (j *Journal) FireSignalForTenant(ctx context.Context, tenantID, token string, payload []byte) (runID, signalName string, err error) {
+	if tenantID == "" {
+		tenantID = DefaultTenant
+	}
+	return j.fireSignal(ctx, tenantID, token, payload)
+}
+
+func (j *Journal) fireSignal(ctx context.Context, tenantID, token string, payload []byte) (runID, signalName string, err error) {
 	if len(payload) == 0 {
 		// payload-presence is the delivery marker; an empty body would be
 		// indistinguishable from "not yet delivered" once the scanner reads
@@ -117,33 +314,124 @@ func (j *Journal) FireSignal(ctx context.Context, token string, payload []byte) 
 	// ErrAlreadyFired forever, stranding the pending await. Ordering pending
 	// rows first, oldest first, makes repeated deliveries to one signal name
 	// fill successive awaits in program order.
-	const sel = `SELECT id, run_id, signal_name, signal_payload FROM schedules
-		WHERE signal_token = $1 AND kind = 'signal'
-		ORDER BY CASE WHEN signal_payload IS NULL THEN 0 ELSE 1 END, created_at ASC
+	now := time.Now().UTC()
+	wakeAfter := "s.wake_at > $5"
+	falseLit := "false"
+	if j.engine == EngineSQLite {
+		// Imported RFC3339 offsets compare incorrectly as TEXT against our
+		// canonical UTC timestamp. The Go expiry check below compares parsed
+		// instants; make the SQL candidate priority and CAS agree with it.
+		wakeAfter = "julianday(s.wake_at) > julianday($5)"
+		falseLit = "0"
+	}
+	sel := `SELECT s.id, s.run_id, s.step_name, s.signal_name, s.seq, r.tenant_id,
+		s.signal_crypto_version, s.signal_payload IS NOT NULL, s.fired, s.wake_at
+		FROM schedules s JOIN runs r ON r.id = s.run_id
+		JOIN workflows w ON w.id = r.workflow_id
+		WHERE ((s.signal_token_sha256 = $1 AND s.signal_crypto_version = 1)
+			OR (s.signal_token = $2 AND s.signal_crypto_version = 0))
+		AND s.kind = 'signal' AND ($3 = '' OR w.tenant_id = $4)
+		ORDER BY CASE WHEN s.signal_payload IS NULL AND s.fired = ` + falseLit + `
+			AND s.wake_at IS NOT NULL AND ` + wakeAfter + ` THEN 0 ELSE 1 END,
+			CASE WHEN s.signal_payload IS NULL AND s.fired = ` + falseLit + ` THEN 0 ELSE 1 END,
+			s.created_at ASC, s.seq ASC, s.id ASC
 		LIMIT 1`
-	row := j.db.QueryRowContext(ctx, j.bind(sel), token)
+	args := []any{signalTokenDigest(token), token, tenantID, tenantID, j.formatTime(now)}
+	row := j.db.QueryRowContext(ctx, j.bind(sel), args...)
 	var (
-		id       string
-		runIDOut sql.NullString
-		nameOut  sql.NullString
-		existing []byte
+		id           string
+		runIDOut     string
+		stepName     sql.NullString
+		nameOut      sql.NullString
+		seq          int64
+		storedTenant string
+		version      int
+		existing     any
+		fired        any
+		wakeAt       sql.NullString
 	)
-	if err := row.Scan(&id, &runIDOut, &nameOut, &existing); err != nil {
+	if err := row.Scan(&id, &runIDOut, &stepName, &nameOut, &seq, &storedTenant, &version, &existing, &fired, &wakeAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", ErrNotFound
 		}
 		return "", "", fmt.Errorf("journal: lookup signal: %w", err)
 	}
-	if existing != nil {
+	if parseBool(existing) || parseBool(fired) {
 		return "", "", ErrAlreadyFired
 	}
+	if version != 0 && version != 1 {
+		return "", "", payloadcrypto.ErrInvalidEnvelope
+	}
+	if !wakeAt.Valid {
+		return "", "", ErrSignalExpired
+	}
+	expiresAt, parseErr := j.parseTime(wakeAt.String)
+	if parseErr != nil {
+		return "", "", fmt.Errorf("journal: parse signal expiry: %w", parseErr)
+	}
+	if !expiresAt.After(now) {
+		return "", "", ErrSignalExpired
+	}
 
-	const upd = `UPDATE schedules
-		SET signal_payload = $1, wake_at = $2
-		WHERE id = $3 AND signal_payload IS NULL`
-	res, err := j.db.ExecContext(ctx, j.bind(upd),
-		payload, j.formatTime(time.Now().UTC()), id,
-	)
+	var res sql.Result
+	if j.payloadKey != nil {
+		sealedPayload, sealErr := j.sealSignalDelivery(storedTenant, runIDOut, id, stepName.String, nameOut.String, seq, payload)
+		if sealErr != nil {
+			return "", "", sealErr
+		}
+		if version == 0 {
+			// Promote the exact pending legacy row in the same CAS as delivery.
+			// The token remains available to replay only under the envelope.
+			sealedToken, hash, sealErr := j.sealSignalToken(storedTenant, runIDOut, id, stepName.String, nameOut.String, seq, token)
+			if sealErr != nil {
+				return "", "", sealErr
+			}
+			upd := `UPDATE schedules SET signal_token = NULL, signal_token_ciphertext = $1,
+				signal_token_sha256 = $2, signal_token_plaintext_bytes = $3,
+				signal_payload = $4, signal_payload_plaintext_bytes = $5,
+				signal_crypto_version = 1, wake_at = $6
+				WHERE id = $7 AND signal_crypto_version = 0 AND signal_token = $8
+					AND signal_payload IS NULL AND fired = $9 AND wake_at > $10`
+			if j.engine == EngineSQLite {
+				upd = `UPDATE schedules SET signal_token = NULL, signal_token_ciphertext = $1,
+					signal_token_sha256 = $2, signal_token_plaintext_bytes = $3,
+					signal_payload = $4, signal_payload_plaintext_bytes = $5,
+					signal_crypto_version = 1, wake_at = $6
+					WHERE id = $7 AND signal_crypto_version = 0 AND signal_token = $8
+						AND signal_payload IS NULL AND fired = $9 AND julianday(wake_at) > julianday($10)`
+			}
+			res, err = j.db.ExecContext(ctx, j.bind(upd), sealedToken, hash, len(token),
+				sealedPayload, len(payload), j.formatTime(now), id, token, j.boolValue(false), j.formatTime(now))
+		} else {
+			upd := `UPDATE schedules SET signal_payload = $1, signal_payload_plaintext_bytes = $2,
+				wake_at = $3 WHERE id = $4 AND signal_crypto_version = 1
+				AND signal_token_sha256 = $5 AND signal_payload IS NULL AND fired = $6 AND wake_at > $7`
+			if j.engine == EngineSQLite {
+				upd = `UPDATE schedules SET signal_payload = $1, signal_payload_plaintext_bytes = $2,
+					wake_at = $3 WHERE id = $4 AND signal_crypto_version = 1
+					AND signal_token_sha256 = $5 AND signal_payload IS NULL AND fired = $6
+					AND julianday(wake_at) > julianday($7)`
+			}
+			res, err = j.db.ExecContext(ctx, j.bind(upd), sealedPayload, len(payload),
+				j.formatTime(now), id, signalTokenDigest(token), j.boolValue(false), j.formatTime(now))
+		}
+	} else {
+		if version == 1 {
+			return "", "", payloadcrypto.ErrKeyRequired
+		}
+		if keyErr := j.requireSignalPayloadKey(ctx, j.db); keyErr != nil {
+			return "", "", keyErr
+		}
+		upd := `UPDATE schedules SET signal_payload = $1, wake_at = $2
+			WHERE id = $3 AND signal_crypto_version = 0 AND signal_payload IS NULL
+				AND fired = $4 AND wake_at > $5`
+		if j.engine == EngineSQLite {
+			upd = `UPDATE schedules SET signal_payload = $1, wake_at = $2
+				WHERE id = $3 AND signal_crypto_version = 0 AND signal_payload IS NULL
+					AND fired = $4 AND julianday(wake_at) > julianday($5)`
+		}
+		res, err = j.db.ExecContext(ctx, j.bind(upd), payload, j.formatTime(now), id, j.boolValue(false), j.formatTime(now))
+	}
 	if err != nil {
 		return "", "", fmt.Errorf("journal: fire signal: %w", err)
 	}
@@ -152,7 +440,7 @@ func (j *Journal) FireSignal(ctx context.Context, token string, payload []byte) 
 		// Lost the race to another delivery between SELECT and UPDATE.
 		return "", "", ErrAlreadyFired
 	}
-	return nullableString(runIDOut), nullableString(nameOut), nil
+	return runIDOut, nullableString(nameOut), nil
 }
 
 // FindDueSchedules returns up to limit unfired schedules whose wake time has
@@ -176,6 +464,11 @@ func (j *Journal) FindDueSchedules(ctx context.Context, now time.Time, limit int
 	for rows.Next() {
 		s, err := scanScheduleRow(rows.Scan, j)
 		if err != nil {
+			if errors.Is(err, payloadcrypto.ErrInvalidEnvelope) || errors.Is(err, payloadcrypto.ErrKeyRequired) {
+				// An authenticated delivery failure must stop dispatch, not
+				// masquerade as a malformed imported wake timestamp.
+				return nil, err
+			}
 			// Skip the row instead of failing the whole batch. A single
 			// unparseable wake_at (an out-of-range timestamp sorts FIRST as
 			// TEXT and always matches "wake_at <= now") would otherwise abort
@@ -254,7 +547,7 @@ func (j *Journal) ClaimScheduleResume(ctx context.Context, id string, enqueue bo
 			return false, tx.Commit()
 		}
 	}
-	lockQ := `SELECT r.status, w.enabled, s.fired
+	lockQ := `SELECT r.id, r.status, r.cancel_requested, w.enabled, w.tenant_id, s.fired
 		FROM schedules s
 		JOIN runs r ON r.id = s.run_id
 		JOIN workflows w ON w.id = r.workflow_id
@@ -263,11 +556,14 @@ func (j *Journal) ClaimScheduleResume(ctx context.Context, id string, enqueue bo
 		lockQ += ` FOR UPDATE OF s, r, w`
 	}
 	var (
-		runStatus string
-		enabled   any
-		fired     any
+		runID           string
+		runStatus       string
+		cancelRequested any
+		enabled         any
+		tenantID        string
+		fired           any
 	)
-	if err := tx.QueryRowContext(ctx, j.bind(lockQ), id).Scan(&runStatus, &enabled, &fired); err != nil {
+	if err := tx.QueryRowContext(ctx, j.bind(lockQ), id).Scan(&runID, &runStatus, &cancelRequested, &enabled, &tenantID, &fired); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, tx.Commit()
 		}
@@ -275,6 +571,31 @@ func (j *Journal) ClaimScheduleResume(ctx context.Context, id string, enqueue bo
 	}
 	if parseBool(fired) {
 		return false, tx.Commit()
+	}
+	// A cancellation request may race the supervisor's suspended transition:
+	// RequestRunCancel flags a running row first, while the supervisor can
+	// commit the schedule + suspended state before the cancel watcher reaches
+	// the process. Never consume the wake-up while that flag is set. Retire the
+	// continuation and finalize cancellation in this same locked transaction so
+	// a scheduler tick cannot resurrect a run that the operator already stopped.
+	if parseBool(cancelRequested) && runStatus == "suspended" {
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE runs SET status = 'cancelled', finished_at = $1
+			WHERE id = (SELECT run_id FROM schedules WHERE id = $2) AND status = 'suspended' AND cancel_requested = $3`),
+			j.now(), id, j.boolValue(true)); err != nil {
+			return false, fmt.Errorf("journal: finalize cancelled scheduled run: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE schedules SET fired = $1 WHERE run_id = (SELECT run_id FROM schedules WHERE id = $2) AND fired = $3`),
+			j.boolValue(true), id, j.boolValue(false)); err != nil {
+			return false, fmt.Errorf("journal: retire cancelled schedules: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("journal: commit cancelled schedule resume: %w", err)
+		}
+		// This terminalization happens at the scheduler admission boundary,
+		// outside the supervisor's normal finish path. Keep usage metering
+		// complete when a cancellation wins the suspend/resume race.
+		j.recordUsageBestEffort(ctx, runID, "cancelled")
+		return false, nil
 	}
 	if runStatus != "suspended" {
 		if runStatus == "running" || runStatus == "queued" {
@@ -295,6 +616,18 @@ func (j *Journal) ClaimScheduleResume(ctx context.Context, id string, enqueue bo
 	if !parseBool(enabled) {
 		// A disabled workflow is paused, not discarded. Keep the due schedule
 		// pending so a later re-enable can resume the same suspended run.
+		return false, tx.Commit()
+	}
+	// FindDueSchedules applies tenant policy while selecting a batch, but that
+	// read can become stale before this claim transaction starts (an operator
+	// may disable a tenant or another run may fill its concurrency cap). Recheck
+	// the policy under the same transaction that flips the schedule and run so a
+	// selected wake-up cannot bypass the tenant kill switch or cap.
+	allowed, err := j.tenantResumeAdmissionTx(ctx, tx, tenantID)
+	if err != nil {
+		return false, err
+	}
+	if !allowed {
 		return false, tx.Commit()
 	}
 
@@ -325,6 +658,47 @@ func (j *Journal) ClaimScheduleResume(ctx context.Context, id string, enqueue bo
 	return true, nil
 }
 
+// tenantResumeAdmissionTx rechecks tenant-level execution policy for one
+// suspended wake-up. The scheduler's due-row query is intentionally a fast
+// fair read; this transactional check is the authoritative last gate before a
+// schedule is consumed. A tenant row is optional for backwards-compatible
+// single-tenant installs, where its absence means unlimited + enabled.
+//
+// PostgreSQL locks the tenant row so two scheduler claims for the same tenant
+// cannot both observe the same max_concurrent_runs budget. SQLite already
+// holds its single-writer transaction lock from ClaimScheduleResume.
+func (j *Journal) tenantResumeAdmissionTx(ctx context.Context, tx *sql.Tx, tenantID string) (bool, error) {
+	if tenantID == "" {
+		tenantID = DefaultTenant
+	}
+	q := `SELECT disabled, max_concurrent_runs FROM tenants WHERE tenant_id = $1`
+	if j.engine == EnginePostgres {
+		q += ` FOR UPDATE`
+	}
+	var (
+		disabled any
+		maxRuns  sql.NullInt64
+	)
+	err := tx.QueryRowContext(ctx, j.bind(q), tenantID).Scan(&disabled, &maxRuns)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("journal: read tenant resume admission: %w", err)
+	}
+	if parseBool(disabled) {
+		return false, nil
+	}
+	if !maxRuns.Valid || maxRuns.Int64 <= 0 {
+		return true, nil
+	}
+	var running int64
+	if err := tx.QueryRowContext(ctx, j.bind(`SELECT COUNT(*) FROM runs WHERE tenant_id = $1 AND status = 'running'`), tenantID).Scan(&running); err != nil {
+		return false, fmt.Errorf("journal: count tenant running resumes: %w", err)
+	}
+	return running < maxRuns.Int64, nil
+}
+
 // FindLatestSleepSchedule returns the most recent sleep schedule for a
 // (run_id, step_name) pair regardless of fired state. Used by the supervisor
 // on re-spawn to decide whether the workflow's repeated Sleep frame is
@@ -349,9 +723,9 @@ func (j *Journal) FindScheduleBySeq(ctx context.Context, runID string, seq int64
 	if seq <= 0 {
 		return Schedule{}, ErrNotFound
 	}
-	const q = `SELECT id, run_id, step_name, kind, wake_at, signal_name, signal_token, signal_payload, fired, created_at
-		FROM schedules WHERE run_id = $1 AND seq = $2 AND kind = $3
-		ORDER BY created_at DESC LIMIT 1`
+	q := `SELECT ` + scheduleSelectFields + ` FROM schedules s JOIN runs r ON r.id = s.run_id
+		WHERE s.run_id = $1 AND s.seq = $2 AND s.kind = $3
+		ORDER BY s.created_at DESC LIMIT 1`
 	row := j.db.QueryRowContext(ctx, j.bind(q), runID, seq, kind)
 	s, err := scanScheduleRow(row.Scan, j)
 	if err != nil {
@@ -364,9 +738,9 @@ func (j *Journal) FindScheduleBySeq(ctx context.Context, runID string, seq int64
 }
 
 func (j *Journal) findLatestByKind(ctx context.Context, runID, stepName, kind string) (Schedule, error) {
-	const q = `SELECT id, run_id, step_name, kind, wake_at, signal_name, signal_token, signal_payload, fired, created_at
-		FROM schedules WHERE run_id = $1 AND step_name = $2 AND kind = $3
-		ORDER BY created_at DESC LIMIT 1`
+	q := `SELECT ` + scheduleSelectFields + ` FROM schedules s JOIN runs r ON r.id = s.run_id
+		WHERE s.run_id = $1 AND s.step_name = $2 AND s.kind = $3
+		ORDER BY s.created_at DESC LIMIT 1`
 	row := j.db.QueryRowContext(ctx, j.bind(q), runID, stepName, kind)
 	s, err := scanScheduleRow(row.Scan, j)
 	if err != nil {
@@ -382,15 +756,23 @@ func (j *Journal) findLatestByKind(ctx context.Context, runID, stepName, kind st
 // FindDueSchedules (rows) and findLatestByKind (row).
 func scanScheduleRow(scan func(...any) error, j *Journal) (Schedule, error) {
 	var (
-		s          Schedule
-		wakeAt     sql.NullString
-		signalName sql.NullString
-		signalTok  sql.NullString
-		payload    []byte
-		fired      any
-		createdAt  sql.NullString
+		s            Schedule
+		wakeAt       sql.NullString
+		signalName   sql.NullString
+		signalTok    sql.NullString
+		payload      []byte
+		fired        any
+		createdAt    sql.NullString
+		version      int
+		tokenCipher  sql.NullString
+		tokenHash    sql.NullString
+		tokenBytes   sql.NullInt64
+		payloadBytes sql.NullInt64
+		seq          int64
+		tenantID     string
 	)
-	if err := scan(&s.ID, &s.RunID, &s.StepName, &s.Kind, &wakeAt, &signalName, &signalTok, &payload, &fired, &createdAt); err != nil {
+	if err := scan(&s.ID, &s.RunID, &s.StepName, &s.Kind, &wakeAt, &signalName, &signalTok, &payload, &fired, &createdAt,
+		&version, &tokenCipher, &tokenHash, &tokenBytes, &payloadBytes, &seq, &tenantID); err != nil {
 		return Schedule{}, err
 	}
 	if wakeAt.Valid {
@@ -403,16 +785,47 @@ func scanScheduleRow(scan func(...any) error, j *Journal) (Schedule, error) {
 	if signalName.Valid {
 		s.SignalName = signalName.String
 	}
-	if signalTok.Valid {
-		s.SignalToken = signalTok.String
-	}
-	if len(payload) > 0 {
-		s.SignalPayload = append([]byte(nil), payload...)
+	if err := j.openScheduleSignal(&s, tenantID, seq, version, signalTok, tokenCipher, tokenHash, tokenBytes, payload, payloadBytes); err != nil {
+		return Schedule{}, fmt.Errorf("journal: open schedule signal: %w", err)
 	}
 	s.Fired = parseBool(fired)
 	if createdAt.Valid {
 		t, perr := j.parseTime(createdAt.String)
 		if perr == nil {
+			s.CreatedAt = t
+		}
+	}
+	return s, nil
+}
+
+func scanScheduleMetadataRow(scan func(...any) error, j *Journal) (Schedule, error) {
+	var (
+		s          Schedule
+		wakeAt     sql.NullString
+		signalName sql.NullString
+		token      any
+		payload    any
+		fired      any
+		createdAt  sql.NullString
+	)
+	if err := scan(&s.ID, &s.RunID, &s.StepName, &s.Kind, &wakeAt, &signalName, &token, &payload, &fired, &createdAt); err != nil {
+		return Schedule{}, err
+	}
+	if wakeAt.Valid {
+		t, err := j.parseTime(wakeAt.String)
+		if err != nil {
+			return Schedule{}, fmt.Errorf("journal: parse wake_at: %w", err)
+		}
+		s.WakeAt = t
+	}
+	if signalName.Valid {
+		s.SignalName = signalName.String
+	}
+	s.SignalTokenPresent = parseBool(token)
+	s.SignalPayloadPresent = parseBool(payload)
+	s.Fired = parseBool(fired)
+	if createdAt.Valid {
+		if t, err := j.parseTime(createdAt.String); err == nil {
 			s.CreatedAt = t
 		}
 	}
@@ -574,33 +987,58 @@ func NewSignalToken() (string, error) {
 func (j *Journal) fairDueScheduleQuery() string {
 	falseLit := "false"
 	trueLit := "true"
+	validWake := ""
+	wakeOrder := "s.wake_at"
+	wakeDue := "s.wake_at <= $2"
 	if j.engine == EngineSQLite {
 		falseLit = "0"
 		trueLit = "1"
+		// SQLite stores wake_at as text. An imported/legacy malformed value
+		// can sort before every real timestamp, then occupy both a tenant's
+		// first rank and the batch LIMIT forever. Require the RFC3339 shape
+		// accepted by parseTime and an in-range date before ranking. SQLite's
+		// julianday alone accepts date-only strings that parseTime rejects.
+		// PostgreSQL uses TIMESTAMPTZ and cannot store malformed values.
+		validWake = ` AND substr(s.wake_at, 11, 1) = 'T'
+			AND (substr(s.wake_at, -1, 1) = 'Z' OR substr(s.wake_at, -6, 1) IN ('+', '-'))
+			AND julianday(s.wake_at) IS NOT NULL`
+		// The accepted RFC3339 offset form is a real instant, but TEXT
+		// comparison sorts by its displayed wall clock. Normalize both due
+		// admission and tenant-fair order to instants; otherwise a future
+		// -01:00 wake runs early while an already-due +02:00 wake is delayed.
+		wakeOrder = "julianday(s.wake_at)"
+		wakeDue = "julianday(s.wake_at) <= julianday($2)"
 	}
 	return `WITH running AS (
 		SELECT tenant_id, COUNT(*) AS n FROM runs WHERE status = 'running' GROUP BY tenant_id
 	),
 	ranked AS (
 		SELECT s.id, s.run_id, s.step_name, s.kind, s.wake_at, s.signal_name,
-			s.signal_token, s.signal_payload, s.fired, s.created_at, r.tenant_id,
-			ROW_NUMBER() OVER (PARTITION BY r.tenant_id ORDER BY s.wake_at, s.id) AS rn
+			s.signal_token, s.signal_payload, s.fired, s.created_at,
+			s.signal_crypto_version, s.signal_token_ciphertext, s.signal_token_sha256,
+			s.signal_token_plaintext_bytes, s.signal_payload_plaintext_bytes, s.seq,
+			r.tenant_id,
+			` + wakeOrder + ` AS wake_order,
+			ROW_NUMBER() OVER (PARTITION BY r.tenant_id ORDER BY ` + wakeOrder + `, s.id) AS rn
 		FROM schedules s
 		JOIN runs r ON r.id = s.run_id
 		JOIN workflows w ON w.id = r.workflow_id
-		WHERE s.fired = $1 AND s.wake_at IS NOT NULL AND s.wake_at <= $2
+		WHERE s.fired = $1 AND s.wake_at IS NOT NULL AND ` + wakeDue + validWake + `
 			AND r.status = 'suspended'
 			AND w.enabled = ` + trueLit + `
 	)
 	SELECT k.id, k.run_id, k.step_name, k.kind, k.wake_at, k.signal_name,
-		k.signal_token, k.signal_payload, k.fired, k.created_at
+		k.signal_token, k.signal_payload, k.fired, k.created_at,
+		k.signal_crypto_version, k.signal_token_ciphertext, k.signal_token_sha256,
+		k.signal_token_plaintext_bytes, k.signal_payload_plaintext_bytes, k.seq,
+		k.tenant_id
 	FROM ranked k
 	LEFT JOIN tenants t ON t.tenant_id = k.tenant_id
 	LEFT JOIN running ru ON ru.tenant_id = k.tenant_id
 	WHERE (t.disabled IS NULL OR t.disabled = ` + falseLit + `)
 		AND (t.max_concurrent_runs IS NULL OR t.max_concurrent_runs <= 0
 			OR k.rn <= t.max_concurrent_runs - COALESCE(ru.n, 0))
-	ORDER BY k.rn, k.wake_at, k.id
+	ORDER BY k.rn, k.wake_order, k.id
 	LIMIT $3`
 }
 
@@ -656,10 +1094,16 @@ func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID str
 
 	// Serialize authorization on the parent run before resolving a nullable
 	// legacy item. ClaimStepAttemptSeq uses the same lock, so the identity we
-	// promote cannot change between proof and the run-state CAS.
-	var runStatus string
+	// promote cannot change between proof and the run-state CAS. The run lock
+	// deliberately comes first: the PostgreSQL queue claimant locks runs then
+	// their joined workflows, and retaining that order avoids a retry/claim
+	// deadlock while the workflow enabled check is added below.
+	var (
+		workflowID string
+		runStatus  string
+	)
 	if j.engine == EnginePostgres {
-		if err := tx.QueryRowContext(ctx, j.bind(`SELECT status FROM runs WHERE id = $1 FOR UPDATE`), runID).Scan(&runStatus); err != nil {
+		if err := tx.QueryRowContext(ctx, j.bind(`SELECT workflow_id, status FROM runs WHERE id = $1 FOR UPDATE`), runID).Scan(&workflowID, &runStatus); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return false, ErrNotFound
 			}
@@ -673,7 +1117,7 @@ func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID str
 		if n, _ := res.RowsAffected(); n != 1 {
 			return false, ErrNotFound
 		}
-		if err := tx.QueryRowContext(ctx, j.bind(`SELECT status FROM runs WHERE id = $1`), runID).Scan(&runStatus); err != nil {
+		if err := tx.QueryRowContext(ctx, j.bind(`SELECT workflow_id, status FROM runs WHERE id = $1`), runID).Scan(&workflowID, &runStatus); err != nil {
 			return false, fmt.Errorf("journal: read dead-letter retry run: %w", err)
 		}
 	}
@@ -683,20 +1127,27 @@ func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID str
 		}
 		return false, nil
 	}
+	if err := j.lockWorkflowTx(ctx, tx, workflowID); err != nil {
+		return false, fmt.Errorf("journal: lock dead-letter retry workflow: %w", err)
+	}
+	if err := j.requireEnabledWorkflowTx(ctx, tx, workflowID); err != nil {
+		return false, err
+	}
 
 	var (
-		currentDLQID string
-		stepName     string
-		stepSeq      sql.NullInt64
-		stepAttempt  sql.NullInt64
+		currentDLQID   string
+		stepName       string
+		stepSeq        sql.NullInt64
+		stepAttempt    sql.NullInt64
+		payloadVersion int
 	)
-	currentDLQ := `SELECT id, step_name, step_seq, step_attempt FROM dead_letter
+	currentDLQ := `SELECT id, step_name, step_seq, step_attempt, payload_crypto_version FROM dead_letter
 		WHERE run_id = $1
 		ORDER BY CASE WHEN failure_order IS NULL THEN 1 ELSE 0 END, failure_order DESC, moved_at DESC, id DESC LIMIT 1`
 	if j.engine == EnginePostgres {
 		currentDLQ += ` FOR UPDATE`
 	}
-	if err := tx.QueryRowContext(ctx, j.bind(currentDLQ), runID).Scan(&currentDLQID, &stepName, &stepSeq, &stepAttempt); err != nil {
+	if err := tx.QueryRowContext(ctx, j.bind(currentDLQ), runID).Scan(&currentDLQID, &stepName, &stepSeq, &stepAttempt, &payloadVersion); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		}
@@ -704,6 +1155,21 @@ func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID str
 	}
 	if currentDLQID != dlqID {
 		return false, ErrDeadLetterNotCurrent
+	}
+	if payloadVersion != 0 && payloadVersion != 1 {
+		return false, payloadcrypto.ErrInvalidEnvelope
+	}
+	var authenticated DeadLetterItem
+	if payloadVersion == 1 {
+		// Redrive is an execution-authority boundary. A metadata-only MCP
+		// inventory intentionally omits these fields; authenticate them here
+		// before accepting the selected item or promoting a nullable identity.
+		q := j.deadLetterSelect(-1, -1) + ` FROM dead_letter d JOIN runs r ON r.id = d.run_id
+			WHERE d.id = $1 AND d.run_id = $2`
+		authenticated, err = scanDeadLetter(tx.QueryRowContext(ctx, j.bind(q), dlqID, runID).Scan, j)
+		if err != nil {
+			return false, fmt.Errorf("journal: authenticate dead-letter redrive: %w", err)
+		}
 	}
 
 	// A manual redrive owns a fresh bounded retry window, but it keeps the same
@@ -743,9 +1209,28 @@ func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID str
 		}
 		stepSeq = sql.NullInt64{Int64: matches[0][0], Valid: true}
 		stepAttempt = sql.NullInt64{Int64: matches[0][1], Valid: true}
-		const promote = `UPDATE dead_letter SET step_seq = $1, step_attempt = $2
-			WHERE id = $3 AND run_id = $4 AND (step_seq IS NULL OR step_attempt IS NULL)`
-		res, err := tx.ExecContext(ctx, j.bind(promote), stepSeq.Int64, stepAttempt.Int64, dlqID, runID)
+		var res sql.Result
+		if payloadVersion == 1 {
+			// A keyed legacy row authenticates its original nullable attempt.
+			// Promotion changes that identity, so re-seal under the proven exact
+			// attempt in the same transaction as the redrive authorization.
+			seq, attempt := stepSeq.Int64, int(stepAttempt.Int64)
+			sealed, sealErr := j.prepareDeadLetterPayload(ctx, tx, dlqID, runID, stepName,
+				&seq, &attempt, authenticated.FailureOrder, authenticated.ErrorText, authenticated.Payload)
+			if sealErr != nil {
+				return false, fmt.Errorf("journal: seal promoted dead-letter identity: %w", sealErr)
+			}
+			const promote = `UPDATE dead_letter SET step_seq = $1, step_attempt = $2,
+				error_text = $3, payload = $4, payload_crypto_version = $5,
+				error_plaintext_bytes = $6, payload_plaintext_bytes = $7
+				WHERE id = $8 AND run_id = $9 AND (step_seq IS NULL OR step_attempt IS NULL)`
+			res, err = tx.ExecContext(ctx, j.bind(promote), seq, attempt, sealed.errorText,
+				sealed.payload, sealed.version, sealed.errorBytes, sealed.payloadBytes, dlqID, runID)
+		} else {
+			const promote = `UPDATE dead_letter SET step_seq = $1, step_attempt = $2
+				WHERE id = $3 AND run_id = $4 AND (step_seq IS NULL OR step_attempt IS NULL)`
+			res, err = tx.ExecContext(ctx, j.bind(promote), stepSeq.Int64, stepAttempt.Int64, dlqID, runID)
+		}
 		if err != nil {
 			return false, fmt.Errorf("journal: promote legacy dead-letter identity: %w", err)
 		}
@@ -786,6 +1271,15 @@ func (j *Journal) startDeadLetterRetryItem(ctx context.Context, runID, dlqID str
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, fmt.Errorf("journal: locked dead-letter retry run changed concurrently")
+	}
+	// The retry reuses the run id but represents a new terminal side-effect
+	// generation. Reset the old receipt atomically so a later terminal outcome
+	// is not swallowed by the prior delivered row.
+	if _, err := tx.ExecContext(ctx, j.bind(`INSERT INTO terminal_effects (run_id, status, attempts, claimed_at, delivered_at, last_error, created_at)
+		VALUES ($1, $2, 0, NULL, NULL, NULL, $3)
+		ON CONFLICT (run_id) DO UPDATE SET status = excluded.status, attempts = 0,
+		claimed_at = NULL, claim_token = NULL, delivered_at = NULL, last_error = NULL, created_at = excluded.created_at`), runID, "failed_dlq", j.now()); err != nil {
+		return false, fmt.Errorf("journal: reset terminal effect for retry: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("journal: commit dead-letter retry: %w", err)

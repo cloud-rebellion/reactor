@@ -24,14 +24,16 @@ func NewSecret(plaintext []byte) *Secret {
 	return &Secret{value: cp}
 }
 
-// Reveal returns the underlying plaintext. This is the only path to it;
-// every other method redacts. Greppable and easy to ban from non-runtime
-// packages via build-tag-controlled lint rules.
+// Reveal returns a defensive copy of the plaintext. This is the only path to
+// it; every other method redacts. Returning a copy keeps workflow code from
+// mutating the cached value that other concurrent runs may use, while still
+// making the deliberate runtime escape greppable and easy to ban from
+// non-runtime packages via build-tag-controlled lint rules.
 func (s *Secret) Reveal() []byte {
 	if s == nil {
 		return nil
 	}
-	return s.value
+	return append([]byte(nil), s.value...)
 }
 
 // Fingerprint returns the first 8 bytes of SHA-256(value), hex-encoded.

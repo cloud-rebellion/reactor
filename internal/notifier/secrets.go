@@ -22,16 +22,31 @@ import (
 //
 // A config with no credential reference is returned unchanged. An
 // unresolvable reference returns an error so the caller can fail closed.
-func resolveChannelSecrets(ctx context.Context, kind string, cfg json.RawMessage, resolve func(ctx context.Context, credentialID string) (string, error)) (json.RawMessage, error) {
+func resolveChannelSecrets(ctx context.Context, tenantID, kind string, cfg json.RawMessage, resolve func(ctx context.Context, tenantID, credentialID string) (string, error)) (json.RawMessage, error) {
 	var m map[string]any
 	if err := json.Unmarshal(cfg, &m); err != nil {
 		return cfg, fmt.Errorf("notifier: parse channel config: %w", err)
 	}
+	resolveCredential := func(id string) (string, error) {
+		if resolve == nil {
+			return "", fmt.Errorf("vault resolver unavailable")
+		}
+		return resolve(ctx, tenantID, id)
+	}
 	changed := false
 	switch kind {
+	case journal.ChannelKindSlackWebhook:
+		if id, _ := m["url_credential_id"].(string); id != "" {
+			v, err := resolveCredential(id)
+			if err != nil {
+				return cfg, fmt.Errorf("notifier: resolve slack webhook credential %q: %w", id, err)
+			}
+			m["url"] = v
+			changed = true
+		}
 	case journal.ChannelKindEmailSMTP:
 		if id, _ := m["password_credential_id"].(string); id != "" {
-			v, err := resolve(ctx, id)
+			v, err := resolveCredential(id)
 			if err != nil {
 				return cfg, fmt.Errorf("notifier: resolve smtp password credential %q: %w", id, err)
 			}
@@ -44,7 +59,7 @@ func resolveChannelSecrets(ctx context.Context, kind string, cfg json.RawMessage
 			if name == "" {
 				return cfg, fmt.Errorf("notifier: header_credential_id set but header_name is empty")
 			}
-			v, err := resolve(ctx, id)
+			v, err := resolveCredential(id)
 			if err != nil {
 				return cfg, fmt.Errorf("notifier: resolve webhook header credential %q: %w", id, err)
 			}

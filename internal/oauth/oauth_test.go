@@ -3,6 +3,8 @@ package oauth
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -188,5 +190,112 @@ func TestProviderRequiresSecureURL(t *testing.T) {
 	}, "")
 	if err == nil {
 		t.Fatal("expected non-loopback http auth_url to be rejected")
+	}
+}
+
+func TestStartAuthRejectsUnsafeRedirectURI(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.UpsertProvider(ctx, Provider{
+		ProviderID: "provider", Name: "Provider", AuthURL: "https://accounts.example/authorize",
+		TokenURL: "https://accounts.example/token", ClientID: "client", Enabled: true,
+	}, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	for _, redirect := range []string{
+		"",
+		"https://user:pass@reactor.example/oauth/callback",
+		"https://reactor.example/oauth/callback?state=caller",
+	} {
+		if _, err := st.StartAuth(ctx, "acme", "provider", "Account", redirect, "actor"); err == nil {
+			t.Fatalf("StartAuth(%q) succeeded; want unsafe redirect refusal", redirect)
+		}
+	}
+}
+
+func TestListConnectionsPageBoundsAndFiltersInSQL(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	ctx := context.Background()
+	for _, providerID := range []string{"alpha", "beta"} {
+		if err := st.UpsertProvider(ctx, Provider{
+			ProviderID: providerID, Name: providerID, AuthURL: "https://accounts.example/authorize",
+			TokenURL: "https://accounts.example/token", Enabled: true,
+		}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, row := range []struct {
+		id, tenant, provider, name string
+	}{
+		{"conn-a1", "acme", "alpha", "A1"},
+		{"conn-a2", "acme", "alpha", "A2"},
+		{"conn-b1", "acme", "beta", "B1"},
+		{"conn-other", "other", "alpha", "Other"},
+	} {
+		_, err := st.db.ExecContext(ctx, st.bind(`INSERT INTO oauth_connections
+			(id, tenant_id, provider_id, name, token_encrypted, scopes, status, created_by)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
+			row.id, row.tenant, row.provider, row.name, []byte(fmt.Sprintf("opaque-%d", i)), "openid", "connected", "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, more, err := st.ListConnectionsPage(ctx, "acme", "alpha", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].ID != "conn-a1" || !more {
+		t.Fatalf("first page = %+v, more=%v", page, more)
+	}
+	page, more, err = st.ListConnectionsPage(ctx, "acme", "alpha", 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].ID != "conn-a2" || more {
+		t.Fatalf("second page = %+v, more=%v", page, more)
+	}
+	page, more, err = st.ListConnectionsPage(ctx, "acme", "beta", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].ID != "conn-b1" || more {
+		t.Fatalf("provider page = %+v, more=%v", page, more)
+	}
+	if _, _, err := st.ListConnectionsPage(ctx, "acme", "", 501, 0); err == nil {
+		t.Fatal("expected oversized connection page to be rejected")
+	}
+}
+
+func TestDeleteConnectionIsTenantScopedAndReportsMissing(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.UpsertProvider(ctx, Provider{
+		ProviderID: "provider", Name: "Provider", AuthURL: "https://accounts.example/authorize",
+		TokenURL: "https://accounts.example/token", Enabled: true,
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, err := st.db.ExecContext(ctx, st.bind(`INSERT INTO oauth_connections
+		(id, tenant_id, provider_id, name, token_encrypted, scopes, status, created_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
+		"conn-delete", "acme", "provider", "Account", []byte("encrypted"), "openid", "connected", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteConnection(ctx, "conn-delete", "other"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant delete error = %v, want ErrNotFound", err)
+	}
+	if got, err := st.ListConnections(ctx, "acme"); err != nil || len(got) != 1 {
+		t.Fatalf("cross-tenant delete changed owner row: got=%d err=%v", len(got), err)
+	}
+	if err := st.DeleteConnection(ctx, "conn-delete", "acme"); err != nil {
+		t.Fatalf("owner delete: %v", err)
+	}
+	if err := st.DeleteConnection(ctx, "conn-delete", "acme"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("repeat delete error = %v, want ErrNotFound", err)
 	}
 }

@@ -1,6 +1,8 @@
-// Package registry resolves a workflow slug to the compiled binary the
-// supervisor exec's. Production deployments store binaries under
-// <root>/<slug>/workflow; tests inject a fake.
+// Package registry resolves a workflow slug and tenant to the compiled binary
+// the supervisor exec's. Production deployments retain the legacy
+// <root>/<slug>/workflow layout for an existing owner and use a hashed
+// <root>/tenants/<tenant-hash>/<slug>/workflow namespace for same-slug
+// workflows in other tenants; tests inject a fake.
 //
 // Convention is simple by design: one directory per workflow, the
 // binary always named "workflow". This matches the codegen
@@ -10,18 +12,33 @@
 package registry
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
-	artifactDirName       = "artifacts"
-	buildArtifactFileName = "candidate.sha256"
+	artifactDirName        = "artifacts"
+	buildArtifactFileName  = "candidate.sha256"
+	tenantOwnerFileName    = ".tenant-owner"
+	tenantNamespaceDirName = "tenants"
+	maxTenantOwnerBytes    = 256
 )
+
+// ErrTenantOwnerMissing means the executable slug namespace has not been
+// claimed by an authoring path yet. An unclaimed namespace must not be adopted
+// by an import merely because a digest happens to exist under the slug.
+var ErrTenantOwnerMissing = errors.New("registry: tenant owner manifest missing")
 
 // Artifact is an immutable, content-addressed workflow executable. Digest is
 // the lowercase SHA-256 of the exact bytes at Path.
@@ -40,18 +57,259 @@ func New(root string) *FileRegistry {
 	return &FileRegistry{Root: root}
 }
 
+// ScopedWorkflowDir returns the tenant-isolated namespace used when two
+// tenants use the same workflow slug. Tenant IDs are encoded as a SHA-256
+// directory component instead of being used as a path directly: tenant IDs
+// are database data and may contain path separators or other characters that
+// must never influence filesystem traversal. The namespace still carries a
+// .tenant-owner manifest, so a hash collision or a copied directory fails
+// closed rather than silently becoming executable under another tenant.
+func (r *FileRegistry) ScopedWorkflowDir(slug, tenant string) (string, error) {
+	if !safeSlug(slug) {
+		return "", fmt.Errorf("registry: invalid slug")
+	}
+	tenant, err := normalizeTenant(tenant)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(tenant))
+	return filepath.Join(r.Root, tenantNamespaceDirName, hex.EncodeToString(sum[:]), slug), nil
+}
+
+// EnsureScopedTenant creates and immutably claims a tenant-isolated workflow
+// namespace. It is used by authoring paths when a shared legacy slug
+// directory is already owned by another tenant. Callers should hold
+// AcquireSlugLock while invoking it.
+func (r *FileRegistry) EnsureScopedTenant(slug, tenant string) (string, error) {
+	dir, err := r.ScopedWorkflowDir(slug, tenant)
+	if err != nil {
+		return "", err
+	}
+	if err := r.claimTenantAt(dir, tenant); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// EnsureTenant binds a slug's mutable executable namespace to one tenant.
+//
+// The journal permits the same slug in multiple tenants, while the current
+// node-local artifact layout has one directory per slug. The owner manifest is
+// deliberately separate from candidate.sha256 and the immutable digest tree:
+// changing a candidate or activating a reviewed digest can never change the
+// tenant that owns the namespace. Callers should hold AcquireSlugLock while
+// invoking this method. When allowLegacy is true, an existing database row
+// for the requested tenant is an explicit migration proof that permits adding
+// the manifest to a pre-manifest installation. With no such proof, a
+// pre-existing unclaimed directory is rejected rather than adopting stale
+// executable bytes.
+func (r *FileRegistry) EnsureTenant(slug, tenant string, allowLegacy bool) error {
+	tenant, err := normalizeTenant(tenant)
+	if err != nil {
+		return err
+	}
+	owner, err := r.TenantOwner(slug)
+	if err == nil {
+		if owner != tenant {
+			return fmt.Errorf("registry: slug %q is owned by tenant %q, not %q", slug, owner, tenant)
+		}
+		return nil
+	}
+	if !errors.Is(err, ErrTenantOwnerMissing) {
+		return err
+	}
+	if !allowLegacy {
+		dir := filepath.Join(r.Root, slug)
+		if info, statErr := os.Stat(dir); statErr == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("registry: slug namespace %q is not a directory", slug)
+			}
+			entries, readErr := os.ReadDir(dir)
+			if readErr != nil {
+				return fmt.Errorf("registry: inspect unclaimed slug namespace: %w", readErr)
+			}
+			if len(entries) > 0 {
+				return fmt.Errorf("registry: slug %q has executable state but no tenant owner manifest; explicit adoption is required", slug)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("registry: inspect slug namespace: %w", statErr)
+		}
+	}
+	return r.ClaimTenant(slug, tenant)
+}
+
+// ClaimTenant atomically creates the immutable tenant-owner manifest for a
+// slug, or verifies the existing manifest. It never overwrites an owner. This
+// is kept separate from PublishArtifact because content-addressed bytes do
+// not carry tenant identity and must not be used to infer it.
+func (r *FileRegistry) ClaimTenant(slug, tenant string) error {
+	if !safeSlug(slug) {
+		return fmt.Errorf("registry: invalid slug")
+	}
+	tenant, err := normalizeTenant(tenant)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(r.Root, slug)
+	return r.claimTenantAt(dir, tenant)
+}
+
+// TenantOwner reads the immutable tenant-owner manifest for a slug.
+func (r *FileRegistry) TenantOwner(slug string) (string, error) {
+	if !safeSlug(slug) {
+		return "", fmt.Errorf("registry: invalid slug")
+	}
+	return r.tenantOwnerAt(filepath.Join(r.Root, slug))
+}
+
+func (r *FileRegistry) tenantOwnerAt(dir string) (string, error) {
+	path := filepath.Join(dir, tenantOwnerFileName)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", ErrTenantOwnerMissing
+	}
+	if err != nil {
+		return "", fmt.Errorf("registry: stat tenant owner manifest: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 2 || info.Size() > maxTenantOwnerBytes {
+		return "", fmt.Errorf("registry: invalid tenant owner manifest")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("registry: read tenant owner manifest: %w", err)
+	}
+	if len(raw) < 2 || len(raw) > maxTenantOwnerBytes || raw[len(raw)-1] != '\n' {
+		return "", fmt.Errorf("registry: invalid tenant owner manifest")
+	}
+	owner, err := normalizeTenant(string(raw[:len(raw)-1]))
+	if err != nil {
+		return "", fmt.Errorf("registry: invalid tenant owner manifest: %w", err)
+	}
+	return owner, nil
+}
+
+// claimTenantAt creates or verifies the immutable owner manifest for an
+// already validated namespace directory. The same helper is used by the
+// legacy slug directory and the hashed tenant-isolated namespace so both
+// layouts have identical fail-closed owner semantics.
+func (r *FileRegistry) claimTenantAt(dir, tenant string) error {
+	tenant, err := normalizeTenant(tenant)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("registry: create tenant namespace: %w", err)
+	}
+	path := filepath.Join(dir, tenantOwnerFileName)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		ok := false
+		defer func() {
+			_ = f.Close()
+			if !ok {
+				_ = os.Remove(path)
+			}
+		}()
+		if _, err := io.WriteString(f, tenant+"\n"); err != nil {
+			return fmt.Errorf("registry: write tenant owner manifest: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("registry: sync tenant owner manifest: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("registry: close tenant owner manifest: %w", err)
+		}
+		if err := syncDirHierarchy(dir, filepath.Dir(r.Root)); err != nil {
+			return err
+		}
+		ok = true
+		return nil
+	}
+	if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("registry: create tenant owner manifest: %w", err)
+	}
+	owner, err := r.tenantOwnerAt(dir)
+	if err != nil {
+		return err
+	}
+	if owner != tenant {
+		return fmt.Errorf("registry: tenant namespace is owned by tenant %q, not %q", owner, tenant)
+	}
+	return nil
+}
+
+func normalizeTenant(tenant string) (string, error) {
+	tenant = strings.TrimSpace(tenant)
+	if tenant == "" || len(tenant) >= maxTenantOwnerBytes || strings.ContainsAny(tenant, "\r\n") {
+		return "", fmt.Errorf("registry: invalid tenant owner")
+	}
+	return tenant, nil
+}
+
+// AcquireSlugLock serializes every publisher that shares a node-local slug
+// namespace. The lock is an advisory flock on a stable file, so it is shared
+// by separate Reactor processes (CLI + daemon) and released by the kernel if a
+// process crashes. Callers must invoke the returned release function.
+//
+// The lock file itself is intentionally retained under .locks; its inode is
+// stable across acquisitions, which avoids the unlink/recreate race where two
+// processes can each believe they own a lock for the same slug.
+func (r *FileRegistry) AcquireSlugLock(ctx context.Context, slug string) (func(), error) {
+	if !safeSlug(slug) {
+		return nil, fmt.Errorf("registry: invalid slug")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lockDir := filepath.Join(r.Root, ".locks")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return nil, fmt.Errorf("registry: create slug lock directory: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(lockDir, slug+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("registry: open slug lock: %w", err)
+	}
+	for {
+		err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+				_ = f.Close()
+			}, nil
+		}
+		if err != unix.EWOULDBLOCK && err != unix.EAGAIN {
+			_ = f.Close()
+			return nil, fmt.Errorf("registry: acquire slug lock: %w", err)
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			_ = f.Close()
+			return nil, fmt.Errorf("registry: acquire slug lock: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
 // BinaryPath implements dispatcher.BinaryLookup. Returns an error if
 // the binary doesn't exist or isn't executable.
 func (r *FileRegistry) BinaryPath(slug string) (string, error) {
 	if slug == "" {
 		return "", fmt.Errorf("registry: empty slug")
 	}
-	path := filepath.Join(r.Root, slug, "workflow")
-	info, err := os.Stat(path)
+	return r.binaryPathInDir(filepath.Join(r.Root, slug), slug)
+}
+
+func (r *FileRegistry) binaryPathInDir(dir, label string) (string, error) {
+	path := filepath.Join(dir, "workflow")
+	info, err := os.Lstat(path)
 	if err != nil {
-		return "", fmt.Errorf("registry: stat %s: %w", path, err)
+		return "", fmt.Errorf("registry: stat %s: %w", label, err)
 	}
-	if info.IsDir() {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("registry: %s is a directory", path)
 	}
 	if info.Mode()&0o111 == 0 {
@@ -67,6 +325,23 @@ func (r *FileRegistry) PublishArtifact(slug, sourcePath string) (Artifact, error
 	if !safeSlug(slug) {
 		return Artifact{}, fmt.Errorf("registry: invalid slug")
 	}
+	return r.publishArtifactInDir(filepath.Join(r.Root, slug), sourcePath)
+}
+
+// PublishArtifactForTenant publishes into the hashed tenant-isolated
+// namespace. It is the authoring primitive for a tenant whose slug collides
+// with a legacy/shared namespace owned by another tenant. Callers that already
+// resolved a legacy owner should continue to use PublishArtifact so existing
+// installations retain their on-disk layout.
+func (r *FileRegistry) PublishArtifactForTenant(slug, sourcePath, tenant string) (Artifact, error) {
+	dir, err := r.EnsureScopedTenant(slug, tenant)
+	if err != nil {
+		return Artifact{}, err
+	}
+	return r.publishArtifactInDir(dir, sourcePath)
+}
+
+func (r *FileRegistry) publishArtifactInDir(dir, sourcePath string) (Artifact, error) {
 	srcInfo, err := os.Lstat(sourcePath)
 	if err != nil {
 		return Artifact{}, fmt.Errorf("registry: stat artifact source: %w", err)
@@ -80,7 +355,7 @@ func (r *FileRegistry) PublishArtifact(slug, sourcePath string) (Artifact, error
 	}
 	defer src.Close()
 
-	base := filepath.Join(r.Root, slug, artifactDirName, "sha256")
+	base := filepath.Join(dir, artifactDirName, "sha256")
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return Artifact{}, fmt.Errorf("registry: create artifact root: %w", err)
 	}
@@ -123,7 +398,7 @@ func (r *FileRegistry) PublishArtifact(slug, sourcePath string) (Artifact, error
 		if !os.IsExist(err) {
 			return Artifact{}, fmt.Errorf("registry: publish artifact: %w", err)
 		}
-		if _, verifyErr := r.ArtifactPath(slug, digest); verifyErr != nil {
+		if _, verifyErr := r.artifactPathInDir(dir, digest); verifyErr != nil {
 			return Artifact{}, fmt.Errorf("registry: existing artifact verification failed: %w", verifyErr)
 		}
 	}
@@ -145,10 +420,14 @@ func (r *FileRegistry) ArtifactPath(slug, digest string) (string, error) {
 	if !safeSlug(slug) {
 		return "", fmt.Errorf("registry: invalid slug")
 	}
+	return r.artifactPathInDir(filepath.Join(r.Root, slug), digest)
+}
+
+func (r *FileRegistry) artifactPathInDir(dir, digest string) (string, error) {
 	if !validDigest(digest) {
 		return "", fmt.Errorf("registry: invalid artifact sha256")
 	}
-	path := filepath.Join(r.Root, slug, artifactDirName, "sha256", digest, "workflow")
+	path := filepath.Join(dir, artifactDirName, "sha256", digest, "workflow")
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", fmt.Errorf("registry: stat artifact %s: %w", path, err)
@@ -169,6 +448,57 @@ func (r *FileRegistry) ArtifactPath(slug, digest string) (string, error) {
 	return path, nil
 }
 
+// ArtifactPathForTenant resolves an immutable executable only when the
+// namespace owner manifest matches the workflow tenant. It first preserves the
+// original <root>/<slug> layout for installations with a matching owner, then
+// checks the hashed tenant-isolated layout used for same-slug workflows in
+// another tenant. ArtifactPath remains available for legacy in-process
+// fixtures and low-level maintenance, but all tenant-aware read and execution
+// paths should use this method. A missing owner manifest fails closed; a digest
+// alone never establishes tenant ownership.
+func (r *FileRegistry) ArtifactPathForTenant(slug, digest, tenant string) (string, error) {
+	tenant, err := normalizeTenant(tenant)
+	if err != nil {
+		return "", err
+	}
+	legacyDir := filepath.Join(r.Root, slug)
+	owner, ownerErr := r.TenantOwner(slug)
+	if ownerErr == nil && owner == tenant {
+		return r.artifactPathInDir(legacyDir, digest)
+	}
+	if ownerErr != nil && !errors.Is(ownerErr, ErrTenantOwnerMissing) {
+		return "", fmt.Errorf("registry: verify tenant owner for artifact: %w", ownerErr)
+	}
+
+	// A legacy owner belonging to another tenant does not make the digest
+	// invalid for this tenant; it selects the isolated namespace instead. The
+	// isolated owner manifest is still mandatory, so copying bytes into the
+	// hashed path without the claim cannot bypass the fence.
+	scopedDir, err := r.ScopedWorkflowDir(slug, tenant)
+	if err != nil {
+		return "", err
+	}
+	scopedOwner, scopedErr := r.tenantOwnerAt(scopedDir)
+	if scopedErr == nil && scopedOwner == tenant {
+		return r.artifactPathInDir(scopedDir, digest)
+	}
+	if scopedErr != nil && !errors.Is(scopedErr, ErrTenantOwnerMissing) {
+		return "", fmt.Errorf("registry: verify scoped tenant owner for artifact: %w", scopedErr)
+	}
+	if ownerErr == nil {
+		return "", fmt.Errorf("registry: artifact namespace %q is owned by tenant %q, not %q", slug, owner, tenant)
+	}
+	return "", fmt.Errorf("registry: verify tenant owner for artifact: %w", ErrTenantOwnerMissing)
+}
+
+// TenantArtifactPath is the dispatcher/scheduler callback shape: tenant first,
+// followed by the workflow slug and immutable digest. Keep this adapter next
+// to the canonical slug,digest,tenant method so assigning a method value to a
+// three-string callback cannot silently reorder the security-sensitive args.
+func (r *FileRegistry) TenantArtifactPath(tenant, slug, digest string) (string, error) {
+	return r.ArtifactPathForTenant(slug, digest, tenant)
+}
+
 // SetBuildArtifact atomically records the exact immutable executable produced
 // by the split `workflow build` command. Registration and replay testing read
 // this digest instead of re-hashing the mutable compatibility binary, so an
@@ -178,7 +508,23 @@ func (r *FileRegistry) SetBuildArtifact(slug, digest string) error {
 	if _, err := r.ArtifactPath(slug, digest); err != nil {
 		return err
 	}
-	dir := filepath.Join(r.Root, slug)
+	return r.setBuildArtifactInDir(filepath.Join(r.Root, slug), digest)
+}
+
+// SetBuildArtifactForTenant records a candidate in the isolated namespace.
+// The owner manifest is checked before the candidate pointer is written.
+func (r *FileRegistry) SetBuildArtifactForTenant(slug, digest, tenant string) error {
+	dir, err := r.EnsureScopedTenant(slug, tenant)
+	if err != nil {
+		return err
+	}
+	if _, err := r.artifactPathInDir(dir, digest); err != nil {
+		return err
+	}
+	return r.setBuildArtifactInDir(dir, digest)
+}
+
+func (r *FileRegistry) setBuildArtifactInDir(dir, digest string) error {
 	tmp, err := os.CreateTemp(dir, ".candidate-")
 	if err != nil {
 		return fmt.Errorf("registry: create candidate reference: %w", err)
@@ -213,7 +559,28 @@ func (r *FileRegistry) BuildArtifact(slug string) (Artifact, error) {
 	if !safeSlug(slug) {
 		return Artifact{}, fmt.Errorf("registry: invalid slug")
 	}
-	path := filepath.Join(r.Root, slug, buildArtifactFileName)
+	return r.buildArtifactInDir(filepath.Join(r.Root, slug))
+}
+
+// BuildArtifactForTenant reads the candidate from a tenant-isolated namespace.
+func (r *FileRegistry) BuildArtifactForTenant(slug, tenant string) (Artifact, error) {
+	dir, err := r.ScopedWorkflowDir(slug, tenant)
+	if err != nil {
+		return Artifact{}, err
+	}
+	owner, err := r.tenantOwnerAt(dir)
+	if err != nil {
+		return Artifact{}, fmt.Errorf("registry: verify tenant owner for candidate: %w", err)
+	}
+	normalized, _ := normalizeTenant(tenant)
+	if owner != normalized {
+		return Artifact{}, fmt.Errorf("registry: candidate namespace is owned by tenant %q, not %q", owner, normalized)
+	}
+	return r.buildArtifactInDir(dir)
+}
+
+func (r *FileRegistry) buildArtifactInDir(dir string) (Artifact, error) {
+	path := filepath.Join(dir, buildArtifactFileName)
 	info, err := os.Lstat(path)
 	if err != nil {
 		return Artifact{}, fmt.Errorf("registry: stat candidate reference: %w", err)
@@ -229,7 +596,7 @@ func (r *FileRegistry) BuildArtifact(slug string) (Artifact, error) {
 		return Artifact{}, fmt.Errorf("registry: invalid candidate reference")
 	}
 	digest := string(raw[:len(raw)-1])
-	artifactPath, err := r.ArtifactPath(slug, digest)
+	artifactPath, err := r.artifactPathInDir(dir, digest)
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -247,7 +614,24 @@ func (r *FileRegistry) ActivateArtifact(slug, digest string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(r.Root, slug)
+	return r.activateArtifactInDir(filepath.Join(r.Root, slug), artifactPath)
+}
+
+// ActivateArtifactForTenant refreshes the isolated compatibility binary after
+// a version row has passed its journal compare-and-swap fence.
+func (r *FileRegistry) ActivateArtifactForTenant(slug, digest, tenant string) (string, error) {
+	dir, err := r.EnsureScopedTenant(slug, tenant)
+	if err != nil {
+		return "", err
+	}
+	artifactPath, err := r.artifactPathInDir(dir, digest)
+	if err != nil {
+		return "", err
+	}
+	return r.activateArtifactInDir(dir, artifactPath)
+}
+
+func (r *FileRegistry) activateArtifactInDir(dir, artifactPath string) (string, error) {
 	tmp, err := os.CreateTemp(dir, ".activate-")
 	if err != nil {
 		return "", fmt.Errorf("registry: create activation stage: %w", err)
@@ -361,14 +745,99 @@ func (r *FileRegistry) List() ([]string, error) {
 		}
 		return nil, fmt.Errorf("registry: read dir: %w", err)
 	}
-	var out []string
+	seen := make(map[string]struct{})
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
+		if e.Name() == tenantNamespaceDirName || e.Name() == ".locks" {
+			continue
+		}
 		if _, err := r.BinaryPath(e.Name()); err == nil {
-			out = append(out, e.Name())
+			seen[e.Name()] = struct{}{}
 		}
 	}
+	// Include tenant-isolated namespaces in estate-wide status views. The
+	// hashed directory is an implementation detail; status exposes the journal
+	// slug, and the set naturally de-duplicates a slug shared by tenants.
+	scopedRoot := filepath.Join(r.Root, tenantNamespaceDirName)
+	hashEntries, hashErr := os.ReadDir(scopedRoot)
+	if hashErr != nil && !os.IsNotExist(hashErr) {
+		return nil, fmt.Errorf("registry: read tenant namespaces: %w", hashErr)
+	}
+	for _, hashEntry := range hashEntries {
+		if !hashEntry.IsDir() {
+			continue
+		}
+		slugEntries, readErr := os.ReadDir(filepath.Join(scopedRoot, hashEntry.Name()))
+		if readErr != nil {
+			return nil, fmt.Errorf("registry: read tenant workflow namespaces: %w", readErr)
+		}
+		for _, slugEntry := range slugEntries {
+			if !slugEntry.IsDir() {
+				continue
+			}
+			if _, pathErr := r.binaryPathInDir(filepath.Join(scopedRoot, hashEntry.Name(), slugEntry.Name()), slugEntry.Name()); pathErr == nil {
+				seen[slugEntry.Name()] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for slug := range seen {
+		out = append(out, slug)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// ListForTenant returns only executable workflow slugs whose owner manifest
+// matches tenant. It covers both legacy slug directories and hashed isolated
+// namespaces, so a member's dashboard cannot report another tenant's
+// executable as available merely because the slug is shared.
+func (r *FileRegistry) ListForTenant(tenant string) ([]string, error) {
+	tenant, err := normalizeTenant(tenant)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	entries, err := os.ReadDir(r.Root)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("registry: read dir: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == tenantNamespaceDirName || entry.Name() == ".locks" {
+			continue
+		}
+		owner, ownerErr := r.TenantOwner(entry.Name())
+		if ownerErr != nil || owner != tenant {
+			continue
+		}
+		if _, pathErr := r.binaryPathInDir(filepath.Join(r.Root, entry.Name()), entry.Name()); pathErr == nil {
+			seen[entry.Name()] = struct{}{}
+		}
+	}
+	sum := sha256.Sum256([]byte(tenant))
+	scopedRoot := filepath.Join(r.Root, tenantNamespaceDirName, hex.EncodeToString(sum[:]))
+	slugEntries, readErr := os.ReadDir(scopedRoot)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return nil, fmt.Errorf("registry: read tenant workflow namespaces: %w", readErr)
+	}
+	for _, entry := range slugEntries {
+		if !entry.IsDir() {
+			continue
+		}
+		owner, ownerErr := r.tenantOwnerAt(filepath.Join(scopedRoot, entry.Name()))
+		if ownerErr != nil || owner != tenant {
+			continue
+		}
+		if _, pathErr := r.binaryPathInDir(filepath.Join(scopedRoot, entry.Name()), entry.Name()); pathErr == nil {
+			seen[entry.Name()] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for slug := range seen {
+		out = append(out, slug)
+	}
+	sort.Strings(out)
 	return out, nil
 }

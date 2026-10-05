@@ -67,4 +67,9 @@ func TestRemoteSecretRedactsEverywhere(t *testing.T) {
 	if string(s.Reveal()) != plaintext {
 		t.Error("Reveal() should return the real value")
 	}
+	got := s.Reveal()
+	got[0] = 'X'
+	if string(s.Reveal()) != plaintext {
+		t.Errorf("mutating Reveal result changed cached remote secret: %q", s.Reveal())
+	}
 }

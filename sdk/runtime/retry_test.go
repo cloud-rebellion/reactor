@@ -6,6 +6,7 @@ import (
 	"time"
 
 	reactor "github.com/bright-interaction/reactor/sdk"
+	reactorhttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
 // TestRetryDecision pins the retry contract for the COMPILED-BINARY path, which
@@ -49,6 +50,22 @@ func TestRetryDecision(t *testing.T) {
 				t.Fatalf("retryDecision = %v, want %v", got, tc.wantRetry)
 			}
 		})
+	}
+}
+
+func TestRetryDecisionRespectsProviderWindow(t *testing.T) {
+	policy := reactor.ExpBackoff{Max: 3, Base: time.Millisecond, Cap: time.Millisecond}
+	short := errors.Join(errors.New("provider read"), &reactorhttp.Error{Status: 429, RetryAfter: 4 * time.Second})
+	delay, retry := retryDecision(policy, short, 1)
+	if !retry || delay != 4*time.Second {
+		t.Fatalf("short provider window = (%s, %t), want 4s retry", delay, retry)
+	}
+	long := &reactorhttp.Error{Status: 429, RetryAfter: 30 * time.Second, RetryAfterLong: true}
+	if delay, retry := retryDecision(policy, long, 1); retry || delay != 0 {
+		t.Fatalf("long provider window = (%s, %t), want terminal automatic retry", delay, retry)
+	}
+	if delay, retry := retryDecision(policy, reactor.Permanent(short), 1); retry || delay != 0 {
+		t.Fatalf("permanent provider error = (%s, %t), want no retry", delay, retry)
 	}
 }
 

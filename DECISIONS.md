@@ -36,15 +36,18 @@ deploy to Postgres from day one on the existing BI ops stack.
 
 ## Engine + sandbox
 
-1. **Go toolchain**: require system Go 1.22+ on `PATH`. README documents as a prerequisite.
-   Future: optionally vendor a Go toolchain inside the binary if community demand materialises.
+1. **Go toolchain**: require the pinned Go 1.26.5 toolchain on `PATH` for build-capable
+   deployments. The `go.mod` toolchain directive, container, and CI use this same version.
+   A future release may vendor a toolchain, but a daemon that cannot find `go` must keep
+   workflow authoring disabled and direct operators to the CLI build path.
 2. **Worker model**: in-process scheduler + N supervisor goroutines for v0. The `leases` table
    is in the schema from migration 1 so external workers can be added without a schema change.
-3. **Replay determinism**: `reactor lint` forbids `math/rand` and `time.Now`
-   outside `Step` closures. Temporal-strict by default. NOTE: it does NOT forbid
-   direct `net/http`, which this item originally also claimed; that part was
-   never implemented, so workflows have unrestricted egress (see
-   docs/security.md Layer 4).
+3. **Replay determinism and authoring boundary**: `reactor lint` forbids
+   `math/rand`, `time.Now`, direct `os`, and direct `net/http` imports outside
+   the Reactor SDK. Temporal-strict by default. Workflow `sdk/http` uses the
+   shared SSRF-safe transport by default; reviewed source may opt into private
+   networks explicitly, while public destination policy remains operator
+   responsibility (see docs/security.md Layer 4).
 
 ## Code generation + AI
 
@@ -54,7 +57,9 @@ deploy to Postgres from day one on the existing BI ops stack.
    the committer no-ops and `git log` is not an audit trail until an operator
    creates the repo themselves. STATUS: partially implemented.
    Opt-out via `REACTOR_GIT_BACKED=false` for low-disk installs.
-5. **Dry-run sandbox**: in-process for v0. Child process + seccomp before v1 GA.
+5. **Dry-run sandbox**: in-process for v0. Child workflows run as subprocesses
+   with resource limits; seccomp and stronger network isolation remain future
+   hardening before treating Reactor as a hostile-code sandbox.
 
 ## MCP Environment Lens
 
@@ -68,13 +73,10 @@ deploy to Postgres from day one on the existing BI ops stack.
 
 ## Vault
 
-9. **Master-key recovery format**: BIP39 24-word mnemonic. Adds `tyler-smith/go-bip39` (MIT).
-   STATUS: **NOT IMPLEMENTED.** The dependency was never added and no mnemonic is
-   ever generated or shown. `<state>/master.key` is the only copy of the key, so
-   an out-of-band backup is mandatory. This decision is recorded as still-open,
-   not as shipped behaviour; docs/security.md and docs/operations.md previously
-   described it as delivered.
-   Worth the dep; users actually write down the words.
+9. **Master-key recovery**: no recovery phrase is shipped in v0.1. `reactor init` writes
+   one random 32-byte key to `<state>/master.key`; operators must back it up out of band.
+   A future recovery format remains a product decision and must not be described as
+   available until it is implemented and tested.
 10. **Default dual-validity window**: 60s. Per-rotator overrides (AWS IAM 90s, Postal 30s).
     Workflow runtime exposes `Drain()` so scheduler can extend the window up to 5 min if
     active steps still hold the credential.

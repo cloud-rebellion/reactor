@@ -10,6 +10,20 @@ import (
 	"testing"
 )
 
+func TestOAuthHTTPClientBlocksTailscaleEvenWithPrivateAccess(t *testing.T) {
+	t.Parallel()
+
+	s := New(nil, EngineSQLite, make([]byte, 32))
+	transport, ok := s.http.Transport.(*http.Transport)
+	if !ok || transport.DialContext == nil {
+		t.Fatalf("oauth transport = %T, want safe http.Transport", s.http.Transport)
+	}
+	_, err := transport.DialContext(context.Background(), "tcp", "100.64.0.1:443")
+	if err == nil || !strings.Contains(err.Error(), "ssrf: refusing") {
+		t.Fatalf("Tailscale token endpoint dial error = %v, want SSRF refusal", err)
+	}
+}
+
 // TestTokenExchangeDoesNotFollowRedirects closes the pivot that made this an
 // SSRF primitive for a third party rather than only for an admin.
 //

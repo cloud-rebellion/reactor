@@ -6,6 +6,7 @@ package flarereport
 import (
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -68,13 +69,28 @@ func scrubEvent(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
 		event.Request.QueryString = ""
 		event.Request.Data = ""
 		event.Request.Cookies = ""
-		if event.Request.Headers != nil {
-			delete(event.Request.Headers, "Referer")
-			delete(event.Request.Headers, "Referrer")
+		for key := range event.Request.Headers {
+			// Header maps can come from sentry-go's canonical net/http path or
+			// from an integration that supplied a plain map. Compare folded
+			// names so lower-case "authorization" and "cookie" cannot bypass
+			// the scrub just because they were not canonicalised first.
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "authorization", "proxy-authorization", "cookie", "set-cookie",
+				"referer", "referrer", "x-api-key", "x-auth-token", "x-csrf-token",
+				"x-forwarded-for", "x-real-ip":
+				delete(event.Request.Headers, key)
+			}
 		}
 		// The URL itself can carry a token in the path on a future route; keep
-		// only scheme+host+path, never a fragment or query.
-		if i := strings.IndexAny(event.Request.URL, "?#"); i >= 0 {
+		// only scheme+host+path, never a fragment/query or userinfo. Parse
+		// first so a URL such as https://user:pass@example/path cannot leak
+		// credentials even though it has no query string.
+		if parsed, err := url.Parse(event.Request.URL); err == nil {
+			parsed.User = nil
+			parsed.RawQuery = ""
+			parsed.Fragment = ""
+			event.Request.URL = parsed.String()
+		} else if i := strings.IndexAny(event.Request.URL, "?#"); i >= 0 {
 			event.Request.URL = event.Request.URL[:i]
 		}
 	}

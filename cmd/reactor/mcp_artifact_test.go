@@ -16,6 +16,9 @@ func TestCreateMCPPinnedRunPersistsExactArtifact(t *testing.T) {
 	_, j := newSeededDB(t)
 	ctx := context.Background()
 	reg := registry.New(filepath.Join(t.TempDir(), "workflows"))
+	if err := reg.ClaimTenant("demo", journal.DefaultTenant); err != nil {
+		t.Fatal(err)
+	}
 	source := filepath.Join(t.TempDir(), "workflow")
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -60,6 +63,9 @@ func TestCreateMCPPinnedRunRejectsTamperedOrMissingArtifactWithoutRow(t *testing
 	_, j := newSeededDB(t)
 	ctx := context.Background()
 	reg := registry.New(filepath.Join(t.TempDir(), "workflows"))
+	if err := reg.ClaimTenant("demo", journal.DefaultTenant); err != nil {
+		t.Fatal(err)
+	}
 	source := filepath.Join(t.TempDir(), "workflow")
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -100,6 +106,9 @@ func TestCreateMCPQueuedPinnedRunForDistributedWorker(t *testing.T) {
 	_, j := newSeededDB(t)
 	ctx := context.Background()
 	reg := registry.New(filepath.Join(t.TempDir(), "workflows"))
+	if err := reg.ClaimTenant("demo", journal.DefaultTenant); err != nil {
+		t.Fatal(err)
+	}
 	source := filepath.Join(t.TempDir(), "workflow")
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)

@@ -11,6 +11,19 @@ import (
 // ErrNotFound is returned when a credential ID is not provisioned.
 var ErrNotFound = errors.New("vault: credential not found")
 
+// MaxSecretBytes bounds the plaintext held in the runtime credential path.
+// Vault values are injected into an isolated command environment and copied
+// for output redaction, so an unbounded value could turn one credential into a
+// memory and journal-redaction amplification vector. 64 KiB covers ordinary
+// API keys, certificates, and small credentials while keeping per-step copies
+// bounded (the command plan itself allows at most 32 references).
+const MaxSecretBytes = 64 << 10
+
+// ErrSecretTooLarge is returned before an oversized value is encrypted or
+// materialized. Existing oversized rows fail closed when first read so a
+// legacy value cannot bypass the bound.
+var ErrSecretTooLarge = errors.New("vault: credential value exceeds maximum size")
+
 // Backend persists encrypted blobs. Implementations live under
 // internal/vault/backend/ (sqlite, postgres). Week 2 ships an in-memory
 // backend; the SQL backends land alongside the rest of the vault schema
@@ -68,7 +81,10 @@ func (s *Store) Put(ctx context.Context, id string, plaintext []byte) error {
 	if id == "" {
 		return errors.New("secrets: id required")
 	}
-	blob, err := Encrypt(s.master, plaintext)
+	if len(plaintext) > MaxSecretBytes {
+		return ErrSecretTooLarge
+	}
+	blob, err := EncryptForID(s.master, id, plaintext)
 	if err != nil {
 		return err
 	}
@@ -151,25 +167,44 @@ func (s *Store) loadFromBackend(ctx context.Context, id string) (*Secret, error)
 	if err != nil {
 		return nil, err
 	}
-	plaintext, err := Decrypt(s.master, blob)
+	plaintext, err := DecryptForID(s.master, id, blob)
 	if err != nil {
 		// Rotation window: a blob still sealed under the previous master key
 		// decrypts with it; re-encrypt it under the current key on read
 		// (transparent re-encryption) so a master-key rotation migrates the
 		// vault lazily instead of leaving every secret undecryptable.
 		if len(s.previous) == keyLen {
-			if pt, pErr := Decrypt(s.previous, blob); pErr == nil {
-				if reblob, eErr := Encrypt(s.master, pt); eErr == nil {
+			if pt, pErr := DecryptForID(s.previous, id, blob); pErr == nil {
+				if len(pt) > MaxSecretBytes {
+					zero(pt)
+					return nil, ErrSecretTooLarge
+				}
+				if reblob, eErr := EncryptForID(s.master, id, pt); eErr == nil {
 					_ = s.backend.Put(ctx, id, reblob) // best-effort; retried next read
 				}
 				sec := NewSecret(pt)
+				zero(pt)
 				s.swap(id, sec)
 				return sec, nil
 			}
 		}
 		return nil, fmt.Errorf("secrets: decrypt %q: %w", id, err)
 	}
+	if len(plaintext) > MaxSecretBytes {
+		zero(plaintext)
+		return nil, ErrSecretTooLarge
+	}
+	// v1 blobs predate credential-bound associated data. Keep them readable for
+	// compatibility, but migrate them on first access so a later row swap is
+	// rejected by the v2 identity binding. A transient backend write failure is
+	// safe: the value is still returned and the next uncached read retries it.
+	if len(blob) > 0 && blob[0] == VersionV1 {
+		if reblob, reErr := EncryptForID(s.master, id, plaintext); reErr == nil {
+			_ = s.backend.Put(ctx, id, reblob)
+		}
+	}
 	sec := NewSecret(plaintext)
+	zero(plaintext)
 	s.swap(id, sec)
 	return sec, nil
 }

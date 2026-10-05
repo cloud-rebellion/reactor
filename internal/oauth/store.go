@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/bright-interaction/reactor/internal/safehttp"
@@ -68,9 +70,13 @@ type Connection struct {
 	Name       string
 	Scopes     string
 	Status     string
-	ExpiresAt  time.Time
-	CreatedBy  string
-	CreatedAt  time.Time
+	// TokenAccessMode is legacy_raw or broker_only. A broker-only connection
+	// needs a reviewed API policy before generic GETs can execute.
+	TokenAccessMode     string
+	BrokerPolicyVersion int64
+	ExpiresAt           time.Time
+	CreatedBy           string
+	CreatedAt           time.Time
 }
 
 // tokenBlob is the encrypted payload of a connection.
@@ -80,6 +86,12 @@ type tokenBlob struct {
 	TokenType    string    `json:"token_type,omitempty"`
 	Scope        string    `json:"scope,omitempty"`
 	Expiry       time.Time `json:"expiry,omitempty"`
+	// SalesforceAPIOrigin is provider-returned account metadata, not a URL
+	// supplied by an MCP caller or workflow. It stays in the encrypted blob.
+	SalesforceAPIOrigin string `json:"salesforce_api_origin,omitempty"`
+	// SalesforceOrgID comes from the provider's OAuth identity URL. The
+	// broker hashes this stable identity to share a budget across connections.
+	SalesforceOrgID string `json:"salesforce_org_id,omitempty"`
 }
 
 // Store persists providers + connections and runs the OAuth2 flow.
@@ -90,11 +102,23 @@ type Store struct {
 	http      *http.Client
 	now       func() time.Time
 
+	// SQLite is a single-process deployment. Its per-connection gates avoid
+	// duplicate rotating-token refreshes without holding the database writer
+	// lock across a provider request. Postgres uses an advisory transaction
+	// lock for the same fence across distributed workers.
+	refreshMu    sync.Mutex
+	refreshGates map[string]*refreshGate
+
 	// ProfileFor optionally returns per-provider OAuth quirks (token-exchange
 	// auth style, extra authorize params) so the generic flow can talk to
 	// providers that deviate from the plain spec. The daemon wires this to the
 	// service catalog; nil means the default behaviour (creds in the body).
 	ProfileFor func(providerID string) Profile
+}
+
+type refreshGate struct {
+	semaphore chan struct{}
+	users     int
 }
 
 // Profile holds the optional, provider-specific knobs the OAuth flow honours.
@@ -128,8 +152,8 @@ func New(db *sql.DB, engine Engine, masterKey []byte) *Store {
 		// metadata endpoint. allowPrivate is true because secureURL
 		// deliberately permits an http provider on loopback for self-hosted
 		// and local-dev setups; the metadata block holds either way.
-		http:      safehttp.Client(true),
-		now:       time.Now,
+		http: safehttp.Client(true),
+		now:  time.Now,
 	}
 }
 
@@ -211,6 +235,28 @@ func (s *Store) parseTime(v any) time.Time {
 	return time.Time{}
 }
 
+// providerSecretIdentity and connectionTokenIdentity are stable, non-secret
+// associated-data labels for encrypted OAuth rows. Length-prefixing each
+// field avoids delimiter ambiguity if an operator uses an unusual id/name.
+func providerSecretIdentity(providerID string) string {
+	return oauthCipherIdentity("provider-secret", providerID)
+}
+
+func connectionTokenIdentity(tenantID, providerID, name string) string {
+	return oauthCipherIdentity("connection-token", tenantID, providerID, name)
+}
+
+func oauthCipherIdentity(kind string, fields ...string) string {
+	var b strings.Builder
+	b.WriteString("reactor-oauth-v1\x00")
+	b.WriteString(kind)
+	for _, field := range fields {
+		fmt.Fprintf(&b, "\x00%d:", len(field))
+		b.WriteString(field)
+	}
+	return b.String()
+}
+
 func newID(prefix string) string {
 	b := make([]byte, 12)
 	if _, err := rand.Read(b); err != nil {
@@ -227,9 +273,16 @@ func (s *Store) UpsertProvider(ctx context.Context, p Provider, clientSecret str
 	if !secureURL(p.AuthURL) || !secureURL(p.TokenURL) {
 		return errors.New("oauth: auth_url and token_url must be https (or http on localhost)")
 	}
+	if p.ProviderID != "salesforce" &&
+		(isKnownSalesforceOAuthEndpoint(p.AuthURL) || isKnownSalesforceOAuthEndpoint(p.TokenURL)) {
+		return errors.New("oauth: Salesforce OAuth endpoints require the canonical salesforce provider id")
+	}
 	var enc []byte
 	if clientSecret != "" {
-		e, err := vault.Encrypt(s.masterKey, []byte(clientSecret))
+		if len(clientSecret) > vault.MaxSecretBytes {
+			return vault.ErrSecretTooLarge
+		}
+		e, err := vault.EncryptForID(s.masterKey, providerSecretIdentity(p.ProviderID), []byte(clientSecret))
 		if err != nil {
 			return fmt.Errorf("oauth: encrypt client secret: %w", err)
 		}
@@ -281,11 +334,27 @@ func (s *Store) GetProvider(ctx context.Context, id string) (Provider, error) {
 	p.Enabled = parseBool(enab)
 	p.HasSecret = len(enc) > 0
 	if len(enc) > 0 {
-		dec, derr := vault.Decrypt(s.masterKey, enc)
+		dec, derr := vault.DecryptForID(s.masterKey, providerSecretIdentity(id), enc)
 		if derr != nil {
 			return Provider{}, fmt.Errorf("oauth: decrypt client secret: %w", derr)
 		}
+		if len(dec) > vault.MaxSecretBytes {
+			for i := range dec {
+				dec[i] = 0
+			}
+			return Provider{}, vault.ErrSecretTooLarge
+		}
+		// v1 rows were encrypted without provider identity. Keep them readable
+		// during migration, then write the authenticated v2 form best-effort.
+		if enc[0] == vault.VersionV1 {
+			if migrated, mErr := vault.EncryptForID(s.masterKey, providerSecretIdentity(id), dec); mErr == nil {
+				_, _ = s.db.ExecContext(ctx, s.bind(`UPDATE oauth_providers SET client_secret_encrypted=$1, updated_at=$2 WHERE provider_id=$3`), migrated, s.nowVal(), id)
+			}
+		}
 		p.ClientSecret = string(dec)
+		for i := range dec {
+			dec[i] = 0
+		}
 	}
 	return p, nil
 }
@@ -326,14 +395,15 @@ func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 // ListConnections returns a tenant's connections (no tokens). Pass "" for all
 // (admin).
 func (s *Store) ListConnections(ctx context.Context, tenantID string) ([]Connection, error) {
-	q := `SELECT id, tenant_id, provider_id, name, scopes, status, expires_at, created_by, created_at
-		FROM oauth_connections`
+	q := `SELECT c.id, c.tenant_id, c.provider_id, c.name, c.scopes, c.status, c.token_access_mode,
+		COALESCE((SELECT version FROM oauth_api_policies p WHERE p.connection_id=c.id AND p.tenant_id=c.tenant_id),0),
+		c.expires_at, c.created_by, c.created_at FROM oauth_connections c`
 	var args []any
 	if tenantID != "" {
-		q += ` WHERE tenant_id = $1`
+		q += ` WHERE c.tenant_id = $1`
 		args = append(args, tenantID)
 	}
-	q += ` ORDER BY provider_id, name`
+	q += ` ORDER BY c.provider_id, c.name`
 	rows, err := s.db.QueryContext(ctx, s.bind(q), args...)
 	if err != nil {
 		return nil, wrap("list connections", err)
@@ -350,12 +420,67 @@ func (s *Store) ListConnections(ctx context.Context, tenantID string) ([]Connect
 	return out, rows.Err()
 }
 
+// ListConnectionsPage returns one bounded page of connections. The tenant and
+// optional provider filter are applied in SQL so callers do not have to load
+// the complete connection inventory before paging it. The extra row is used
+// only to report whether another page exists; connection tokens are never
+// selected by this query.
+func (s *Store) ListConnectionsPage(ctx context.Context, tenantID, providerID string, limit, offset int) ([]Connection, bool, error) {
+	if limit <= 0 || limit > 500 || offset < 0 || offset > 10000 {
+		return nil, false, errors.New("oauth: invalid connection page")
+	}
+	q := `SELECT c.id, c.tenant_id, c.provider_id, c.name, c.scopes, c.status, c.token_access_mode,
+		COALESCE((SELECT version FROM oauth_api_policies p WHERE p.connection_id=c.id AND p.tenant_id=c.tenant_id),0),
+		c.expires_at, c.created_by, c.created_at FROM oauth_connections c`
+	args := make([]any, 0, 4)
+	position := 1
+	where := make([]string, 0, 2)
+	if tenantID != "" {
+		where = append(where, fmt.Sprintf("c.tenant_id = $%d", position))
+		args = append(args, tenantID)
+		position++
+	}
+	if providerID != "" {
+		where = append(where, fmt.Sprintf("c.provider_id = $%d", position))
+		args = append(args, providerID)
+		position++
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += fmt.Sprintf(" ORDER BY c.provider_id, c.name, c.id LIMIT $%d OFFSET $%d", position, position+1)
+	args = append(args, limit+1, offset)
+	rows, err := s.db.QueryContext(ctx, s.bind(q), args...)
+	if err != nil {
+		return nil, false, wrap("list connection page", err)
+	}
+	defer rows.Close()
+	out := make([]Connection, 0, limit)
+	hasMore := false
+	for rows.Next() {
+		if len(out) == limit {
+			hasMore = true
+			break
+		}
+		c, scanErr := s.scanConn(rows)
+		if scanErr != nil {
+			return nil, false, scanErr
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return out, hasMore, nil
+}
+
 type rowScanner interface{ Scan(...any) error }
 
 func (s *Store) scanConn(r rowScanner) (Connection, error) {
 	var c Connection
 	var expires, created any
-	if err := r.Scan(&c.ID, &c.TenantID, &c.ProviderID, &c.Name, &c.Scopes, &c.Status, &expires, &c.CreatedBy, &created); err != nil {
+	if err := r.Scan(&c.ID, &c.TenantID, &c.ProviderID, &c.Name, &c.Scopes, &c.Status,
+		&c.TokenAccessMode, &c.BrokerPolicyVersion, &expires, &c.CreatedBy, &created); err != nil {
 		return Connection{}, err
 	}
 	c.ExpiresAt = s.parseTime(expires)
@@ -372,8 +497,33 @@ func (s *Store) DeleteConnection(ctx context.Context, id, tenantID string) error
 		q += ` AND tenant_id = $2`
 		args = append(args, tenantID)
 	}
-	_, err := s.db.ExecContext(ctx, s.bind(q), args...)
-	return wrap("delete connection", err)
+	res, err := s.db.ExecContext(ctx, s.bind(q), args...)
+	if err != nil {
+		return wrap("delete connection", err)
+	}
+	if affected, err := res.RowsAffected(); err != nil {
+		return wrap("delete connection", err)
+	} else if affected == 0 {
+		// Keep a foreign tenant indistinguishable from an unknown id. Callers
+		// can safely retry after re-reading their own inventory without learning
+		// whether another tenant owns the connection.
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ConnectionTenant returns the owner tenant for an admin-selected connection.
+// Approval handlers derive scope from this row, never from a posted tenant id.
+func (s *Store) ConnectionTenant(ctx context.Context, connectionID string) (string, error) {
+	if connectionID == "" {
+		return "", ErrNotFound
+	}
+	var tenantID string
+	err := s.db.QueryRowContext(ctx, s.bind(`SELECT tenant_id FROM oauth_connections WHERE id=$1`), connectionID).Scan(&tenantID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return tenantID, wrap("load connection tenant", err)
 }
 
 func wrap(op string, err error) error {
@@ -383,19 +533,54 @@ func wrap(op string, err error) error {
 	return fmt.Errorf("oauth: %s: %w", op, err)
 }
 
-func (s *Store) saveTokenBlob(tb tokenBlob) ([]byte, error) {
+func (s *Store) saveTokenBlob(identity string, tb tokenBlob) ([]byte, error) {
+	if tb.SalesforceAPIOrigin != "" {
+		origin, err := validateSalesforceAPIOrigin(tb.SalesforceAPIOrigin)
+		if err != nil {
+			return nil, err
+		}
+		tb.SalesforceAPIOrigin = origin
+	}
+	if tb.SalesforceOrgID != "" {
+		if !validSalesforceOrgID(tb.SalesforceOrgID) {
+			return nil, errors.New("oauth: invalid Salesforce organization identity")
+		}
+		// The provider can use either the 15- or 18-character representation.
+		// Store one canonical form so refresh comparisons keep the same bucket.
+		tb.SalesforceOrgID = tb.SalesforceOrgID[:15]
+	}
 	raw, err := json.Marshal(tb)
 	if err != nil {
 		return nil, err
 	}
-	return vault.Encrypt(s.masterKey, raw)
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+	return vault.EncryptForID(s.masterKey, identity, raw)
 }
 
-func (s *Store) loadTokenBlob(enc []byte) (tokenBlob, error) {
-	raw, err := vault.Decrypt(s.masterKey, enc)
+func (s *Store) loadTokenBlob(enc []byte, identity ...string) (tokenBlob, error) {
+	var (
+		raw []byte
+		err error
+	)
+	if len(enc) > 0 && enc[0] == vault.VersionV2 {
+		if len(identity) != 1 || identity[0] == "" {
+			return tokenBlob{}, errors.New("oauth: connection identity required for token blob")
+		}
+		raw, err = vault.DecryptForID(s.masterKey, identity[0], enc)
+	} else {
+		raw, err = vault.Decrypt(s.masterKey, enc)
+	}
 	if err != nil {
 		return tokenBlob{}, err
 	}
 	var tb tokenBlob
-	return tb, json.Unmarshal(raw, &tb)
+	err = json.Unmarshal(raw, &tb)
+	for i := range raw {
+		raw[i] = 0
+	}
+	return tb, err
 }

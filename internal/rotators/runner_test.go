@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,6 +86,7 @@ func TestRunnerEndToEndSharedSecret(t *testing.T) {
 	if err := repo.Create(ctx, credentials.CreateParams{
 		ID: "cred_app", Name: "app-shared-secret", Service: "internal",
 		Provider:             "shared-secret",
+		AllowLocalMint:       true,
 		AutoRotate:           true,
 		RotationIntervalDays: 1,
 		RotationTargets: []credentials.Target{
@@ -148,6 +150,50 @@ func TestRunnerEndToEndSharedSecret(t *testing.T) {
 	}
 }
 
+func TestRunnerLocalMintRequiresAcknowledgement(t *testing.T) {
+	t.Parallel()
+	repo, store, cleanup := newE2EEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := repo.Create(ctx, credentials.CreateParams{
+		ID: "cred_unack", Name: "unacknowledged", Service: "external", Provider: "shared-secret",
+		AutoRotate: true, RotationIntervalDays: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(ctx, "cred_unack", []byte("externally-issued")); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Repo: repo, Vault: store, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := runner.Tick(ctx); err != nil {
+		t.Fatalf("scheduler tick should record the refusal and continue: %v", err)
+	}
+	unchanged, err := store.Get(ctx, "cred_unack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(unchanged.Reveal()); got != "externally-issued" {
+		t.Fatalf("unacknowledged scheduled rotation changed the stored value to %q", got)
+	}
+	c, err := repo.Get(ctx, "cred_unack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(c.LastRotationError, "local_mint_ack_required") {
+		t.Fatalf("scheduler refusal did not record its policy error: %q", c.LastRotationError)
+	}
+	if err := runner.RotateOneWithLocalMintAck(ctx, "cred_unack", true); err != nil {
+		t.Fatalf("explicitly acknowledged local mint: %v", err)
+	}
+	rotated, err := store.Get(ctx, "cred_unack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(rotated.Reveal()); got == "externally-issued" || got == "" {
+		t.Fatalf("acknowledged rotation did not replace value: %q", got)
+	}
+}
+
 // TestRunnerDeliveryFailureStampsError verifies the runner logs each
 // failed target separately and stamps last_rotation_error so the CLI
 // surface shows "X of Y delivery target(s) failed".
@@ -173,7 +219,8 @@ func TestRunnerDeliveryFailureStampsError(t *testing.T) {
 
 	if err := repo.Create(ctx, credentials.CreateParams{
 		ID: "cred_app", Name: "app", Service: "internal", Provider: "shared-secret",
-		AutoRotate: true, RotationIntervalDays: 1,
+		AllowLocalMint: true,
+		AutoRotate:     true, RotationIntervalDays: 1,
 		RotationTargets: []credentials.Target{
 			{Kind: "webhook", URL: srv.URL, SecretID: "cred_hmac", KeyName: "K"},
 		},
@@ -259,7 +306,8 @@ func TestRunnerTickProcessesAllDue(t *testing.T) {
 		id := []string{"cred_a", "cred_b", "cred_c"}[i]
 		if err := repo.Create(ctx, credentials.CreateParams{
 			ID: id, Name: id, Service: "x", Provider: "shared-secret",
-			AutoRotate: true, RotationIntervalDays: 1,
+			AllowLocalMint: true,
+			AutoRotate:     true, RotationIntervalDays: 1,
 		}); err != nil {
 			t.Fatal(err)
 		}

@@ -77,3 +77,37 @@ func TestChainTriggerRejectsUnknownSource(t *testing.T) {
 		t.Fatalf("status = %d, want 404\n%s", resp.StatusCode, body)
 	}
 }
+
+func TestDownstreamChainLinkCarriesOwnerTenant(t *testing.T) {
+	t.Parallel()
+	j := journalForServerTest(t)
+	ctx := context.Background()
+
+	if err := j.CreateWorkflowInTenant(ctx, "wf_chain_link_source", "chain-link-source", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateWorkflowInTenant(ctx, "wf_chain_link_downstream", "shared-downstream", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	// A global admin can have two tenants with the same slug. The rendered
+	// chain link must retain the owning tenant or it can open the wrong
+	// workflow when the bare-slug lookup chooses another tenant's row.
+	if err := j.CreateWorkflowInTenant(ctx, "wf_chain_link_foreign", "shared-downstream", "h", "0.1.0", json.RawMessage(`{}`), "globex"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CreateChainTrigger(ctx, "wf_chain_link_downstream", "wf_chain_link_source", "succeeded"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := j.ChainTriggersDownstreamOf(ctx, "wf_chain_link_source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].DownstreamTenantID != "acme" {
+		t.Fatalf("downstream rows = %+v, want one acme-owned row", rows)
+	}
+	html := renderDownstreamChainSection(rows)
+	if !strings.Contains(html, `href="/workflows/shared-downstream?tenant=acme"`) {
+		t.Fatalf("downstream link lost owner tenant: %s", html)
+	}
+}

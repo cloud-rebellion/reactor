@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,8 +19,11 @@ import (
 // no write permission, missing controllers) and the caller falls back
 // to prlimit-only enforcement.
 type cgroupHandle struct {
-	Fd      int
-	Cleanup func()
+	Fd int
+	// Killable reports whether this kernel exposes cgroup.kill. Without it,
+	// the direct child is bounded but descendants can survive the run.
+	Killable bool
+	Cleanup  func()
 }
 
 // noopCgroupHandle is the fallback returned when cgroup v2 isn't
@@ -65,12 +69,27 @@ func prepareCgroup(log *slog.Logger, runID string, lim ResourceLimits) cgroupHan
 		return noopCgroupHandle
 	}
 
+	// cgroup.kill was added to cgroup v2 in Linux 5.14. Keep the capability
+	// on the handle so strict callers can refuse a run on older kernels rather
+	// than pretending that descendants are contained.
+	_, killStatErr := os.Stat(filepath.Join(child, "cgroup.kill"))
+	killable := false
+	if killStatErr == nil {
+		// The cgroup is empty before cmd.Start, so this probe is harmless and
+		// proves that the daemon can actually write the kernel control file;
+		// merely seeing a mode entry is insufficient because delegation/ACLs
+		// can still make the write fail.
+		killable = killCgroupProcesses(child) == nil
+	}
 	cleanup := func() {
-		// Move any straggling pids back to the parent before rmdir; the
-		// kernel rejects rmdir on a non-empty cgroup. v2 doesn't allow
-		// writing to a child's cgroup.procs after the leader exits in
-		// the happy path, so this is best-effort.
-		os.Remove(filepath.Join(child, "cgroup.events")) // ignore err
+		// A workflow may fork descendants and exit cleanly. Kill the entire
+		// per-run cgroup before removing it so those descendants cannot keep
+		// operating against the daemon's journal or credentials. On older
+		// kernels cgroup.kill is absent; optional mode retains the historical
+		// best-effort cleanup and strict mode refuses the run below.
+		if err := killCgroupProcesses(child); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Warn("cgroup: descendant cleanup failed", "path", child, "err", err)
+		}
 		_ = os.Remove(child)
 	}
 
@@ -101,12 +120,27 @@ func prepareCgroup(log *slog.Logger, runID string, lim ResourceLimits) cgroupHan
 		return noopCgroupHandle
 	}
 	return cgroupHandle{
-		Fd: fd,
+		Fd:       fd,
+		Killable: killable,
 		Cleanup: func() {
 			syscall.Close(fd)
 			cleanup()
 		},
 	}
+}
+
+// killCgroupProcesses asks the kernel to terminate every process in a v2
+// cgroup, including descendants of the workflow. It is intentionally a tiny
+// helper so its destructive write can be tested without requiring a mounted
+// cgroup hierarchy.
+func killCgroupProcesses(path string) error {
+	f, err := os.OpenFile(filepath.Join(path, "cgroup.kill"), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString("1")
+	return err
 }
 
 // isCgroupV2 reports whether the given mount root is a cgroup v2

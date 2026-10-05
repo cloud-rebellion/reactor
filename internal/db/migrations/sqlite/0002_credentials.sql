@@ -28,10 +28,8 @@ CREATE INDEX credentials_expires_idx
     ON credentials(expires_at)
     WHERE deleted_at IS NULL;
 
--- Append-only audit log. Every read AND write of credential metadata or
--- value goes here. The MCP-facing readonly view of credentials still
--- writes a row here so "Claude looked at this credential's existence"
--- is visible.
+-- Append-only credential-management audit log. Runtime SecretFetch receives
+-- its own vault/OAuth-capable receipt table in migration 0051.
 CREATE TABLE credential_audit (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     credential_id TEXT NOT NULL REFERENCES credentials(id),

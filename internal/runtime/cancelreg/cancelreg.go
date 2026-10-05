@@ -115,10 +115,12 @@ func (r *Registry) Cancel(runID string) bool {
 }
 
 // CancelAll cancels every registered execution and returns how many it
-// signalled. Used at shutdown when graceful drain times out: killing the
-// subprocesses (exec.CommandContext SIGKILL) prevents orphaned children
-// and stops them writing to a DB that is about to close. The cancel funcs
-// are snapshotted under the lock so callers' Deregister doesn't race.
+// signalled. Used at shutdown when graceful drain times out: killing each
+// workflow subprocess (exec.CommandContext SIGKILL) stops that process from
+// writing to a DB that is about to close. Descendants of a hostile binary
+// still require the cgroup/container or deployment process supervisor to
+// enforce a complete process-tree boundary. The cancel funcs are snapshotted
+// under the lock so callers' Deregister doesn't race.
 func (r *Registry) CancelAll() int {
 	return r.CancelAllWithCause(context.Canceled)
 }

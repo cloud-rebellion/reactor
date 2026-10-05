@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/reactor/sdk/esign"
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
 func validRequest() SignatureRequest {
@@ -65,6 +66,23 @@ func TestCreateAndSendContract(t *testing.T) {
 	}
 	if received.TemplateID != validRequest().TemplateID || received.Variables["customer.name"] != "Ada Lovelace" {
 		t.Fatalf("request = %+v", received)
+	}
+}
+
+func TestCreateAndSendBlocksDryRunBeforeNetwork(t *testing.T) {
+	t.Setenv("REACTOR_MODE", "dry_run")
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("dry-run Hash request reached the server")
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "hash-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.CreateAndSend(context.Background(), "event-42", validRequest())
+	if !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("dry-run error = %v, want ErrDryRun", err)
 	}
 }
 
@@ -283,6 +301,22 @@ func TestNewClientURLPolicy(t *testing.T) {
 	}
 	if _, err := NewClient("http://127.0.0.1:8080", "key", nil); err != nil {
 		t.Fatalf("loopback client: %v", err)
+	}
+}
+
+func TestDefaultClientUsesConnectTimeSSRFGuard(t *testing.T) {
+	t.Parallel()
+	client, err := NewClient("https://hash.example.com", "key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok || transport.DialContext == nil {
+		t.Fatalf("default client transport = %T, want SSRF-safe http.Transport", client.httpClient.Transport)
+	}
+	_, err = transport.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	if err == nil || !strings.Contains(err.Error(), "ssrf: refusing") {
+		t.Fatalf("default client dial error = %v, want connect-time SSRF refusal", err)
 	}
 }
 

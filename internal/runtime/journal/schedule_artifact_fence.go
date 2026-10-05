@@ -93,7 +93,9 @@ func (j *Journal) DeferScheduleArtifactAvailability(ctx context.Context, schedul
 	}
 
 	var marked int
-	if err := tx.QueryRowContext(ctx, j.bind(`SELECT COUNT(*) FROM run_logs WHERE run_id = $1 AND line = $2`),
+	if err := tx.QueryRowContext(ctx, j.bind(`SELECT COUNT(*) FROM run_logs
+		WHERE run_id = $1 AND (kind = 'artifact_fence'
+			OR (payload_crypto_version = 0 AND line = $2))`),
 		runID, WorkflowArtifactFenceRunLog).Scan(&marked); err != nil {
 		return false, fmt.Errorf("journal: inspect scheduled artifact marker: %w", err)
 	}
@@ -151,6 +153,12 @@ func (j *Journal) ClaimScheduleAndFailArtifactFence(ctx context.Context, schedul
 	// delete by run_id here: if corrupted/legacy state leaves a lease behind,
 	// an unowned scheduler must never remove a newer worker generation.
 	if err := appendArtifactFenceLog(ctx, tx, j, runID); err != nil {
+		return false, err
+	}
+	// This scheduler path terminalizes a suspended run without going through a
+	// supervisor/dispatcher callback. Persist the terminal handoff atomically so
+	// the notification/chain recovery loop cannot miss the failed outcome.
+	if err := j.enqueueTerminalEffectTx(ctx, tx, runID, "failed"); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -8,26 +8,70 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/reactor/internal/registry"
+	"github.com/bright-interaction/reactor/internal/runtime/journal"
 )
 
 // fakeJournal stubs JournalForBuildRegister.
 type fakeJournal struct {
-	existingSlug     string
-	existingID       string
-	existingTenant   string
-	createdID        string
-	createdSlug      string
-	createdHash      string
-	createdSDK       string
-	createdDAG       json.RawMessage
-	createdTenant    string
-	createdArtifact  string
-	recordedID       string
-	recordedArtifact string
-	recordedVersion  int
-	currentVersion   int
-	currentArtifact  string
-	createErr        error
+	existingSlug           string
+	existingID             string
+	existingTenant         string
+	createdID              string
+	createdSlug            string
+	createdHash            string
+	createdSDK             string
+	createdDAG             json.RawMessage
+	createdTenant          string
+	createdArtifact        string
+	createdSourceManifest  string
+	recordedID             string
+	recordedArtifact       string
+	recordedSourceManifest string
+	recordedVersion        int
+	expectedVersion        int
+	currentVersion         int
+	currentArtifact        string
+	createErr              error
+}
+
+func TestValidateWorkflowSourceBoundsAuthoringInputs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	if err := ValidateWorkflowSource(ctx, ValidateSourceRequest{
+		Slug: "bounded-source", MainGo: strings.Repeat("x", maxWorkflowSourceBytes+1),
+	}); err == nil || !strings.Contains(err.Error(), "main_go exceeds") {
+		t.Fatalf("oversized source error = %v", err)
+	}
+	if err := ValidateWorkflowSource(ctx, ValidateSourceRequest{
+		Slug: "bounded-dag", MainGo: "package main\nfunc main() {}\n",
+		DAGJSON: `{"steps":[],"padding":"` + strings.Repeat("x", maxWorkflowDAGBytes) + `"}`,
+	}); err == nil || !strings.Contains(err.Error(), "dag.json exceeds") {
+		t.Fatalf("oversized dag error = %v", err)
+	}
+}
+
+func TestValidateWorkflowSourceBoundsAdditionalFiles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  string
+	}{
+		{name: "traversal", files: map[string]string{"../escape.go": "package main"}, want: "invalid additional source path"},
+		{name: "reserved", files: map[string]string{"dag.json": "{}"}, want: "reserved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateWorkflowSource(ctx, ValidateSourceRequest{
+				Slug: "bounded-files", MainGo: "package main\nfunc main() {}\n", DAGJSON: `{"steps":[]}`, Files: tc.files,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("additional file error = %v, want %q", err, tc.want)
+			}
+		})
+	}
 }
 
 func (f *fakeJournal) WorkflowIDBySlug(_ context.Context, slug string) (string, error) {
@@ -37,10 +81,28 @@ func (f *fakeJournal) WorkflowIDBySlug(_ context.Context, slug string) (string, 
 	return "", errors.New("not found")
 }
 
+func (f *fakeJournal) WorkflowTenantsBySlug(_ context.Context, slug string) ([]string, error) {
+	if slug != f.existingSlug || f.existingID == "" {
+		return nil, nil
+	}
+	tenant := f.existingTenant
+	if tenant == "" {
+		tenant = journal.DefaultTenant
+	}
+	return []string{tenant}, nil
+}
+
 // WorkflowIDBySlugInTenant models per-tenant slug uniqueness: the same slug in a
 // DIFFERENT tenant must not resolve, which is what makes SkipIfExists correct.
 func (f *fakeJournal) WorkflowIDBySlugInTenant(_ context.Context, slug, tenantID string) (string, error) {
-	if slug == f.existingSlug && tenantID == f.existingTenant {
+	if tenantID == "" {
+		tenantID = journal.DefaultTenant
+	}
+	existingTenant := f.existingTenant
+	if existingTenant == "" {
+		existingTenant = journal.DefaultTenant
+	}
+	if slug == f.existingSlug && tenantID == existingTenant {
 		return f.existingID, nil
 	}
 	return "", errors.New("not found")
@@ -54,7 +116,7 @@ func (f *fakeJournal) CreateWorkflowInTenant(_ context.Context, id, slug, codeHa
 	return f.CreateWorkflowInTenantWithArtifact(context.Background(), id, slug, codeHash, sdkVersion, "", dag, tenantID)
 }
 
-func (f *fakeJournal) CreateWorkflowInTenantWithArtifact(_ context.Context, id, slug, codeHash, sdkVersion, artifactSHA256 string, dag json.RawMessage, tenantID string) error {
+func (f *fakeJournal) CreateWorkflowInTenantWithArtifact(_ context.Context, id, slug, codeHash, sdkVersion, artifactSHA256 string, dag json.RawMessage, tenantID string, sourceManifestSHA256 ...string) error {
 	if f.createErr != nil {
 		return f.createErr
 	}
@@ -65,21 +127,35 @@ func (f *fakeJournal) CreateWorkflowInTenantWithArtifact(_ context.Context, id, 
 	f.createdDAG = dag
 	f.createdTenant = tenantID
 	f.createdArtifact = artifactSHA256
+	if len(sourceManifestSHA256) == 1 {
+		f.createdSourceManifest = sourceManifestSHA256[0]
+	}
 	f.currentVersion = 1
 	f.currentArtifact = artifactSHA256
 	return nil
 }
 
-func (f *fakeJournal) RecordWorkflowVersionWithArtifact(_ context.Context, workflowID, _ string, _ string, artifactSHA256 string, _ json.RawMessage) (int, error) {
+func (f *fakeJournal) RecordWorkflowVersionWithArtifact(_ context.Context, workflowID, _ string, _ string, artifactSHA256 string, _ json.RawMessage, sourceManifestSHA256 ...string) (int, error) {
 	if f.createErr != nil {
 		return 0, f.createErr
 	}
 	f.recordedID = workflowID
 	f.recordedArtifact = artifactSHA256
+	if len(sourceManifestSHA256) == 1 {
+		f.recordedSourceManifest = sourceManifestSHA256[0]
+	}
 	f.recordedVersion++
 	f.currentVersion = f.recordedVersion + 1
 	f.currentArtifact = artifactSHA256
 	return f.currentVersion, nil
+}
+
+func (f *fakeJournal) RecordWorkflowVersionWithArtifactExpected(ctx context.Context, workflowID, sdkVersion, codeHash, artifactSHA256 string, dag json.RawMessage, expectedVersion int, sourceManifestSHA256 ...string) (int, error) {
+	f.expectedVersion = expectedVersion
+	if expectedVersion != f.currentVersion {
+		return 0, errors.New("workflow version conflict")
+	}
+	return f.RecordWorkflowVersionWithArtifact(ctx, workflowID, sdkVersion, codeHash, artifactSHA256, dag, sourceManifestSHA256...)
 }
 
 func (f *fakeJournal) ActivateWorkflowArtifactIfCurrent(_ context.Context, _ string, version int, artifactSHA256 string, activate func() error) (bool, error) {
@@ -90,6 +166,49 @@ func (f *fakeJournal) ActivateWorkflowArtifactIfCurrent(_ context.Context, _ str
 		return false, err
 	}
 	return true, nil
+}
+
+// supersededActivationJournal simulates another publisher committing a newer
+// version after this request's row was written but before its compatibility
+// files could be activated.
+type supersededActivationJournal struct{ *fakeJournal }
+
+func (*supersededActivationJournal) ActivateWorkflowArtifactIfCurrent(context.Context, string, int, string, func() error) (bool, error) {
+	return false, nil
+}
+
+func TestBuildAndRegisterReportsSupersededActivation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		existing bool
+	}{
+		{name: "first creation"},
+		{name: "revision", existing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := writeMiniWorkflow(t, false)
+			root := t.TempDir()
+			j := &supersededActivationJournal{fakeJournal: &fakeJournal{}}
+			if tc.existing {
+				j.existingSlug, j.existingID, j.existingTenant = "superseded", "wf_existing", journal.DefaultTenant
+			}
+			res, err := BuildAndRegister(context.Background(), j, BuildAndRegisterRequest{
+				Slug: "superseded", SrcDir: src, StateRoot: root, SkipIfExists: true,
+			})
+			if !errors.Is(err, journal.ErrWorkflowVersionConflict) || res.WorkflowID != "" {
+				t.Fatalf("superseded registration reported success: result=%+v err=%v", res, err)
+			}
+			if tc.existing && j.recordedID != j.existingID {
+				t.Fatalf("revision was not recorded before supersession: %+v", j.fakeJournal)
+			}
+			if !tc.existing && j.createdID == "" {
+				t.Fatalf("creation was not recorded before supersession: %+v", j.fakeJournal)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "workflows", "superseded", "workflow")); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("superseded artifact was activated: %v", statErr)
+			}
+		})
+	}
 }
 
 // writeMiniWorkflow produces a tiny compilable workflow source dir +
@@ -147,6 +266,33 @@ func TestBuildAndRegisterHappyPath(t *testing.T) {
 	}
 }
 
+func TestBuildAndRegisterRejectsGoVetFailureBeforePublishing(t *testing.T) {
+	// go build accepts this format call, while go vet correctly rejects the
+	// mismatched printf verb. The authoring persistence path must apply the
+	// same safety gate as reactor_validate_workflow before publishing an
+	// artifact or creating a journal row.
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(`package main
+
+import "fmt"
+
+func main() { fmt.Printf("%d\\n", "not-an-integer") }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	j := &fakeJournal{}
+	_, err := BuildAndRegister(context.Background(), j, BuildAndRegisterRequest{
+		Slug: "vet-failure", SrcDir: src, StateRoot: root,
+	})
+	if err == nil || !strings.Contains(err.Error(), "go vet") {
+		t.Fatalf("BuildAndRegister error = %v, want go vet failure", err)
+	}
+	if j.createdID != "" || j.recordedID != "" {
+		t.Fatalf("go vet failure touched journal: %+v", j)
+	}
+}
+
 func TestBuildAndRegisterRejectsBadSlug(t *testing.T) {
 	t.Parallel()
 	j := &fakeJournal{}
@@ -190,6 +336,35 @@ func TestBuildAndRegisterReusesExistingIDAndAppendsVersion(t *testing.T) {
 	}
 }
 
+func TestBuildAndRegisterUsesExpectedVersionForExistingWorkflow(t *testing.T) {
+	t.Parallel()
+	src := writeMiniWorkflow(t, false)
+	root := t.TempDir()
+	j := &fakeJournal{
+		existingSlug:   "demo",
+		existingID:     "wf_existing",
+		existingTenant: "default",
+		currentVersion: 1,
+	}
+	res, err := BuildAndRegister(context.Background(), j, BuildAndRegisterRequest{
+		Slug:            "demo",
+		SrcDir:          src,
+		StateRoot:       root,
+		SkipIfExists:    true,
+		TenantID:        "default",
+		ExpectedVersion: 1,
+	})
+	if err != nil {
+		t.Fatalf("BuildAndRegister: %v", err)
+	}
+	if res.WorkflowID != "wf_existing" || res.Version != 2 {
+		t.Fatalf("result = %+v, want existing workflow version 2", res)
+	}
+	if j.expectedVersion != 1 {
+		t.Fatalf("expected version passed to journal = %d, want 1", j.expectedVersion)
+	}
+}
+
 func TestBuildAndRegisterSource(t *testing.T) {
 	// Force the no-SDK-replace path so a stdlib-only workflow builds
 	// deterministically regardless of the dev's shell env.
@@ -217,9 +392,286 @@ func TestBuildAndRegisterSource(t *testing.T) {
 	if string(j.createdDAG) != `{"steps":[]}` {
 		t.Fatalf("dag not propagated: %s", j.createdDAG)
 	}
-	// The temp build dir must not leak into the workflows tree.
-	if _, err := os.Stat(filepath.Join(root, "workflows", "src-demo", "main.go")); err == nil {
-		t.Fatal("source main.go leaked into the workflows dir; expected build from a temp dir")
+	currentSource := filepath.Join(root, "workflows", "src-demo", "source")
+	gotMain, err := os.ReadFile(filepath.Join(currentSource, "main.go"))
+	if err != nil {
+		t.Fatalf("retained current source: %v", err)
+	}
+	if string(gotMain) != "package main\n\nfunc main() {}\n" {
+		t.Fatalf("retained main.go mismatch: %q", gotMain)
+	}
+	if res.SourcePath != currentSource {
+		t.Fatalf("SourcePath = %q, want %q", res.SourcePath, currentSource)
+	}
+	artifactSource := filepath.Join(filepath.Dir(res.BinaryPath), "source", "main.go")
+	gotArtifactMain, err := os.ReadFile(artifactSource)
+	if err != nil {
+		t.Fatalf("retained immutable source: %v", err)
+	}
+	if string(gotArtifactMain) != string(gotMain) {
+		t.Fatalf("artifact source differs from current source")
+	}
+	gotDAG, err := os.ReadFile(filepath.Join(filepath.Dir(res.BinaryPath), "source", "dag.json"))
+	if err != nil || string(gotDAG) != `{"steps":[]}` {
+		t.Fatalf("retained dag = %q, err=%v", gotDAG, err)
+	}
+}
+
+func TestBuildAndRegisterSourceIdenticalStagesShareArtifactDigest(t *testing.T) {
+	// MCP requests materialize in different private directories. Their
+	// content address should reflect the executable, not the staging path.
+	t.Setenv("REACTOR_SDK_REPLACE", "")
+	request := BuildSourceRequest{
+		Slug: "repeatable-source", MainGo: "package main\nfunc main() {}\n",
+		DAGJSON: `{"steps":[]}`,
+	}
+	request.StateRoot = t.TempDir()
+	first, err := BuildAndRegisterSource(context.Background(), &fakeJournal{}, request)
+	if err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	request.StateRoot = t.TempDir()
+	second, err := BuildAndRegisterSource(context.Background(), &fakeJournal{}, request)
+	if err != nil {
+		t.Fatalf("second build: %v", err)
+	}
+	if first.ArtifactSHA256 == "" || first.ArtifactSHA256 != second.ArtifactSHA256 {
+		t.Fatalf("identical source produced different content addresses: %q and %q", first.ArtifactSHA256, second.ArtifactSHA256)
+	}
+}
+
+// activationFailureJournal models a journal commit followed by a failed
+// filesystem refresh. The next create request must repair that view without
+// allocating a second immutable version.
+type activationFailureJournal struct {
+	*fakeJournal
+	failFirstActivation bool
+	retryActivations    int
+}
+
+func (f *activationFailureJournal) CreateWorkflowInTenantWithArtifactDisabled(ctx context.Context, id, slug, codeHash, sdkVersion, artifactSHA256 string, dag json.RawMessage, tenantID string, sourceManifestSHA256 ...string) error {
+	return f.fakeJournal.CreateWorkflowInTenantWithArtifact(ctx, id, slug, codeHash, sdkVersion, artifactSHA256, dag, tenantID, sourceManifestSHA256...)
+}
+
+func (f *activationFailureJournal) RecordWorkflowVersionWithArtifactIfDisabled(context.Context, string, string, string, string, json.RawMessage, ...string) (int, error) {
+	return 0, errors.New("unexpected duplicate version")
+}
+
+func (f *activationFailureJournal) CurrentWorkflowVersionRecord(_ context.Context, workflowID string) (journal.WorkflowVersion, error) {
+	if workflowID != f.createdID {
+		return journal.WorkflowVersion{}, journal.ErrNotFound
+	}
+	return journal.WorkflowVersion{
+		WorkflowID:           f.createdID,
+		Version:              f.currentVersion,
+		SDKVersion:           f.createdSDK,
+		CodeHash:             f.createdHash,
+		ArtifactSHA256:       f.createdArtifact,
+		SourceManifestSHA256: f.createdSourceManifest,
+		DAG:                  f.createdDAG,
+	}, nil
+}
+
+func (f *activationFailureJournal) ActivateWorkflowArtifactIfCurrent(ctx context.Context, workflowID string, version int, artifactSHA256 string, activate func() error) (bool, error) {
+	if f.failFirstActivation {
+		f.failFirstActivation = false
+		return false, errors.New("simulated activation failure")
+	}
+	return f.fakeJournal.ActivateWorkflowArtifactIfCurrent(ctx, workflowID, version, artifactSHA256, activate)
+}
+
+func (f *activationFailureJournal) ActivateWorkflowArtifactIfCurrentAndDisabled(ctx context.Context, workflowID string, version int, artifactSHA256 string, activate func() error) (bool, error) {
+	f.retryActivations++
+	return f.fakeJournal.ActivateWorkflowArtifactIfCurrent(ctx, workflowID, version, artifactSHA256, activate)
+}
+
+func TestBuildAndRegisterSourceRetryRepairsStaleCurrentSource(t *testing.T) {
+	t.Setenv("REACTOR_SDK_REPLACE", "")
+	root := t.TempDir()
+	j := &activationFailureJournal{fakeJournal: &fakeJournal{}, failFirstActivation: true}
+	req := BuildSourceRequest{
+		Slug: "retry-source", MainGo: "package main\nfunc main() {}\n",
+		DAGJSON: `{"steps":[]}`, StateRoot: root, SkipIfExists: true,
+		StartDisabled: true,
+	}
+	if _, err := BuildAndRegisterSource(context.Background(), j, req); err == nil || !strings.Contains(err.Error(), "simulated activation failure") {
+		t.Fatalf("first activation error = %v", err)
+	}
+	if j.createdID == "" || j.createdSourceManifest == "" || j.currentVersion != 1 {
+		t.Fatalf("first attempt did not commit a pinned version: %+v", j.fakeJournal)
+	}
+	j.existingSlug, j.existingID, j.existingTenant = req.Slug, j.createdID, journal.DefaultTenant
+	currentSource := filepath.Join(root, "workflows", req.Slug, "source")
+	if err := os.MkdirAll(currentSource, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(currentSource, "main.go"), []byte("stale review view"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := BuildAndRegisterSource(context.Background(), j, req)
+	if err != nil {
+		t.Fatalf("exact-source retry did not repair stale view: %v", err)
+	}
+	if !res.Idempotent || res.WorkflowID != j.createdID || res.Version != 1 || res.ArtifactSHA256 != j.createdArtifact || j.recordedVersion != 0 || j.retryActivations != 1 {
+		t.Fatalf("retry appended a version or changed its receipt: result=%+v journal=%+v retryActivations=%d", res, j.fakeJournal, j.retryActivations)
+	}
+	got, err := os.ReadFile(filepath.Join(currentSource, "main.go"))
+	if err != nil || string(got) != req.MainGo {
+		t.Fatalf("current source not repaired: %q, %v", got, err)
+	}
+	if present, digest, err := registry.VerifySourceManifestDigestIfPresent(currentSource); err != nil || !present || digest != j.createdSourceManifest {
+		t.Fatalf("repaired source proof = present:%v digest:%q err:%v", present, digest, err)
+	}
+}
+
+func TestBuildAndRegisterRetainsCompleteSourceManifest(t *testing.T) {
+	t.Parallel()
+	src := writeMiniWorkflow(t, false)
+	if err := os.WriteFile(filepath.Join(src, "helper.go"), []byte("package main\n\nfunc helper() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	res, err := BuildAndRegister(context.Background(), &fakeJournal{}, BuildAndRegisterRequest{
+		Slug: "complete-source", SrcDir: src, StateRoot: root, RetainSource: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildAndRegister: %v", err)
+	}
+	artifactSource := filepath.Join(filepath.Dir(res.BinaryPath), "source")
+	gotHelper, err := os.ReadFile(filepath.Join(artifactSource, "helper.go"))
+	if err != nil || string(gotHelper) != "package main\n\nfunc helper() {}\n" {
+		t.Fatalf("retained helper.go = %q, err=%v", gotHelper, err)
+	}
+	if present, err := registry.VerifySourceManifestIfPresent(artifactSource); err != nil || !present {
+		t.Fatalf("retained source manifest verification: present=%v err=%v", present, err)
+	}
+	if present, err := registry.VerifySourceManifestIfPresent(res.SourcePath); err != nil || !present {
+		t.Fatalf("current source manifest verification: present=%v err=%v", present, err)
+	}
+	selected, present, err := registry.SourceManifestCompiledGoFiles(artifactSource)
+	if err != nil || !present || strings.Join(selected, ",") != "helper.go,main.go" {
+		t.Fatalf("compiled root selection = %v, present=%v err=%v", selected, present, err)
+	}
+}
+
+func TestAuthoringRejectsVisualNodesOutsideExecutableDependencyGraph(t *testing.T) {
+	moduleRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REACTOR_SDK_REPLACE", moduleRoot)
+	mainGo := "package main\nfunc main() {}\n"
+	decoyBody := `import (
+    "context"
+    reactor "github.com/bright-interaction/reactor/sdk"
+)
+func phantom(ctx context.Context, flow reactor.Flow) error {
+    _, err := reactor.Step(flow, ctx, "phantom", reactor.StepOpts{}, func(context.Context) (string, error) { return "ok", nil })
+    return err
+}
+`
+	dag := `{"steps":[{"name":"phantom","kind":"step"}]}`
+	for _, tc := range []struct {
+		name string
+		file string
+		body string
+	}{
+		{name: "nested package", file: "unused/decoy.go", body: "package unused\n" + decoyBody},
+		{name: "build tag excluded", file: "excluded.go", body: "//go:build reactor_never_selected\n\npackage main\n" + decoyBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{tc.file: tc.body}
+			if err := ValidateWorkflowSource(context.Background(), ValidateSourceRequest{
+				Slug: "visual-decoy", MainGo: mainGo, DAGJSON: dag, Files: files,
+			}); err == nil || !strings.Contains(err.Error(), "DAG nodes missing from source: phantom") {
+				t.Fatalf("validate accepted uncompiled visual node: %v", err)
+			}
+			j := &fakeJournal{}
+			_, err := BuildAndRegisterSource(context.Background(), j, BuildSourceRequest{
+				Slug: "visual-decoy", MainGo: mainGo, DAGJSON: dag, Files: files,
+				StateRoot: t.TempDir(),
+			})
+			if err == nil || !strings.Contains(err.Error(), "DAG nodes missing from source: phantom") {
+				t.Fatalf("create accepted uncompiled visual node: %v", err)
+			}
+			if j.createdID != "" {
+				t.Fatalf("uncompiled visual node was registered as %q", j.createdID)
+			}
+		})
+	}
+	// A real additional root file remains eligible: the selection is based on
+	// Go's package membership, not an artificial main.go-only restriction.
+	if err := ValidateWorkflowSource(context.Background(), ValidateSourceRequest{
+		Slug: "visual-root-helper", MainGo: mainGo, DAGJSON: dag,
+		Files: map[string]string{"helper.go": "package main\n" + decoyBody},
+	}); err != nil {
+		t.Fatalf("compiled root helper was rejected: %v", err)
+	}
+}
+
+func TestAuthoringAcceptsImportedNestedDurableStep(t *testing.T) {
+	moduleRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REACTOR_SDK_REPLACE", moduleRoot)
+	mainGo := `package main
+import (
+    "context"
+    reactor "github.com/bright-interaction/reactor/sdk"
+    runtime "github.com/bright-interaction/reactor/sdk/runtime"
+    "reactor-workflow/imported-step/helper"
+)
+func run(ctx context.Context, flow reactor.Flow, _ struct{}) error { return helper.Execute(ctx, flow) }
+func main() { runtime.Serve(reactor.Workflow{Slug: "imported-step", Version: "0.1.0"}, reactor.EventTrigger{}, run) }
+`
+	helperGo := `package helper
+import (
+    "context"
+    reactor "github.com/bright-interaction/reactor/sdk"
+)
+func Execute(ctx context.Context, flow reactor.Flow) error {
+    _, err := reactor.Step(flow, ctx, "nested-step", reactor.StepOpts{}, func(context.Context) (string, error) { return "ok", nil })
+    return err
+}
+`
+	dag := `{"steps":[{"name":"nested-step","kind":"step"}]}`
+	files := map[string]string{"helper/worker.go": helperGo}
+	if err := ValidateWorkflowSource(context.Background(), ValidateSourceRequest{
+		Slug: "imported-step", MainGo: mainGo, DAGJSON: dag, Files: files,
+	}); err != nil {
+		t.Fatalf("imported nested helper was rejected by validate: %v", err)
+	}
+	res, err := BuildAndRegisterSource(context.Background(), &fakeJournal{}, BuildSourceRequest{
+		Slug: "imported-step", MainGo: mainGo, DAGJSON: dag, Files: files, StateRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("imported nested helper was rejected by create: %v", err)
+	}
+	selected, present, err := registry.SourceManifestCompiledGoFiles(filepath.Join(filepath.Dir(res.BinaryPath), "source"))
+	if err != nil || !present || strings.Join(selected, ",") != "helper/worker.go,main.go" {
+		t.Fatalf("imported helper selection = %v, present=%v err=%v", selected, present, err)
+	}
+}
+
+func TestWriteCurrentSourceReplacesStaleFiles(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(filepath.Join(dir, "old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "old", "helper.go"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{"main.go": []byte("package main\n"), "dag.json": []byte("{}\n")}
+	if err := writeCurrentSource(dir, files); err != nil {
+		t.Fatalf("writeCurrentSource: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "old", "helper.go")); !os.IsNotExist(err) {
+		t.Fatalf("stale source survived replacement: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "main.go")); err != nil {
+		t.Fatalf("new source missing: %v", err)
 	}
 }
 
@@ -266,24 +718,23 @@ func TestBuildAndRegisterSkipsOnlyWithinTheSameTenant(t *testing.T) {
 		t.Fatal("same-tenant re-register should not have created a second row")
 	}
 
-	// Different tenant: it must CREATE, not silently hand back the other
-	// tenant's workflow.
+	// Different tenant: the database permits the metadata row and the registry
+	// now places the second tenant's mutable candidate/source/current files in a
+	// hashed namespace, so the authoring path can safely create the workflow.
 	otherTenant := &fakeJournal{existingSlug: "flow", existingID: "wf_existing", existingTenant: "acme"}
+	otherRoot := t.TempDir()
 	res, err = BuildAndRegister(context.Background(), otherTenant, BuildAndRegisterRequest{
-		Slug: "flow", SrcDir: writeMiniWorkflow(t, false), StateRoot: t.TempDir(),
+		Slug: "flow", SrcDir: writeMiniWorkflow(t, false), StateRoot: otherRoot,
 		SkipIfExists: true, TenantID: "globex",
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("cross-tenant artifact registration: %v", err)
 	}
-	if res.WorkflowID == "wf_existing" {
-		t.Fatal("registering into a different tenant returned the OTHER tenant's workflow id")
+	if otherTenant.createdID == "" || res.WorkflowID == "" {
+		t.Fatalf("cross-tenant namespace did not create a workflow row: result=%+v journal=%+v", res, otherTenant)
 	}
-	if otherTenant.createdID == "" {
-		t.Fatal("registering into a different tenant wrote no row, so the upload succeeded with nothing created")
-	}
-	if otherTenant.createdTenant != "globex" {
-		t.Fatalf("row created in tenant %q, want globex", otherTenant.createdTenant)
+	if _, err := registry.New(filepath.Join(otherRoot, "workflows")).ArtifactPathForTenant("flow", res.ArtifactSHA256, "globex"); err != nil {
+		t.Fatalf("cross-tenant artifact was not tenant-resolvable: %v", err)
 	}
 }
 
@@ -342,11 +793,42 @@ func TestBuildAndRegisterRejectsVendorAndGoWork(t *testing.T) {
 	}
 }
 
-// TestBuildAndRegisterRegeneratesSuppliedGoMod pins the fix for the host-RCE
-// path: the tarball-upload route used the caller's go.mod verbatim, so a
-// `replace github.com/bright-interaction/reactor => ./evil` substituted
-// attacker code for the SDK and ran it at build time as the daemon uid.
-// initModule now runs on EVERY compile path, not just the MCP one.
+func TestBuildAndRegisterLintsHelperGoFiles(t *testing.T) {
+	t.Parallel()
+	src := writeMiniWorkflow(t, false)
+	if err := os.WriteFile(filepath.Join(src, "helper.go"), []byte(`package main
+
+import "time"
+
+func helper() { time.Sleep(time.Second) }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := BuildAndRegister(context.Background(), &fakeJournal{}, BuildAndRegisterRequest{
+		Slug: "helper-lint", SrcDir: src, StateRoot: t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "time.Sleep") {
+		t.Fatalf("helper lint violation was not rejected: %v", err)
+	}
+}
+
+func TestBuildAndRegisterRejectsNativeSource(t *testing.T) {
+	t.Parallel()
+	src := writeMiniWorkflow(t, false)
+	if err := os.WriteFile(filepath.Join(src, "escape.s"), []byte("TEXT ·main(SB),$0-0\n\tRET\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := BuildAndRegister(context.Background(), &fakeJournal{}, BuildAndRegisterRequest{
+		Slug: "native-source", SrcDir: src, StateRoot: t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "native source or assembly") {
+		t.Fatalf("native source was not rejected: %v", err)
+	}
+}
+
+// TestBuildAndRegisterStagesSuppliedGoMod pins both halves of the module-graph
+// fix: a hostile caller go.mod must not influence the build, and module setup
+// must not rewrite the caller-owned source tree.
 func TestBuildAndRegisterRegeneratesSuppliedGoMod(t *testing.T) {
 	t.Parallel()
 	src := writeMiniWorkflow(t, false)
@@ -363,10 +845,7 @@ func TestBuildAndRegisterRegeneratesSuppliedGoMod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
 	}
-	if strings.Contains(string(got), "replace") {
-		t.Fatalf("supplied replace directive survived:\n%s", got)
-	}
-	if !strings.Contains(string(got), "module reactor-workflow/hostile") {
-		t.Fatalf("go.mod should be daemon-owned, got:\n%s", got)
+	if string(got) != hostile {
+		t.Fatalf("caller-owned go.mod was modified:\n%s", got)
 	}
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/bright-interaction/reactor/internal/credentials"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
+	"github.com/bright-interaction/reactor/internal/workflowproof"
 )
 
 // ManualDispatcher is the surface the dashboard's "Run now" button
@@ -174,7 +177,52 @@ func (s *Server) setWorkflowEnabled(w http.ResponseWriter, r *http.Request, enab
 		s.errorPage(w, "lookup workflow", err)
 		return
 	}
-	if err := s.Journal.SetWorkflowEnabled(r.Context(), wfID, enabled); err != nil {
+	var reviewedVersion journal.WorkflowVersion
+	if enabled {
+		version, versionErr := s.Journal.CurrentWorkflowVersionRecordBounded(r.Context(), wfID, maxFlowDAGBytes)
+		if versionErr != nil {
+			http.Error(w, "workflow cannot be enabled until an immutable reviewed version exists", http.StatusConflict)
+			return
+		}
+		if version.DAGTruncated {
+			http.Error(w, fmt.Sprintf("workflow cannot be enabled: recorded DAG is %d bytes and exceeds the bounded dashboard projection", version.DAGBytes), http.StatusConflict)
+			return
+		}
+		reviewedVersion = version
+		stateRoot := strings.TrimSpace(s.State)
+		if stateRoot == "" && s.Registry != nil {
+			stateRoot = filepath.Dir(s.Registry.Root)
+		}
+		tenantID, tenantErr := s.Journal.WorkflowTenant(r.Context(), wfID)
+		if tenantErr != nil {
+			http.Error(w, "workflow cannot be enabled: workflow tenant is unavailable", http.StatusConflict)
+			return
+		}
+		// Activation is a new trust decision: a pre-existing artifact may be
+		// allowed to finish/dispatch under its original source policy, but an
+		// unverified legacy inner-step block graph must not pass review-to-enable.
+		proof := workflowproof.CheckVersionForTenant(stateRoot, slug, tenantID, version)
+		if proof.Status != "verified" {
+			http.Error(w, "workflow cannot be enabled: "+proof.Error(), http.StatusConflict)
+			return
+		}
+		if s.WorkerArtifactRoot != "" {
+			workerProof := workflowproof.CheckVersionForTenant(s.WorkerArtifactRoot, slug, tenantID, version)
+			if workerProof.Status != "verified" {
+				http.Error(w, "workflow cannot be enabled: exact artifact and retained source are not verified on distributed worker storage (status "+workerProof.Status+"); publish the reviewed version first", http.StatusConflict)
+				return
+			}
+		}
+	}
+	if enabled {
+		// The proof above is a read-time check; fence the state mutation to the
+		// exact immutable version that was reviewed so a concurrent authoring
+		// write cannot activate a different version.
+		if err := s.Journal.SetWorkflowEnabledIfVersion(r.Context(), wfID, true, reviewedVersion.Version); err != nil {
+			s.errorPage(w, "set workflow enabled", err)
+			return
+		}
+	} else if err := s.Journal.SetWorkflowEnabled(r.Context(), wfID, false); err != nil {
 		s.errorPage(w, "set workflow enabled", err)
 		return
 	}

@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -37,11 +38,41 @@ const (
 )
 
 var bannedImports = map[string]string{
-	"math/rand":    "use the runtime's Step boundary; nondeterministic randomness breaks replay",
-	"math/rand/v2": "same as math/rand",
-	"os/exec":      "workflows must not shell out",
-	"syscall":      "no raw syscalls",
-	"unsafe":       "no unsafe pointer arithmetic in workflows",
+	"math/rand":       "use the runtime's Step boundary; nondeterministic randomness breaks replay",
+	"math/rand/v2":    "same as math/rand",
+	"os/exec":         "workflows must not shell out",
+	"os":              "workflows must use Reactor inputs, vault grants, and SDKs instead of direct filesystem or environment access",
+	"io/ioutil":       "workflows must not read or write the daemon filesystem through deprecated os wrappers",
+	"go/parser":       "workflows must not open arbitrary files through parser.ParseFile",
+	"text/template":   "workflows must not open arbitrary files through template.ParseFiles",
+	"html/template":   "workflows must not open arbitrary files through template.ParseFiles",
+	"debug/elf":       "workflows must not open arbitrary files through debug object readers",
+	"debug/macho":     "workflows must not open arbitrary files through debug object readers",
+	"debug/pe":        "workflows must not open arbitrary files through debug object readers",
+	"debug/plan9obj":  "workflows must not open arbitrary files through debug object readers",
+	"log/syslog":      "workflows must not open raw network or Unix-domain logging sockets",
+	"syscall":         "no raw syscalls",
+	"unsafe":          "no unsafe pointer arithmetic in workflows",
+	"net":             "use github.com/bright-interaction/reactor/sdk/http so outbound calls share SSRF, timeout, and retry policy",
+	"net/http":        "use github.com/bright-interaction/reactor/sdk/http so outbound calls share timeout and retry policy",
+	"net/smtp":        "workflow email must use the reviewed SDK connector",
+	"net/rpc":         "raw network transports are forbidden in workflows",
+	"net/rpc/jsonrpc": "raw network transports are forbidden in workflows",
+	"crypto/tls":      "raw network transports are forbidden; use the reviewed SDK connector",
+}
+
+// These binding hooks exist for in-process SDK tests. A production workflow
+// must use the host-installed bindings or its reviewed source could replace a
+// real connector call with a fabricated result or suppress an observed block
+// receipt. LintDir skips _test.go, where these hooks remain available.
+var testOnlySDKHooks = map[string]map[string]bool{
+	"github.com/bright-interaction/reactor/sdk/email": {"BindMailSender": true},
+	"github.com/bright-interaction/reactor/sdk/http":  {"BindConnectorRequester": true},
+	"github.com/bright-interaction/reactor/sdk/vault": {"BindFunc": true},
+	"github.com/bright-interaction/reactor/sdk/blocks": {
+		"WithJoinObserver": true, "WithSplitObserver": true,
+		"WithIterateObserver": true, "WithAggregateObserver": true,
+	},
 }
 
 // Lint reports every Reactor violation in src. path is used only for
@@ -50,7 +81,7 @@ var bannedImports = map[string]string{
 // with rule="parse" so callers can render them uniformly.
 //
 // Forbidden:
-//   - import of "math/rand", "math/rand/v2", "os/exec", "syscall", "unsafe"
+//   - import of "math/rand", "math/rand/v2", "os", "os/exec", "syscall", "unsafe", raw network transports
 //   - call to time.Sleep (use flow.Sleep)
 //   - call to time.Now  (deterministic replay; record times inside Step closures)
 //   - call to os.StartProcess (process spawning; the os/exec import denial
@@ -88,8 +119,23 @@ func Lint(src []byte, path string) []Issue {
 		return issues
 	}
 
+	sdkHookImports := map[string]string{}
+	dotSDKHookNames := map[string]bool{}
 	for _, imp := range f.Imports {
 		ipath := strings.Trim(imp.Path.Value, `"`)
+		if _, protected := testOnlySDKHooks[ipath]; protected {
+			alias := pathpkg.Base(ipath)
+			if imp.Name != nil {
+				alias = imp.Name.Name
+			}
+			if alias == "." {
+				for hook := range testOnlySDKHooks[ipath] {
+					dotSDKHookNames[hook] = true
+				}
+			} else if alias != "_" {
+				sdkHookImports[alias] = ipath
+			}
+		}
 		reason, banned := bannedImports[ipath]
 		if !banned {
 			continue
@@ -123,11 +169,11 @@ func Lint(src []byte, path string) []Issue {
 			// Walk the FuncLit body explicitly so the depth bookkeeping
 			// stays paired with the recursion.
 			ast.Inspect(n.(*ast.FuncLit).Body, func(inner ast.Node) bool {
-				return inspectCalls(inner, fset, path, &issues, funcLitDepth)
+				return inspectCalls(inner, fset, path, &issues, funcLitDepth, sdkHookImports, dotSDKHookNames)
 			})
 			return false
 		}
-		return inspectCalls(n, fset, path, &issues, funcLitDepth)
+		return inspectCalls(n, fset, path, &issues, funcLitDepth, sdkHookImports, dotSDKHookNames)
 	})
 
 	sort.SliceStable(issues, func(i, j int) bool {
@@ -197,7 +243,19 @@ func lintWorkflow(src string) error {
 
 // inspectCalls runs the per-CallExpr rules. Pulled out of the Lint
 // closure so the FuncLit-depth bookkeeping has one re-entry point.
-func inspectCalls(n ast.Node, fset *token.FileSet, path string, issues *[]Issue, funcLitDepth int) bool {
+func inspectCalls(n ast.Node, fset *token.FileSet, path string, issues *[]Issue, funcLitDepth int, sdkHookImports map[string]string, dotSDKHookNames map[string]bool) bool {
+	if sel, ok := n.(*ast.SelectorExpr); ok {
+		if ident, ok := sel.X.(*ast.Ident); ok && testOnlySDKHooks[sdkHookImports[ident.Name]][sel.Sel.Name] {
+			pos := fset.Position(sel.Pos())
+			*issues = append(*issues, Issue{Path: path, Line: pos.Line, Col: pos.Column,
+				Rule: RuleBannedCall, Message: "SDK test-binding hook forbidden in workflow source"})
+		}
+	}
+	if ident, ok := n.(*ast.Ident); ok && dotSDKHookNames[ident.Name] {
+		pos := fset.Position(ident.Pos())
+		*issues = append(*issues, Issue{Path: path, Line: pos.Line, Col: pos.Column,
+			Rule: RuleBannedCall, Message: "SDK test-binding hook forbidden in workflow source"})
+	}
 	call, ok := n.(*ast.CallExpr)
 	if !ok {
 		return true

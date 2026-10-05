@@ -12,19 +12,21 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/bright-interaction/reactor/internal/dispatcher"
 	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/supervisor"
+	"github.com/bright-interaction/reactor/internal/workflowproof"
 )
 
 // cmdDLQ dispatches the dlq subcommand group: list / show / retry.
 //
-// retry re-runs the workflow with the same RunID. The supervisor's
-// journal cache short-circuits previously-succeeded steps; the failed
-// step has no succeeded output_jsonb row so it re-executes. On run
-// success, the dead_letter row is deleted; on failure, last_rotation_
-// error semantics apply (run terminal flips to failed_dlq again).
+// retry re-runs the workflow with the same RunID through the canonical
+// dispatcher. The supervisor's journal cache short-circuits previously-
+// succeeded steps; the failed step has no succeeded output_jsonb row so it
+// re-executes. On run success, the dead_letter row is deleted; on failure,
+// the run terminal flips back to failed_dlq through the normal repair path.
 func cmdDLQ(ctx context.Context, log *slog.Logger, args []string) error {
 	if len(args) == 0 {
 		return errors.New("dlq: missing subcommand (list|show|retry)")
@@ -45,6 +47,8 @@ func cmdDLQ(ctx context.Context, log *slog.Logger, args []string) error {
 func cmdDLQList(ctx context.Context, log *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("dlq list", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
+	root := fs.String("root", defaultRoot(), "Reactor state root containing master.key")
+	masterKeyFile := fs.String("master-key-file", "", "path to a 64-hex-char master key (default <root>/master.key)")
 	limit := fs.Int("limit", 50, "max items to return")
 	offset := fs.Int("offset", 0, "rows to skip")
 	asJSON := fs.Bool("json", false, "emit JSON")
@@ -60,6 +64,9 @@ func cmdDLQList(ctx context.Context, log *slog.Logger, args []string) error {
 		return err
 	}
 	defer closer()
+	if err := loadDLQReadPayloadKey(ctx, j, *root, *masterKeyFile); err != nil {
+		return err
+	}
 
 	items, err := j.ListDeadLetterItems(ctx, *limit, *offset)
 	if err != nil {
@@ -98,6 +105,8 @@ func cmdDLQList(ctx context.Context, log *slog.Logger, args []string) error {
 func cmdDLQShow(ctx context.Context, _ *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("dlq show", flag.ContinueOnError)
 	dbURL := fs.String("db", envFirst("REACTOR_DB_URL", "ARACHNE_DB_URL"), "database URL")
+	root := fs.String("root", defaultRoot(), "Reactor state root containing master.key")
+	masterKeyFile := fs.String("master-key-file", "", "path to a 64-hex-char master key (default <root>/master.key)")
 	asJSON := fs.Bool("json", false, "emit JSON")
 	// stdlib flag.Parse stops at the first non-flag arg. Users naturally
 	// type `reactor dlq show --db ... <id> --json` (positional in the
@@ -118,6 +127,9 @@ func cmdDLQShow(ctx context.Context, _ *slog.Logger, args []string) error {
 		return err
 	}
 	defer closer()
+	if err := loadDLQReadPayloadKey(ctx, j, *root, *masterKeyFile); err != nil {
+		return err
+	}
 
 	item, err := j.GetDeadLetterItem(ctx, id)
 	if err != nil {
@@ -141,11 +153,37 @@ func cmdDLQShow(ctx context.Context, _ *slog.Logger, args []string) error {
 	return nil
 }
 
-// cmdDLQRetry re-runs the workflow that owns the dead-letter row by
-// spawning a fresh supervisor with the original RunID. The supervisor's
-// journal cache short-circuits every previously-succeeded step; the
-// failed step has no succeeded output_jsonb row so the closure runs
-// again. On success, the dead_letter row is removed.
+func loadDLQReadPayloadKey(ctx context.Context, j *journal.Journal, root, masterKeyFile string) error {
+	hasKey, err := j.HasPayloadKey(ctx)
+	if err != nil || !hasKey {
+		return err
+	}
+	masterHex, err := loadMasterKey(envFirst("REACTOR_MASTER_KEY", "ARACHNE_MASTER_KEY"), masterKeyFile, root)
+	if err != nil {
+		return fmt.Errorf("dlq: journal payload key: %w", err)
+	}
+	master, err := decodeMasterKey(masterHex)
+	if err != nil {
+		return fmt.Errorf("dlq: journal payload key: %w", err)
+	}
+	var previous []byte
+	if prevHex := envFirst("REACTOR_MASTER_KEY_PREVIOUS", "ARACHNE_MASTER_KEY_PREVIOUS"); prevHex != "" {
+		previous, err = decodeMasterKey(prevHex)
+		if err != nil {
+			return fmt.Errorf("dlq: previous journal payload key: %w", err)
+		}
+	}
+	if err := j.LoadPayloadEncryption(ctx, master, previous); err != nil {
+		return fmt.Errorf("dlq: journal payload key: %w", err)
+	}
+	return nil
+}
+
+// cmdDLQRetry re-runs the workflow that owns the dead-letter row through the
+// same Dispatcher path used by HTTP MCP, dashboard, webhook and cron. The
+// dispatcher resolves and verifies the pinned artifact immediately before the
+// retry, applies the normal admission gates, and owns the terminal/DLQ repair
+// lifecycle. This command is only an adapter for flags and output.
 //
 //	reactor dlq retry --db <url> --master-key-file <path> <dlq-id>
 //
@@ -179,6 +217,34 @@ func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 	}
 	defer closer()
 
+	if *root == "" {
+		return errors.New("dlq retry: missing --root (and HOME unset)")
+	}
+	hasPayloadKey, err := j.HasPayloadKey(ctx)
+	if err != nil {
+		return err
+	}
+	var masterHex string
+	if hasPayloadKey || engine != migrate.EnginePostgres {
+		masterHex, err = loadMasterKey(*masterKeyHex, *masterKeyFile, *root)
+		if err != nil {
+			return err
+		}
+		masterKey, decodeErr := decodeMasterKey(masterHex)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		var previous []byte
+		if prevHex := envFirst("REACTOR_MASTER_KEY_PREVIOUS", "ARACHNE_MASTER_KEY_PREVIOUS"); prevHex != "" {
+			previous, err = decodeMasterKey(prevHex)
+			if err != nil {
+				return fmt.Errorf("REACTOR_MASTER_KEY_PREVIOUS: %w", err)
+			}
+		}
+		if err := j.LoadPayloadEncryption(ctx, masterKey, previous); err != nil {
+			return fmt.Errorf("dlq retry: journal payload key: %w", err)
+		}
+	}
 	item, err := j.GetDeadLetterItem(ctx, dlqID)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
@@ -186,108 +252,52 @@ func cmdDLQRetry(ctx context.Context, log *slog.Logger, args []string) error {
 		}
 		return err
 	}
-
-	run, err := j.GetRun(ctx, item.RunID)
-	if err != nil {
-		return fmt.Errorf("dlq retry: get run: %w", err)
-	}
-	slug, err := j.WorkflowSlugByID(ctx, run.WorkflowID)
-	if err != nil {
-		return fmt.Errorf("dlq retry: workflow lookup: %w", err)
-	}
-	if _, err := j.ValidateRunWorkflowArtifact(ctx, run); err != nil {
-		_ = j.LogRunArtifactFence(context.WithoutCancel(ctx), run.ID)
-		return fmt.Errorf("dlq retry: refused by workflow artifact fence: %w", err)
-	}
-	if enabled, err := j.IsWorkflowEnabled(ctx, run.WorkflowID); err != nil {
-		return fmt.Errorf("dlq retry: workflow enabled gate: %w", err)
-	} else if !enabled {
-		return errors.New("dlq retry: workflow is disabled")
-	}
-	if err := j.CheckWorkflowEnqueueAllowed(ctx, run.WorkflowID); err != nil {
-		return fmt.Errorf("dlq retry: workflow quota gate: %w", err)
-	}
-	if allowed, limit, err := j.CheckWorkflowRateLimit(ctx, run.WorkflowID); err != nil {
-		return fmt.Errorf("dlq retry: workflow rate-limit gate: %w", err)
-	} else if !allowed {
-		return fmt.Errorf("dlq retry: workflow rate limit reached (%d/minute)", limit)
-	}
-
-	if engine == migrate.EnginePostgres {
-		// PostgreSQL is the serve/worker split. Never execute synchronously in
-		// this CLI process without a lease: a terminal disconnect would leave a
-		// running row no worker can reclaim. The worker resolves and verifies the
-		// immutable artifact again immediately before execution.
-		claimed, err := j.StartDeadLetterRetryQueuedItem(ctx, item.RunID, item.ID)
-		if err != nil {
-			return fmt.Errorf("dlq retry: enqueue run: %w", err)
-		}
-		if !claimed {
-			return errors.New("dlq retry: run is not in the current failed_dlq state")
-		}
-		fmt.Printf("retry %s -> run %s status=queued\n", dlqID, item.RunID)
-		return nil
-	}
-
-	if *root == "" {
-		return errors.New("dlq retry: missing --root (and HOME unset)")
-	}
-	masterHex, err := loadMasterKey(*masterKeyHex, *masterKeyFile, *root)
-	if err != nil {
-		return err
-	}
-	// Local mode opens the same vault + immutable binary registry as serve.
-	store, vaultCloser, err := openVaultStore(*dbURL, masterHex)
-	if err != nil {
-		return err
-	}
-	defer vaultCloser()
 	reg := registry.New(filepath.Join(*root, "workflows"))
-	binaryPath, err := reg.ArtifactPath(slug, run.WorkflowArtifactSHA256)
-	if err != nil {
-		_ = j.LogRunArtifactFence(context.WithoutCancel(ctx), run.ID)
-		return fmt.Errorf("dlq retry: refused by workflow artifact fence: immutable artifact failed verification")
+	var vaultReader supervisor.VaultReader
+	var signalSigningKey []byte
+	var vaultCloser func()
+	if engine != migrate.EnginePostgres {
+		store, closeVault, openErr := openVaultStore(*dbURL, masterHex)
+		if openErr != nil {
+			return openErr
+		}
+		vaultReader = store
+		vaultCloser = closeVault
+		signalSigningKey, _ = decodeMasterKey(masterHex)
+		defer vaultCloser()
 	}
 
-	// Atomically claim the redrive and open a fresh bounded retry generation.
-	// Artifact validation above must happen first: an untrusted executable must
-	// not consume the operator's redrive claim/budget.
-	claimed, err := j.StartDeadLetterRetryItem(ctx, item.RunID, item.ID)
+	d := &dispatcher.Dispatcher{
+		Journal:               j,
+		Resolver:              &dispatcher.SQLResolver{Journal: j},
+		ArtifactPath:          reg.ArtifactPath,
+		ArtifactPathForTenant: reg.TenantArtifactPath,
+		IntegrityCheck: func(ctx context.Context, slug string, version journal.WorkflowVersion) error {
+			tenant, err := j.WorkflowTenant(ctx, version.WorkflowID)
+			if err != nil {
+				return fmt.Errorf("resolve workflow tenant for source proof: %w", err)
+			}
+			return workflowproof.ValidateVersionForTenant(*root, slug, tenant, version)
+		},
+		Log:     log,
+		Enqueue: engine == migrate.EnginePostgres,
+		Sup: supervisor.Supervisor{
+			Vault:            vaultReader,
+			SignalSigningKey: signalSigningKey,
+			Limits: supervisor.ResourceLimits{
+				CgroupRoot:    os.Getenv("REACTOR_CGROUP_ROOT"),
+				RequireCgroup: os.Getenv("REACTOR_REQUIRE_WORKFLOW_CGROUP") == "1",
+			},
+		},
+	}
+	status, err := d.RetryDeadLetter(ctx, dlqID)
 	if err != nil {
-		return fmt.Errorf("dlq retry: claim run: %w", err)
-	}
-	if !claimed {
-		return errors.New("dlq retry: run is already executing or was cancelled")
-	}
-
-	signKey, _ := decodeMasterKey(masterHex)
-	sup := supervisor.Supervisor{
-		BinaryPath:       binaryPath,
-		WorkflowSlug:     slug,
-		RunID:            item.RunID,
-		Mode:             "live",
-		Journal:          j,
-		Vault:            store,
-		Log:              log,
-		Input:            run.TriggerMeta,
-		SignalSigningKey: signKey,
-	}
-	status, err := sup.Run(ctx)
-	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return fmt.Errorf("dlq retry: %s not found", dlqID)
+		}
 		return fmt.Errorf("dlq retry: %w", err)
 	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("dlq retry: %w", ctx.Err())
-	}
 	fmt.Printf("retry %s -> run %s status=%s\n", dlqID, item.RunID, status)
-	if status == "succeeded" {
-		cleared, err := j.DeleteDeadLettersByRun(context.WithoutCancel(ctx), item.RunID)
-		if err != nil {
-			log.Warn("dlq retry: cleanup failed", "err", err)
-		} else {
-			fmt.Printf("cleared %d dead-letter item(s) for run %s\n", cleared, item.RunID)
-		}
-	}
 	return nil
 }
 
@@ -304,7 +314,27 @@ func openJournal(dbURL string) (*journal.Journal, func(), error) {
 	if engine == migrate.EnginePostgres {
 		jEngine = journal.EnginePostgres
 	}
-	return journal.New(db, jEngine), closer, nil
+	j := journal.New(db, jEngine)
+	if masterHex := envFirst("REACTOR_MASTER_KEY", "ARACHNE_MASTER_KEY"); masterHex != "" {
+		master, err := decodeMasterKey(masterHex)
+		if err != nil {
+			closer()
+			return nil, nil, err
+		}
+		var previous []byte
+		if prevHex := envFirst("REACTOR_MASTER_KEY_PREVIOUS", "ARACHNE_MASTER_KEY_PREVIOUS"); prevHex != "" {
+			previous, err = decodeMasterKey(prevHex)
+			if err != nil {
+				closer()
+				return nil, nil, fmt.Errorf("REACTOR_MASTER_KEY_PREVIOUS: %w", err)
+			}
+		}
+		if err := j.LoadPayloadEncryption(context.Background(), master, previous); err != nil {
+			closer()
+			return nil, nil, err
+		}
+	}
+	return j, closer, nil
 }
 
 // truncate trims s to n runes plus an ellipsis when it overflows. Used

@@ -30,6 +30,21 @@ type NotificationChannel struct {
 	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
+// NotificationChannelMetadata is the config-free projection used by control
+// plane inventories and dashboard selectors. Channel config can contain
+// webhook credentials or SMTP secrets, and legacy rows are not guaranteed to
+// have a small JSON blob. Keep the metadata read physically separate from
+// NotificationChannel so an inventory cannot materialize or accidentally
+// serialize config_json.
+type NotificationChannelMetadata struct {
+	ID        string    `json:"id"`
+	TenantID  string    `json:"tenant_id"`
+	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // WorkflowNotificationRoute pairs a workflow with a channel + the list
 // of terminal statuses (comma-separated) that should fire it.
 type WorkflowNotificationRoute struct {
@@ -96,9 +111,14 @@ func (j *Journal) CreateNotificationChannelInTenant(ctx context.Context, tenantI
 }
 
 func (j *Journal) createChannel(ctx context.Context, id, tenantID, name, kind string, config json.RawMessage) (string, error) {
-	const q = `INSERT INTO notification_channels (id, tenant_id, name, kind, config_json) VALUES ($1, $2, $3, $4, $5)`
-	cfg := outputArg(config, j.engine)
-	if _, err := j.db.ExecContext(ctx, j.bind(q), id, tenantID, name, kind, cfg); err != nil {
+	cfg, version, plainBytes, err := j.prepareNotificationConfig(ctx, tenantID, id, kind, config)
+	if err != nil {
+		return "", err
+	}
+	const q = `INSERT INTO notification_channels
+		(id, tenant_id, name, kind, config_json, config_crypto_version, config_plaintext_bytes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	if _, err := j.db.ExecContext(ctx, j.bind(q), id, tenantID, name, kind, cfg, version, plainBytes); err != nil {
 		if isUniqueViolation(err) {
 			return "", ErrChannelNameTaken
 		}
@@ -137,14 +157,15 @@ func (j *Journal) ListNotificationChannels(ctx context.Context) ([]NotificationC
 // from this, so an unscoped call there leaks the id/name/kind of every channel
 // in the install.
 func (j *Journal) ListNotificationChannelsByTenant(ctx context.Context, tenantID string) ([]NotificationChannel, error) {
-	q := `SELECT id, tenant_id, name, kind, config_json, created_at, updated_at
-		FROM notification_channels`
+	q := fmt.Sprintf(`SELECT c.id, c.tenant_id, c.name, c.kind, %s,
+		c.config_crypto_version, c.config_plaintext_bytes, c.created_at, c.updated_at
+		FROM notification_channels c`, j.notificationConfigProjection("c"))
 	args := []any{}
 	if tenantID != "" {
-		q += ` WHERE tenant_id = $1`
+		q += ` WHERE c.tenant_id = $1`
 		args = append(args, tenantID)
 	}
-	q += ` ORDER BY name ASC`
+	q += ` ORDER BY c.name ASC`
 	rows, err := j.db.QueryContext(ctx, j.bind(q), args...)
 	if err != nil {
 		return nil, fmt.Errorf("journal: list notification channels: %w", err)
@@ -161,17 +182,174 @@ func (j *Journal) ListNotificationChannelsByTenant(ctx context.Context, tenantID
 	return out, rows.Err()
 }
 
+// ListNotificationChannelsByTenantPage returns one bounded full-config channel
+// page and a lookahead flag. Metadata-only dashboard and MCP inventories use
+// the separate projection below.
+func (j *Journal) ListNotificationChannelsByTenantPage(ctx context.Context, tenantID string, limit, offset int) ([]NotificationChannel, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, fmt.Errorf("journal: list notification channels: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, fmt.Errorf("journal: list notification channels: negative offset")
+	}
+	q := fmt.Sprintf(`SELECT c.id, c.tenant_id, c.name, c.kind, %s,
+		c.config_crypto_version, c.config_plaintext_bytes, c.created_at, c.updated_at
+		FROM notification_channels c WHERE c.tenant_id = $1 ORDER BY c.name ASC, c.id ASC LIMIT %d OFFSET %d`,
+		j.notificationConfigProjection("c"), limit+1, offset)
+	rows, err := j.db.QueryContext(ctx, j.bind(q), tenantID)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list notification channels page: %w", err)
+	}
+	defer rows.Close()
+	var out []NotificationChannel
+	for rows.Next() {
+		ch, err := scanChannel(rows.Scan, j)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, ch)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// ListNotificationChannelMetadataPage returns a bounded, install-wide page
+// without selecting config_json. Callers must enforce an admin role before
+// using this unscoped inventory.
+func (j *Journal) ListNotificationChannelMetadataPage(ctx context.Context, limit, offset int) ([]NotificationChannelMetadata, bool, error) {
+	return j.listNotificationChannelMetadataPage(ctx, "", limit, offset)
+}
+
+// ListNotificationChannelMetadataByTenantPage returns a bounded tenant-scoped
+// page without selecting config_json. Control-plane inventories and dashboard
+// selectors need the id/name/kind metadata, not destination configuration.
+func (j *Journal) ListNotificationChannelMetadataByTenantPage(ctx context.Context, tenantID string, limit, offset int) ([]NotificationChannelMetadata, bool, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, false, errors.New("journal: list notification channel metadata: tenant required")
+	}
+	return j.listNotificationChannelMetadataPage(ctx, tenantID, limit, offset)
+}
+
+func (j *Journal) listNotificationChannelMetadataPage(ctx context.Context, tenantID string, limit, offset int) ([]NotificationChannelMetadata, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, fmt.Errorf("journal: list notification channel metadata: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, fmt.Errorf("journal: list notification channel metadata: negative offset")
+	}
+	q := `SELECT id, tenant_id, name, kind, created_at, updated_at FROM notification_channels`
+	args := []any{}
+	if tenantID != "" {
+		q += ` WHERE tenant_id = $1`
+		args = append(args, tenantID)
+	}
+	q += fmt.Sprintf(` ORDER BY name ASC, id ASC LIMIT %d OFFSET %d`, limit+1, offset)
+	rows, err := j.db.QueryContext(ctx, j.bind(q), args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list notification channel metadata page: %w", err)
+	}
+	defer rows.Close()
+	out := make([]NotificationChannelMetadata, 0, limit)
+	for rows.Next() {
+		var (
+			ch      NotificationChannelMetadata
+			created sql.NullString
+			updated sql.NullString
+		)
+		if err := rows.Scan(&ch.ID, &ch.TenantID, &ch.Name, &ch.Kind, &created, &updated); err != nil {
+			return nil, false, fmt.Errorf("journal: scan notification channel metadata page: %w", err)
+		}
+		if created.Valid {
+			if t, parseErr := j.parseTime(created.String); parseErr == nil {
+				ch.CreatedAt = t
+			}
+		}
+		if updated.Valid {
+			if t, parseErr := j.parseTime(updated.String); parseErr == nil {
+				ch.UpdatedAt = t
+			}
+		}
+		out = append(out, ch)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("journal: iterate notification channel metadata page: %w", err)
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
 // GetNotificationChannel returns one channel by id.
 func (j *Journal) GetNotificationChannel(ctx context.Context, id string) (NotificationChannel, error) {
-	const q = `SELECT id, tenant_id, name, kind, config_json, created_at, updated_at
-		FROM notification_channels WHERE id = $1`
-	row := j.db.QueryRowContext(ctx, j.bind(q), id)
+	return j.getNotificationChannel(ctx, id, "")
+}
+
+func (j *Journal) getNotificationChannel(ctx context.Context, id, tenantID string) (NotificationChannel, error) {
+	q := fmt.Sprintf(`SELECT c.id, c.tenant_id, c.name, c.kind, %s,
+		c.config_crypto_version, c.config_plaintext_bytes, c.created_at, c.updated_at
+		FROM notification_channels c WHERE c.id = $1`, j.notificationConfigProjection("c"))
+	args := []any{id}
+	if tenantID != "" {
+		q += ` AND c.tenant_id = $2`
+		args = append(args, tenantID)
+	}
+	row := j.db.QueryRowContext(ctx, j.bind(q), args...)
 	ch, err := scanChannel(row.Scan, j)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NotificationChannel{}, ErrNotFound
 		}
 		return NotificationChannel{}, err
+	}
+	return ch, nil
+}
+
+// GetNotificationChannelMetadataForTenant resolves one channel without
+// selecting config_json. Mutation/control-plane callers only need to prove
+// ownership and carry the stable id into a route operation; loading the full
+// configuration here would materialize webhook credentials or SMTP secrets
+// from legacy rows before the tenant check runs.
+func (j *Journal) GetNotificationChannelMetadataForTenant(ctx context.Context, id, tenantID string) (NotificationChannelMetadata, error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(tenantID) == "" {
+		return NotificationChannelMetadata{}, ErrNotFound
+	}
+	const q = `SELECT id, tenant_id, name, kind, created_at, updated_at
+		FROM notification_channels WHERE id = $1 AND tenant_id = $2`
+	row := j.db.QueryRowContext(ctx, j.bind(q), id, tenantID)
+	var (
+		ch      NotificationChannelMetadata
+		created sql.NullString
+		updated sql.NullString
+	)
+	if err := row.Scan(&ch.ID, &ch.TenantID, &ch.Name, &ch.Kind, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NotificationChannelMetadata{}, ErrNotFound
+		}
+		return NotificationChannelMetadata{}, fmt.Errorf("journal: get notification channel metadata: %w", err)
+	}
+	if created.Valid {
+		if t, parseErr := j.parseTime(created.String); parseErr == nil {
+			ch.CreatedAt = t
+		}
+	}
+	if updated.Valid {
+		if t, parseErr := j.parseTime(updated.String); parseErr == nil {
+			ch.UpdatedAt = t
+		}
 	}
 	return ch, nil
 }
@@ -286,18 +464,23 @@ func (j *Journal) DeleteNotificationRoute(ctx context.Context, workflowID, chann
 // a workflow plus the joined channel row so the dashboard can render
 // channel name + kind without a second lookup.
 type NotificationRouteWithChannel struct {
-	WorkflowID  string
-	ChannelID   string
-	ChannelName string
-	ChannelKind string
-	OnStatuses  string
-	CreatedAt   time.Time
+	WorkflowID           string
+	ChannelID            string
+	ChannelName          string
+	ChannelKind          string
+	OnStatuses           string
+	CreatedAt            time.Time
+	ChannelNameBytes     int  `json:"-"`
+	ChannelNameTruncated bool `json:"-"`
+	OnStatusesBytes      int  `json:"-"`
+	OnStatusesTruncated  bool `json:"-"`
 }
 
 func (j *Journal) ListNotificationRoutesForWorkflow(ctx context.Context, workflowID string) ([]NotificationRouteWithChannel, error) {
 	const q = `SELECT r.workflow_id, r.channel_id, c.name, c.kind, r.on_statuses, r.created_at
 		FROM workflow_notification_routes r
-		JOIN notification_channels c ON c.id = r.channel_id
+		JOIN workflows w ON w.id = r.workflow_id
+		JOIN notification_channels c ON c.id = r.channel_id AND c.tenant_id = w.tenant_id
 		WHERE r.workflow_id = $1
 		ORDER BY c.name ASC`
 	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
@@ -324,52 +507,158 @@ func (j *Journal) ListNotificationRoutesForWorkflow(ctx context.Context, workflo
 	return out, rows.Err()
 }
 
+// ListNotificationRoutesForWorkflowPage returns one bounded page plus an
+// optional lookahead row. The MCP control plane uses the lookahead to expose
+// continuation metadata without counting or loading an unbounded route set.
+func (j *Journal) ListNotificationRoutesForWorkflowPage(ctx context.Context, workflowID string, limit, offset int) ([]NotificationRouteWithChannel, error) {
+	if limit <= 0 || limit > 500 || offset < 0 {
+		return nil, fmt.Errorf("journal: invalid notification route page")
+	}
+	const q = `SELECT r.workflow_id, r.channel_id, c.name, c.kind, r.on_statuses, r.created_at
+		FROM workflow_notification_routes r
+		JOIN workflows w ON w.id = r.workflow_id
+		JOIN notification_channels c ON c.id = r.channel_id AND c.tenant_id = w.tenant_id
+		WHERE r.workflow_id = $1
+		ORDER BY c.name ASC, r.channel_id ASC
+		LIMIT $2 OFFSET $3`
+	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("journal: list route page for workflow: %w", err)
+	}
+	defer rows.Close()
+	var out []NotificationRouteWithChannel
+	for rows.Next() {
+		var (
+			row     NotificationRouteWithChannel
+			created sql.NullString
+		)
+		if err := rows.Scan(&row.WorkflowID, &row.ChannelID, &row.ChannelName, &row.ChannelKind, &row.OnStatuses, &created); err != nil {
+			return nil, err
+		}
+		if created.Valid {
+			if t, perr := j.parseTime(created.String); perr == nil {
+				row.CreatedAt = t
+			}
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// ListNotificationRoutesForWorkflowPageBounded is the MCP/read-model route
+// projection. Channel names and status CSVs are operator-controlled text and
+// older imports may contain arbitrarily large values. Measure each value in
+// SQL and return only a bounded prefix so a route inventory cannot allocate a
+// legacy blob merely to redact it after scanning.
+func (j *Journal) ListNotificationRoutesForWorkflowPageBounded(ctx context.Context, workflowID string, limit, offset, maxNameBytes, maxStatusesBytes int) ([]NotificationRouteWithChannel, error) {
+	if limit <= 0 || limit > 500 || offset < 0 {
+		return nil, fmt.Errorf("journal: invalid bounded notification route page")
+	}
+	if maxNameBytes <= 0 || maxStatusesBytes <= 0 || maxNameBytes > 16<<20 || maxStatusesBytes > 16<<20 {
+		return nil, fmt.Errorf("journal: invalid notification route text bounds")
+	}
+	var nameSize, nameValue, statusesSize, statusesValue string
+	if j.engine == EnginePostgres {
+		nameSize = "octet_length(c.name)"
+		nameValue = fmt.Sprintf("CASE WHEN %s <= %d THEN c.name ELSE left(c.name, %d) END", nameSize, maxNameBytes, maxNameBytes)
+		statusesSize = "octet_length(r.on_statuses)"
+		statusesValue = fmt.Sprintf("CASE WHEN %s <= %d THEN r.on_statuses ELSE left(r.on_statuses, %d) END", statusesSize, maxStatusesBytes, maxStatusesBytes)
+	} else {
+		nameSize = "length(CAST(c.name AS BLOB))"
+		nameValue = fmt.Sprintf("CASE WHEN %s <= %d THEN c.name ELSE substr(c.name, 1, %d) END", nameSize, maxNameBytes, maxNameBytes)
+		statusesSize = "length(CAST(r.on_statuses AS BLOB))"
+		statusesValue = fmt.Sprintf("CASE WHEN %s <= %d THEN r.on_statuses ELSE substr(r.on_statuses, 1, %d) END", statusesSize, maxStatusesBytes, maxStatusesBytes)
+	}
+	q := fmt.Sprintf(`SELECT r.workflow_id, r.channel_id, %s, c.kind, %s, r.created_at, %s, %s
+		FROM workflow_notification_routes r
+		JOIN workflows w ON w.id = r.workflow_id
+		JOIN notification_channels c ON c.id = r.channel_id AND c.tenant_id = w.tenant_id
+		WHERE r.workflow_id = $1
+		ORDER BY c.name ASC, r.channel_id ASC
+		LIMIT %d OFFSET %d`, nameValue, statusesValue, nameSize, statusesSize, limit, offset)
+	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("journal: list bounded route page: %w", err)
+	}
+	defer rows.Close()
+	out := make([]NotificationRouteWithChannel, 0, limit)
+	for rows.Next() {
+		var (
+			row           NotificationRouteWithChannel
+			created       sql.NullString
+			nameBytes     sql.NullInt64
+			statusesBytes sql.NullInt64
+		)
+		if err := rows.Scan(&row.WorkflowID, &row.ChannelID, &row.ChannelName, &row.ChannelKind, &row.OnStatuses, &created, &nameBytes, &statusesBytes); err != nil {
+			return nil, fmt.Errorf("journal: scan bounded route page: %w", err)
+		}
+		if nameBytes.Valid && nameBytes.Int64 >= 0 {
+			row.ChannelNameBytes = int(nameBytes.Int64)
+			row.ChannelNameTruncated = row.ChannelNameBytes > len([]byte(row.ChannelName))
+		}
+		if statusesBytes.Valid && statusesBytes.Int64 >= 0 {
+			row.OnStatusesBytes = int(statusesBytes.Int64)
+			row.OnStatusesTruncated = row.OnStatusesBytes > len([]byte(row.OnStatuses))
+		}
+		if created.Valid {
+			if t, perr := j.parseTime(created.String); perr == nil {
+				row.CreatedAt = t
+			}
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // ChannelsForRunTerminal returns the channels that should fire for a
-// terminal run, deduplicated and with their config_json so the
-// notifier can dispatch without a second round-trip.
+// terminal run. It first filters using route metadata, then loads only the
+// matching configurations. Unmatched legacy plaintext configs never enter
+// the notifier process merely because their workflow has another route.
 //
 // status comparison is exact (lowercased) against each route's
 // on_statuses CSV. Dispatcher calls this from OnTerminal.
 func (j *Journal) ChannelsForRunTerminal(ctx context.Context, workflowID, status string) ([]NotificationChannel, error) {
-	const q = `SELECT c.id, c.name, c.kind, c.config_json, c.created_at, c.updated_at, r.on_statuses
+	const q = `SELECT c.id, c.tenant_id, r.on_statuses
 		FROM workflow_notification_routes r
-		JOIN notification_channels c ON c.id = r.channel_id
+		JOIN workflows w ON w.id = r.workflow_id
+		JOIN notification_channels c ON c.id = r.channel_id AND c.tenant_id = w.tenant_id
 		WHERE r.workflow_id = $1`
 	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
 	if err != nil {
 		return nil, fmt.Errorf("journal: channels for run terminal: %w", err)
 	}
-	defer rows.Close()
 	status = strings.ToLower(strings.TrimSpace(status))
-	var out []NotificationChannel
+	type route struct{ id, tenant string }
+	var selected []route
 	for rows.Next() {
-		var (
-			ch         NotificationChannel
-			cfgBytes   []byte
-			created    sql.NullString
-			updated    sql.NullString
-			onStatuses string
-		)
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Kind, &cfgBytes, &created, &updated, &onStatuses); err != nil {
+		var id, tenantID, onStatuses string
+		if err := rows.Scan(&id, &tenantID, &onStatuses); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		if !routeFiresOn(onStatuses, status) {
-			continue
+		if routeFiresOn(onStatuses, status) {
+			selected = append(selected, route{id, tenantID})
 		}
-		ch.ConfigJSON = append(json.RawMessage(nil), cfgBytes...)
-		if created.Valid {
-			if t, perr := j.parseTime(created.String); perr == nil {
-				ch.CreatedAt = t
-			}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	var out []NotificationChannel
+	for _, item := range selected {
+		ch, err := j.getNotificationChannel(ctx, item.id, item.tenant)
+		if err != nil {
+			return nil, err
 		}
-		if updated.Valid {
-			if t, perr := j.parseTime(updated.String); perr == nil {
-				ch.UpdatedAt = t
-			}
+		if ch.TenantID != item.tenant {
+			return nil, ErrNotFound
 		}
 		out = append(out, ch)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func routeFiresOn(csv, status string) bool {
@@ -383,15 +672,19 @@ func routeFiresOn(csv, status string) bool {
 
 func scanChannel(scan func(...any) error, j *Journal) (NotificationChannel, error) {
 	var (
-		ch       NotificationChannel
-		cfgBytes []byte
-		created  sql.NullString
-		updated  sql.NullString
+		ch         NotificationChannel
+		cfgBytes   []byte
+		version    int
+		plainBytes sql.NullInt64
+		created    sql.NullString
+		updated    sql.NullString
 	)
-	if err := scan(&ch.ID, &ch.TenantID, &ch.Name, &ch.Kind, &cfgBytes, &created, &updated); err != nil {
+	if err := scan(&ch.ID, &ch.TenantID, &ch.Name, &ch.Kind, &cfgBytes, &version, &plainBytes, &created, &updated); err != nil {
 		return NotificationChannel{}, err
 	}
-	ch.ConfigJSON = append(json.RawMessage(nil), cfgBytes...)
+	if err := j.openNotificationConfig(&ch, version, plainBytes, cfgBytes); err != nil {
+		return NotificationChannel{}, err
+	}
 	if created.Valid {
 		if t, perr := j.parseTime(created.String); perr == nil {
 			ch.CreatedAt = t

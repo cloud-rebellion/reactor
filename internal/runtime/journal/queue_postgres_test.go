@@ -14,6 +14,57 @@ import (
 	"github.com/bright-interaction/reactor/internal/migrate"
 )
 
+func TestReturnUnstartedLeasePostgres(t *testing.T) {
+	rawURL := os.Getenv("REACTOR_TEST_POSTGRES_URL")
+	if rawURL == "" {
+		t.Skip("set REACTOR_TEST_POSTGRES_URL to run the PostgreSQL unstarted-claim contract")
+	}
+	ctx := context.Background()
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := migrate.Up(ctx, quiet, rawURL); err != nil {
+		t.Fatal(err)
+	}
+	db, engine, err := migrate.Open(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if engine != migrate.EnginePostgres {
+		t.Fatalf("test database engine = %s, want PostgreSQL", engine)
+	}
+	j := New(db, EnginePostgres)
+	suffix := strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "")
+	wfID := "wf_unstarted_pg_" + suffix
+	runID := "run_unstarted_pg_" + suffix
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM runs WHERE id = $1`, runID)
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM workflows WHERE id = $1`, wfID)
+	}()
+	if err := j.CreateWorkflow(ctx, wfID, "unstarted-pg-"+suffix, "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateQueuedRun(ctx, runID, wfID, "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	first, err := j.ClaimQueuedRuns(ctx, "stopping-worker", 1, time.Hour)
+	if err != nil || len(first) != 1 || first[0].RunID != runID {
+		t.Fatalf("first claim = %+v, %v", first, err)
+	}
+	if err := j.ReturnUnstartedLease(ctx, runID, first[0].Owner); err != nil {
+		t.Fatal(err)
+	}
+	second, err := j.ClaimQueuedRuns(ctx, "replacement-worker", 1, time.Minute)
+	if err != nil || len(second) != 1 || second[0].RunID != runID || second[0].Owner == first[0].Owner {
+		t.Fatalf("replacement claim before original hour-long expiry = %+v, %v", second, err)
+	}
+	if err := j.ReturnUnstartedLease(ctx, runID, first[0].Owner); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("stale claim changed replacement = %v", err)
+	}
+	if err := j.ExtendLease(ctx, runID, second[0].Owner, time.Minute); err != nil {
+		t.Fatalf("replacement lost lease: %v", err)
+	}
+}
+
 // TestRunLeaseGenerationPostgres exercises the production SQL path, including
 // FOR UPDATE SKIP LOCKED reaping. CI/developers opt in with an isolated
 // PostgreSQL database; SQLite remains the default self-contained suite.
@@ -52,7 +103,7 @@ func TestRunLeaseGenerationPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := j.ClaimQueuedRuns(ctx, "worker-a", 1, -time.Minute)
+	first, err := j.ClaimQueuedRuns(ctx, "worker-a", 1, time.Minute)
 	if err != nil || len(first) != 1 || first[0].RunID != runID {
 		t.Fatalf("first postgres claim = %v, %v", first, err)
 	}
@@ -64,6 +115,12 @@ func TestRunLeaseGenerationPostgres(t *testing.T) {
 	}
 	if err := j.ExtendLease(ctx, runID, first[0].Owner, -time.Minute); err != nil {
 		t.Fatal(err)
+	}
+	if err := j.ExtendLease(ctx, runID, first[0].Owner, time.Minute); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("postgres expired renewal = %v, want ownership loss", err)
+	}
+	if err := j.VerifyLeaseOwner(ctx, runID, first[0].Owner); !errors.Is(err, ErrLeaseOwnershipLost) {
+		t.Fatalf("postgres expired verification = %v, want ownership loss", err)
 	}
 	if n, err := j.ReapExpiredLeases(ctx); err != nil || n != 1 {
 		t.Fatalf("postgres expired reap = %d, %v", n, err)

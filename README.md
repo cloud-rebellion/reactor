@@ -2,16 +2,30 @@
 
 AI-built workflow automation. Self-hosted. Single Go binary.
 
-You describe a workflow in natural language. Claude (via MCP) reads your live environment, generates production Go code wired to real endpoints and credential IDs, and commits it to git. The runtime executes it durably with checkpointing, replay, and zero-downtime credential rotation.
+You describe a workflow in natural language. An AI client (via authenticated
+HTTP MCP) can inspect the permitted environment and generate reviewable Go
+source wired to connection and credential references. Reactor can commit
+reviewed source to Git when a repository is present; set
+`REACTOR_GIT_BACKED=false` to keep an install filesystem-only. The runtime
+executes approved artifacts with durable checkpoints and replay.
 
 ## Status
 
-v0.1 ready. The daemon ticks scheduler + cron + rotation + HTTP + webhook + signal receivers + dashboard from one process. Codegen, knowledge corpus, graph lens, post-mortems, scaffold CLI, and MCP install all ship. Subprocess resource limits (Linux prlimit) and panic recovery on every daemon goroutine round out the production-safety floor. The dashboard has full write surfaces (add credentials, rotate, grant, set up webhook + cron triggers, generate workflows via the codegen prompt bar) so a non-developer operator can reach a running workflow without touching the CLI.
+v0.1 internal readiness is in progress. The daemon includes scheduler, cron,
+rotation, HTTP/webhook/signal receivers, dashboard, codegen, knowledge and
+graph views, post-mortems, scaffold CLI, and HTTP MCP installation. The
+dashboard can configure credentials and triggers and review generated flows.
+Local tests cover these surfaces, but the distributed deployment, sustained
+capacity, broad provider-credential isolation, and complete execution-data
+encryption still require implementation and acceptance. See
+[security](docs/security.md), [scaling](docs/scaling.md), and
+[operations](docs/operations.md) for current
+boundaries before using customer data.
 
 ## What makes this different
 
-- **AI builds, not drags.** No visual canvas. Claude with the MCP Environment Lens (services, credentials metadata, schemas, run history, post-mortems, knowledge corpus) is the primary builder.
-- **Code as artifact.** Generated Go is written to disk as real source, not JSON config, so it diffs and reviews like code. Commits are **opt-in**: the committer walks up from the workflow directory looking for a `.git`, and no-ops when there is none. `reactor init` does not create a repo, so run `git init` in your state directory (or point `--workflows-dir` at an existing repo) if you want `git log` as the audit trail. Note the MCP authoring path builds in a temp directory and does not retain source at all.
+- **AI builds, not drags.** Claude with the MCP Environment Lens (services, credentials metadata, schemas, run history, post-mortems, knowledge corpus) is the primary builder. Reactor also renders the stored DAG and each run's data flow in the dashboard and through `reactor_get_workflow_flow`.
+- **Code as artifact.** Generated Go is written to disk as real source, not JSON config, so it can be reviewed and versioned. The committer uses a detected Git repository by default; set `REACTOR_GIT_BACKED=false` to disable that side effect. It no-ops when there is no repository, and `reactor init` does not create one. MCP authoring retains the exact `main.go` and `dag.json` under the workflow and beside each immutable artifact; Git history remains an optional external review layer.
 - **Durable execution.** Step journal in the database. Workflows resume after restart. `Sleep(72h)` is real. Replay any past run.
 - **Self-contained vault.** AES-256-GCM, PBKDF2-SHA256 600k iterations, autorotation with zero-downtime hot-swap.
 - **One binary.** Go runtime, dashboard, webhook + signal receivers, vault, scheduler, rotation engine, MCP server, all embedded. SQLite single-node or Postgres scale-out.
@@ -20,14 +34,14 @@ v0.1 ready. The daemon ticks scheduler + cron + rotation + HTTP + webhook + sign
 
 ## Prerequisites
 
-- Go 1.22+ on `PATH` (the daemon spawns `go build` for each registered workflow)
+- Go 1.26.5+ on `PATH` for any path that builds workflows (the daemon and MCP authoring path spawn `go build`; the Homebrew formula and Docker image supply it, while native Linux packages require a host installation)
 - SQLite (bundled) or PostgreSQL 14+
 
 ## Quickstart (one-command setup)
 
 ```bash
 reactor setup                  # interactive: state dir, db, admin user + password
-source ~/.reactor/reactor.env  # loads REACTOR_DB_URL + REACTOR_BASIC_AUTH_USER + hash
+set -a; source ~/.reactor/reactor.env; set +a  # load DB, auth, and root env
 reactor serve --root ~/.reactor
 open http://127.0.0.1:7777/
 ```
@@ -58,21 +72,22 @@ The dispatcher resolves the trigger to a workflow, spawns a supervisor (with prl
 reactor setup    [--root <dir>] [--non-interactive ...]  one-command first-boot wizard
 reactor init     [--root <dir>]                          bootstrap state dir + master key (subset of setup)
 reactor migrate  --db <url>                              run pending schema migrations
-reactor serve    --db <url> [--addr :7777]               run the daemon (HTTP + scheduler + rotation + dashboard)
+reactor payload  backfill-command-definitions            seal one bounded batch of legacy command definitions
+reactor payload  backfill-run-logs                       seal one bounded batch of legacy run logs
+reactor serve    --db <url> [--addr 127.0.0.1:7777]      run the daemon (HTTP + scheduler + rotation + dashboard)
 reactor workflow list/register/build                     manage workflow registrations + binaries
 reactor new      <template> <name>                       scaffold a workflow from a template
 reactor generate --brief <text>|--brief-file|<stdin>     AI codegen via Claude (creates + commits)
 reactor replay   --db <url> <run-id>                     show timeline for a finalised run
 reactor test     <recorded-run>                          replay a run through the supervisor in replay mode
 reactor dlq      list/show [--json] [<id>]               dead-letter inspection
-reactor dlq      retry <dlq-id>                          re-run a failed step from the journal
+reactor dlq      retry <dlq-id>                          re-run through the canonical dispatcher gates
 reactor lint     [--format text|json] <path>             lint workflow .go file or dir
 reactor ps                                                read-only daemon state summary
 reactor vault    add/list/audit/rotate                   credential vault + rotation
 reactor vault    grant/revoke/grants                     per-workflow secret ACLs
 reactor knowledge add/list/search/show/supersede/promote/stale  knowledge corpus management
-reactor mcp      stdio [--allow-write]                   MCP server (stdio JSON-RPC 2.0)
-reactor mcp      install [--client all|claude-code|...]  register MCP server with AI clients
+reactor mcp      install --client X --url URL          register the HTTP MCP endpoint
 reactor version                                           print build version
 ```
 
@@ -94,7 +109,7 @@ The rotation engine delivers new credential values to consumers via these target
 | Provider        | Behaviour                                                                  |
 | --------------- | -------------------------------------------------------------------------- |
 | `cloudflare`    | Rolls a Cloudflare API token in place (PUT /user/tokens/{id}/value)        |
-| `shared-secret` | Mints a fresh 32-byte random hex value (HMAC keys, inter-service tokens)   |
+| `shared-secret` | Mints a fresh 32-byte random hex value (HMAC keys, inter-service tokens); requires explicit local-mint acknowledgement |
 | `aws-iam`       | Self-rotates an IAM user access key pair; deletes the old key with the new |
 | `manual`        | Reminder-only; audits "rotation due" without minting                       |
 
@@ -112,4 +127,4 @@ See [deploy/README.md](deploy/README.md) for systemd + Docker walkthroughs. [`de
 
 ## License
 
-Reactor is **fair-code** ([faircode.io](https://faircode.io)), licensed under the **Reactor Sustainable Use License**. The source is open to read, run, and modify. You can self-host it on your own VPS, use it commercially for your own business, and use it to deliver automation services to your clients. You cannot resell Reactor or run it as a hosted/managed service for third parties (a competing "Reactor cloud") without a separate commercial license. See [LICENSE](LICENSE), or email licensing@brightinteraction.com.
+Reactor is **fair-code** ([faircode.io](https://faircode.io)), licensed under the **Reactor Sustainable Use License**. The source is open to read, run, and modify. You can self-host it on your own VPS, use it commercially for your own business, and use it to deliver automation services to your clients. You cannot resell Reactor or run it as a hosted/managed service for third parties (a competing "Reactor cloud") without a separate commercial license. See [LICENSE](LICENSE), or email tom@cloudrebellion.se.

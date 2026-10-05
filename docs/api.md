@@ -51,12 +51,18 @@ curl -u "$YOUR_USER:$YOUR_PASSWORD" https://reactor.example.com/runs
 ### Public endpoints (no auth)
 
 - `GET /healthz`
+- `GET /readyz`
 - `POST /webhook/{token}` (HMAC verified per provider)
+- `POST /command-webhook/{token_id}` (HMAC verified command-automation ingress)
 - `POST /signal/{token}` (128-bit capability)
 - `GET /login`
 - `GET /docs`, `GET /docs/{page}`
 - `GET /assets/*`
-- `POST /mcp` (when the MCP server is exposed; protect with reverse-proxy IP allowlist or basic auth in front)
+
+`POST /mcp` is not public. When the MCP server is exposed, it remains behind
+the authenticated admin gate and the configured MCP capability scopes. Native
+MCP clients should use a dedicated `REACTOR_MCP_TOKEN` bearer or a user API
+token; browser sessions are not a portable client credential.
 
 ## Common request conventions
 
@@ -71,7 +77,7 @@ curl -u "$YOUR_USER:$YOUR_PASSWORD" https://reactor.example.com/runs
 - **Form POST validation failure:** `400 Bad Request` or `422 Unprocessable Entity` with a plain-text error message in the body.
 - **Conflict:** `409 Conflict` with a remediation hint (e.g. "channel has 3 active routes; detach first").
 - **Capability not wired:** `503 Service Unavailable` with an explanatory message.
-- **JSON responses** (used by `/healthz`, `/graph.json`, `/metrics`) set the right Content-Type.
+- **JSON responses** (used by `/healthz`, `/readyz`, `/graph.json`, `/metrics`) set the right Content-Type.
 
 ## Endpoint catalogue
 
@@ -80,12 +86,14 @@ curl -u "$YOUR_USER:$YOUR_PASSWORD" https://reactor.example.com/runs
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/healthz` | - | 200 `{"ok": true, "version": "..."}` |
+| GET | `/readyz` | - | 200 when database, artifact store, HTTP MCP, and the serve runtime are ready; 503 otherwise |
 | GET | `/metrics` | - | 200 Prometheus text format |
 | GET | `/` | - | 200 HTML home (redirects to `/onboarding` if no workflows) |
 | GET | `/runs` | query: `workflow_id`, `status`, `limit`, `offset` | 200 HTML list |
 | GET | `/runs/{id}` | - | 200 HTML detail, 404 if missing |
 | GET | `/runs/{id}/tail` | - | 200 `text/event-stream` SSE |
 | POST | `/dlq/{id}/retry` | - | 303 to run detail, 404 if missing |
+| GET | `/dlq` | `limit`, `offset` | Admin dead-letter queue HTML page |
 
 ### Workflows
 
@@ -93,12 +101,12 @@ curl -u "$YOUR_USER:$YOUR_PASSWORD" https://reactor.example.com/runs
 |---|---|---|---|
 | GET | `/workflows/{slug}` | - | 200 HTML detail |
 | POST | `/workflows` | multipart: `slug`, `tarball` | 303 to `/workflows/{slug}` |
-| POST | `/workflows/{slug}/code` | form: `body` (Go source) | 303 or 422 with validator output |
-| POST | `/workflows/{slug}/dag` | form: `body` (DAG JSON) | 303 or 422 |
+| POST | `/workflows/{slug}/code` | form: `body` (Go source) | 303 after rebuild/register, or 404/409/422/503 with validator, source-integrity, or capability output |
+| POST | `/workflows/{slug}/dag` | form: `body` (DAG JSON); admin may add `?tenant=` for a same-slug tenant | 303, 404, 409, 422, or 503 |
 | POST | `/workflows/{slug}/run` | form: `payload` (JSON, optional) | 303 to `/runs?workflow_id=...` |
 | POST | `/workflows/{slug}/enable` | - | 303 |
 | POST | `/workflows/{slug}/disable` | - | 303 |
-| POST | `/workflows/{slug}/delete` | - | 303, 403 (member), 409 (active runs) |
+| POST | `/workflows/{slug}/delete` | - | 303, 403 (non-admin), 409 (active runs) |
 | POST | `/workflows/{slug}/minutes-saved` | form: `minutes` (int >= 0) | 303 |
 
 ### Triggers
@@ -126,6 +134,7 @@ the trigger-specific HMAC capability:
 | Method | Path | What |
 |---|---|---|
 | POST | `/webhook/{token_id}` | Verifies the configured provider envelope and durably dispatches or deduplicates one run. `automation-v1` and `hash-v1` are always asynchronous. |
+| POST | `/command-webhook/{token_id}` | Verifies the dedicated command-automation HMAC binding, admits the exact reviewed immutable version, and queues one bounded command run. The binding is tenant-fenced, disabled by default, and replayed deliveries are deduplicated; request bodies never enter the command or durable run metadata. |
 | GET | `/webhook/{token_id}/status?delivery_id=...` | `automation-v1` only. Verifies an empty-body automation signature and returns the run state bound to that trigger and delivery. Active runs return 202; terminal runs return 200; absent or incomplete receipts return 404. Responses are `no-store`. |
 
 The status signature covers `<timestamp>.<delivery_id>.` (including the final
@@ -175,7 +184,7 @@ See [Notifications](/docs/notifications) for the per-kind config shapes.
 | Method | Path | Returns |
 |---|---|---|
 | GET | `/audit` | 200 HTML aggregated credential audit |
-| GET | `/graph.json` | 200 JSON environment graph |
+| GET | `/graph.json` | 200 JSON environment graph (admin-only raw diagnostic export) |
 
 ### Auth + identity
 
@@ -185,7 +194,7 @@ See [Notifications](/docs/notifications) for the per-kind config shapes.
 | POST | `/login` | form: `username`, `password`, `next` | 303 + `Set-Cookie: reactor_sess=...` |
 | POST | `/logout` | - | 303 + cookie clear |
 | GET | `/tokens` | - | 200 HTML list (callers own tokens only) |
-| POST | `/tokens` | form: `name` | 303 + one-time capability cookie; the raw token stays in encrypted flash storage until the redirect GET consumes it |
+| POST | `/tokens` | form: `name`, optional `ttl_days` (1-3650; default 90) | 303 + one-time capability cookie; the raw token stays in encrypted flash storage until the redirect GET consumes it |
 | POST | `/tokens/{id}/revoke` | - | 303 |
 | GET | `/users` | - | 200 HTML, admin-only |
 | POST | `/users` | form: `username`, `password`, `role` | 303 or 422 |
@@ -200,9 +209,14 @@ When the daemon was started with `ANTHROPIC_API_KEY` set:
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| POST | `/generate` | form: `brief` (plain-English description) | 303 to `/workflows/{slug}` after 15-45s, or 500 with validator output |
+| POST | `/generate` | form: `brief` (plain-English description), `tenant_id` (admin-selected target; defaults to `default`) | 303 to `/workflows/{slug}?tenant={tenant_id}` after 15-45s with the workflow staged disabled, or 500 with validator output |
 
-This key-only gate applies to operator-requested code generation, not AI
+The generated artifact remains disabled until an administrator reviews the
+source + visual flow and enables it from the workflow page. Activation also
+requires the immutable artifact and retained source/DAG manifest to verify
+(`artifact_status: "verified"`, `source_dag_status: "verified"`, and
+`visual_complete: true`); missing or legacy source remains inspectable but is
+not dispatch-ready. This key-only gate applies to operator-requested code generation, not AI
 post-mortems. Failed-run diagnostic egress remains off unless
 `REACTOR_AI_POSTMORTEM_ENABLED=true` is also set; see
 [Operations](/docs/operations#ai-post-mortem-egress).
@@ -212,13 +226,13 @@ post-mortems. Failed-run diagnostic egress remains off unless
 | Method | Path | What |
 |---|---|---|
 | POST | `/webhook/{token}` | Provider-specific HMAC verification for Stripe (`Stripe-Signature`), GitHub (`X-Hub-Signature-256`), generic (`X-Webhook-Signature: sha256=hex`), signed `automation-v1`, and Hash lifecycle `hash-v1`. See [Triggers](#triggers) and the [Hash bridge contract](/docs/hash-esign-bridge). |
-| POST | `/signal/{token}` | 128-bit capability token; body becomes the resumed workflow's `AwaitSignal` payload. |
+| POST | `/signal/{token}` | 128-bit capability token; body must be valid, non-empty JSON and becomes the resumed workflow's `AwaitSignal` payload. Payloads over 960 KiB are rejected with `413` so the resume frame remains within the wire budget; malformed or empty JSON returns `400`. |
 
 ### MCP transport
 
 | Method | Path | What |
 |---|---|---|
-| POST | `/mcp` | Streamable HTTP MCP transport per protocol version `2024-11-05`. Accepts single requests or batches; notifications return `202` with no body. |
+| POST | `/mcp` | Streamable HTTP MCP transport per protocol version `2025-03-26`. Accepts single requests or batches up to 128 requests and a 1 MiB body; serialized responses are capped at 4 MiB and one request has a 150-second cumulative execution deadline; notifications return `202` with no body. |
 
 See [MCP server + tool reference](/docs/mcp) for the tool catalogue.
 
@@ -254,7 +268,7 @@ The limiter map evicts idle buckets after 10 minutes and caps at 50,000 entries;
 
 ## Trusted proxies
 
-`X-Forwarded-For` and `X-Forwarded-Proto` are honoured only when the request reached the daemon from a loopback or RFC1918 private address. If you run behind a public reverse proxy on a non-private interface, the daemon will see the proxy's IP and reject spoofed forwarded headers.
+`X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host` are honoured only from loopback or an explicitly configured proxy socket peer. Set `REACTOR_TRUSTED_PROXY_CIDRS=10.4.5.9` (or `--trusted-proxy-cidrs 10.4.5.9`) when the proxy reaches Reactor from that address; exact IPs and CIDRs are accepted. Prefer exact `/32` or `/128` proxy addresses. Do not include direct client addresses in the allowlist; all-address `/0` ranges are rejected. Reactor validates a bounded `X-Forwarded-For` chain and selects the nearest untrusted hop, so a client-supplied prefix cannot select a new rate-limit identity when a trusted proxy appends to the header. The separate `--mcp-trusted-proxy` flag only asserts a TLS-terminating proxy for non-loopback plain HTTP; it does not configure forwarded-header trust or restrict who can reach the listener.
 
 ## Build a workflow programmatically
 

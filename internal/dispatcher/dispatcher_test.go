@@ -2,7 +2,9 @@ package dispatcher
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -165,6 +167,15 @@ func TestDispatchTestForcesLocal(t *testing.T) {
 	if n, _ := j.CountQueued(ctx); n != 0 {
 		t.Fatalf("dry run must not enqueue, CountQueued = %d", n)
 	}
+	if err := j.SetWorkflowEnabled(ctx, "wf_demo", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.DispatchManual(ctx, trig, []byte(`{}`)); !errors.Is(err, ErrWorkflowDisabled) {
+		t.Fatalf("disabled live manual dispatch = %v, want ErrWorkflowDisabled", err)
+	}
+	if _, err := d.DispatchTest(ctx, trig, []byte(`{}`)); err == nil || errors.Is(err, ErrWorkflowDisabled) || !strings.Contains(err.Error(), "artifact") {
+		t.Fatalf("disabled review dry run = %v, want artifact lookup rather than disabled refusal", err)
+	}
 }
 
 // TestSQLResolver round-trips slug<->id against a real journal.
@@ -264,6 +275,105 @@ func TestDispatcherEnqueueMode(t *testing.T) {
 	}
 	if string(run.TriggerMeta) != `{"k":"v"}` {
 		t.Fatalf("trigger_meta = %s, want the payload", run.TriggerMeta)
+	}
+}
+
+func TestDispatcherManualIdempotencyReusesQueuedRunAndRejectsPayloadDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j := newJournal(t)
+	createExecutableWorkflow(t, j, "wf_demo", "demo")
+	d := &Dispatcher{
+		Journal:  j,
+		Resolver: &SQLResolver{Journal: j},
+		ArtifactPath: func(_, _ string) (string, error) {
+			return "/nonexistent", nil
+		},
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Enqueue: true,
+	}
+	trig := journal.Trigger{WorkflowID: "wf_demo", Kind: journal.TriggerManual}
+	first, err := d.DispatchManualIdempotent(ctx, trig, []byte(`{"k":"v"}`), "mcp-retry-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.DispatchManualIdempotent(ctx, trig, []byte(`{"k":"v"}`), "mcp-retry-1")
+	if err != nil || second != first {
+		t.Fatalf("replay = %q err %v, want original %q", second, err, first)
+	}
+	if n, _ := j.CountQueued(ctx); n != 1 {
+		t.Fatalf("idempotent MCP dispatch queued %d runs, want 1", n)
+	}
+	if _, err := d.DispatchManualIdempotent(ctx, trig, []byte(`{"k":"changed"}`), "mcp-retry-1"); !errors.Is(err, journal.ErrMCPDispatchIdempotencyConflict) {
+		t.Fatalf("payload drift = %v, want idempotency conflict", err)
+	}
+}
+
+func TestDispatcherEmptyPayloadUsesOneCanonicalInput(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j := newJournal(t)
+	createExecutableWorkflow(t, j, "wf_empty_input", "empty-input")
+	d := &Dispatcher{
+		Journal:  j,
+		Resolver: &SQLResolver{Journal: j},
+		ArtifactPath: func(_, _ string) (string, error) {
+			return "/nonexistent", nil
+		},
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Enqueue: true,
+	}
+	runID, err := d.DispatchManualIdempotent(ctx, journal.Trigger{WorkflowID: "wf_empty_input", Kind: journal.TriggerManual}, nil, "empty-input-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := j.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(run.TriggerMeta), `{}`; got != want {
+		t.Fatalf("trigger_meta = %q, want %q", got, want)
+	}
+	if got, want := string(run.TriggerInput), `{}`; got != want {
+		t.Fatalf("trigger_input = %q, want %q", got, want)
+	}
+	digest := sha256.Sum256([]byte(`{}`))
+	if run.InputSHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("input hash = %q, want hash of canonical empty object", run.InputSHA256)
+	}
+	if _, err := d.DispatchManualIdempotent(ctx, journal.Trigger{WorkflowID: "wf_empty_input", Kind: journal.TriggerManual}, []byte(`{}`), "   "); err == nil {
+		t.Fatal("whitespace-only idempotency key was accepted")
+	}
+}
+
+func TestDispatcherManualIdempotencyReplaysAfterWorkflowPause(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j := newJournal(t)
+	createExecutableWorkflow(t, j, "wf_pause_idem", "pause-idem")
+	d := &Dispatcher{
+		Journal:  j,
+		Resolver: &SQLResolver{Journal: j},
+		ArtifactPath: func(_, _ string) (string, error) {
+			return "/nonexistent", nil
+		},
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Enqueue: true,
+	}
+	trig := journal.Trigger{WorkflowID: "wf_pause_idem", Kind: journal.TriggerManual}
+	first, err := d.DispatchManualIdempotent(ctx, trig, []byte(`{"k":"v"}`), "pause-retry-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SetWorkflowEnabled(ctx, "wf_pause_idem", false); err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.DispatchManualIdempotent(ctx, trig, []byte(`{"k":"v"}`), "pause-retry-1")
+	if err != nil || second != first {
+		t.Fatalf("replay after pause = %q err %v, want original %q", second, err, first)
+	}
+	if n, _ := j.CountQueued(ctx); n != 1 {
+		t.Fatalf("replay after pause queued %d runs, want 1", n)
 	}
 }
 

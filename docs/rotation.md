@@ -12,7 +12,7 @@ A Provider mints a fresh credential value. Implementations live in
 | Name             | Auto-rotate? | Meta required        | Notes                                          |
 | ---------------- | ------------ | -------------------- | ---------------------------------------------- |
 | `cloudflare`     | yes          | (token verifies self)| PUT /user/tokens/{id}/value rolls in place    |
-| `shared-secret`  | yes          | none                 | 32 random bytes, hex-encoded (HMAC keys)      |
+| `shared-secret`  | yes          | explicit local-mint acknowledgement | 32 random bytes, hex-encoded (HMAC keys); replaces the stored value locally |
 | `aws-iam`        | yes          | `iam_user_name`      | Self-rotating access key pair; stdlib SigV4   |
 | `manual`         | no           | none                 | Audits "rotation due"; operator rotates       |
 
@@ -49,11 +49,19 @@ JSON column.
 
 ## Manual rotation
 
-Dashboard: `/credentials/{id}` -> "Rotate now" button. Calls
-`rotators.Runner.RotateOne(ctx, id)` which is the same path the
-scheduled tick uses. Audits every step.
+Dashboard: `/credentials/{id}` -> "Rotate now" button. Roll-at-source
+providers call `rotators.Runner.RotateOne(ctx, id)`. A local-mint provider
+shows a required acknowledgement checkbox and calls the explicit
+`RotateOneWithLocalMintAck` path; without that acknowledgement the stored
+value is not changed. Creating an auto-rotating local-mint credential stores
+the same acknowledgement in provider metadata so later scheduler ticks do
+not silently turn an externally issued key into a new random value.
 
-CLI: `reactor vault rotate <id>`.
+CLI: `reactor vault rotate <id>`. Add `--allow-local-mint` for a one-off
+explicit approval when the credential has no stored acknowledgement. When
+creating a scheduled local-mint credential, `reactor vault add` likewise
+requires `--allow-local-mint`; an unacknowledged local-mint credential may be
+stored for reference, but the Runner refuses to replace its value.
 
 ## Grant ACL
 

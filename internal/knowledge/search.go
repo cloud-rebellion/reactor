@@ -79,31 +79,7 @@ func rankEntries(entries []Entry, query string, limit int, staleAfter float64) [
 
 	hits := make([]Hit, 0, len(entries))
 	for i, e := range entries {
-		score := 0.0
-		bodyTF := termFreq(docs[i])
-		titleTF := termFreq(titleDocs[i])
-		dl := float64(len(docs[i]))
-		for _, q := range qTokens {
-			n := df[q]
-			if n == 0 {
-				continue
-			}
-			idf := math.Log(1 + (N-float64(n)+0.5)/(float64(n)+0.5))
-			tfBody := float64(bodyTF[q])
-			tfTitle := float64(titleTF[q]) * titleWeight
-			tf := tfBody + tfTitle
-			if tf == 0 {
-				continue
-			}
-			norm := tf * (bm25K1 + 1) / (tf + bm25K1*(1-bm25B+bm25B*dl/avgLen))
-			score += idf * norm
-		}
-		if e.Frontmatter.Gold {
-			score *= 1 + goldBoost
-		}
-		if staleAfter > 0 && isStale(e, staleAfter) {
-			score *= staleHalfLife
-		}
+		score := scoreEntryTokens(e, docs[i], titleDocs[i], qTokens, df, N, avgLen, staleAfter)
 		if score > 0 {
 			hits = append(hits, Hit{Entry: e, Score: score})
 		}
@@ -115,6 +91,38 @@ func rankEntries(entries []Entry, query string, limit int, staleAfter float64) [
 		hits = hits[:limit]
 	}
 	return hits
+}
+
+// scoreEntryTokens computes one BM25 score from already-tokenized fields.
+// Keeping this separate lets the tenant-scoped filesystem search stream the
+// corpus in two passes instead of materializing every entry body at once.
+func scoreEntryTokens(e Entry, body, title, qTokens []string, df map[string]int, totalDocs float64, avgLen, staleAfter float64) float64 {
+	score := 0.0
+	bodyTF := termFreq(body)
+	titleTF := termFreq(title)
+	dl := float64(len(body))
+	for _, q := range qTokens {
+		n := df[q]
+		if n == 0 {
+			continue
+		}
+		idf := math.Log(1 + (totalDocs-float64(n)+0.5)/(float64(n)+0.5))
+		tfBody := float64(bodyTF[q])
+		tfTitle := float64(titleTF[q]) * titleWeight
+		tf := tfBody + tfTitle
+		if tf == 0 {
+			continue
+		}
+		norm := tf * (bm25K1 + 1) / (tf + bm25K1*(1-bm25B+bm25B*dl/avgLen))
+		score += idf * norm
+	}
+	if e.Frontmatter.Gold {
+		score *= 1 + goldBoost
+	}
+	if staleAfter > 0 && isStale(e, staleAfter) {
+		score *= staleHalfLife
+	}
+	return score
 }
 
 // tokenize lowercases + splits on non-alphanumeric runs. Tiny stopword

@@ -171,6 +171,140 @@ func TestAnalyticsSummaryEmptyState(t *testing.T) {
 	}
 }
 
+func TestAnalyticsSummaryForTenantDoesNotAggregateOtherTenants(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_acme", "acme-flow", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateRun(ctx, "run_acme", "wf_acme", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MarkRunFinished(ctx, "run_acme", StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	got, err := j.AnalyticsSummaryForTenant(ctx, "acme")
+	if err != nil {
+		t.Fatalf("AnalyticsSummaryForTenant: %v", err)
+	}
+	if got.TotalRuns != 1 || got.SucceededRuns != 1 {
+		t.Fatalf("tenant analytics = total %d succeeded %d, want 1/1", got.TotalRuns, got.SucceededRuns)
+	}
+	if len(got.PerWorkflow) != 1 || got.PerWorkflow[0].TenantID != "acme" {
+		t.Fatalf("tenant analytics workflows = %+v, want only acme", got.PerWorkflow)
+	}
+}
+
+func TestAnalyticsSummaryForTenantPageKeepsHeadlineCompleteAndRowsBounded(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	for _, row := range []struct {
+		id, slug, tenant, run string
+		minutes               int
+	}{
+		{"wf_page_a", "page-a", "acme", "run_page_a", 3},
+		{"wf_page_b", "page-b", "acme", "run_page_b", 8},
+		{"wf_page_foreign", "page-foreign", "other", "run_page_foreign", 99},
+	} {
+		if err := j.CreateWorkflowInTenant(ctx, row.id, row.slug, "h", "0.1.0", json.RawMessage(`{}`), row.tenant); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.SetEstimatedMinutesSavedPerRun(ctx, row.id, row.minutes); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.CreateRun(ctx, row.run, row.id, "manual", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.MarkRunFinished(ctx, row.run, StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	first, hasMore, err := j.AnalyticsSummaryForTenantPage(ctx, "acme", 1, 0)
+	if err != nil {
+		t.Fatalf("first analytics page: %v", err)
+	}
+	if !hasMore || first.TotalRuns != 2 || first.SucceededRuns != 2 || first.TotalMinutesSaved != 11 || len(first.PerWorkflow) != 1 {
+		t.Fatalf("first page = %+v, hasMore=%v", first, hasMore)
+	}
+	if first.PerWorkflow[0].WorkflowID != "wf_page_b" || first.PerWorkflow[0].TenantID != "acme" {
+		t.Fatalf("first page row = %+v", first.PerWorkflow[0])
+	}
+
+	second, hasMore, err := j.AnalyticsSummaryForTenantPage(ctx, "acme", 1, 1)
+	if err != nil {
+		t.Fatalf("second analytics page: %v", err)
+	}
+	if hasMore || len(second.PerWorkflow) != 1 || second.PerWorkflow[0].WorkflowID != "wf_page_a" || second.PerWorkflow[0].TenantID != "acme" {
+		t.Fatalf("second page = %+v, hasMore=%v", second, hasMore)
+	}
+
+	if _, _, err := j.AnalyticsSummaryForTenantPage(ctx, "", 1, 0); err == nil {
+		t.Fatal("empty tenant should be rejected")
+	}
+	if _, _, err := j.AnalyticsSummaryForTenantPage(ctx, "acme", 0, 0); err == nil {
+		t.Fatal("non-positive limit should be rejected")
+	}
+	if _, _, err := j.AnalyticsSummaryForTenantPage(ctx, "acme", maxAnalyticsWorkflowPage+1, 0); err == nil {
+		t.Fatal("unbounded direct-call limit should be rejected")
+	}
+	if _, _, err := j.AnalyticsSummaryForTenantPage(ctx, "acme", 1, -1); err == nil {
+		t.Fatal("negative offset should be rejected")
+	}
+	if _, _, err := j.AnalyticsSummaryForTenantPage(ctx, "acme", 1, maxAnalyticsWorkflowOffset+1); err == nil {
+		t.Fatal("unbounded direct-call offset should be rejected")
+	}
+}
+
+func TestAnalyticsExcludesRunsWithMismatchedWorkflowTenant(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_owner", "owner", "h", "0.1.0", json.RawMessage(`{}`), "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateWorkflowInTenant(ctx, "wf_viewer", "viewer", "h", "0.1.0", json.RawMessage(`{}`), "viewer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateRun(ctx, "run_owner", "wf_owner", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MarkRunFinished(ctx, "run_owner", StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET tenant_id = $1 WHERE id = $2`), "viewer", "run_owner"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"owner", "viewer"} {
+		for _, paged := range []bool{false, true} {
+			var got Analytics
+			var err error
+			if paged {
+				got, _, err = j.AnalyticsSummaryForTenantPage(ctx, tenant, 1, 0)
+			} else {
+				got, err = j.AnalyticsSummaryForTenant(ctx, tenant)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.TotalRuns != 0 || got.SucceededRuns != 0 || got.AvgDurationMs != 0 || got.TotalMinutesSaved != 0 {
+				t.Fatalf("tenant=%s paged=%t leaked mismatched run: %+v", tenant, paged, got)
+			}
+			for _, day := range got.DailyRuns {
+				if day.Total != 0 {
+					t.Fatalf("tenant=%s paged=%t leaked daily run: %+v", tenant, paged, got.DailyRuns)
+				}
+			}
+		}
+	}
+}
+
 func TestPercentileEdgeCases(t *testing.T) {
 	t.Parallel()
 	// Empty slice should not panic.

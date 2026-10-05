@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,6 +12,12 @@ import (
 
 // SessionCookieName is the dashboard's session cookie name.
 const SessionCookieName = "reactor_sess"
+
+// mcpBearerChallenge is returned with HTTP 401 responses from the MCP
+// connection boundary. MCP clients use the challenge to distinguish an
+// authentication failure from a transport or JSON-RPC failure; it also keeps
+// this route aligned with the Stage bearer-auth contract.
+const mcpBearerChallenge = `Bearer realm="reactor-mcp"`
 
 // userCtxKey is the context key the session middleware uses to stash
 // the resolved user; per-request handlers read it via UserFromContext.
@@ -77,20 +84,53 @@ type SessionAuthConfig struct {
 	// users exist AND no env-var creds are set AND this is true, the
 	// middleware passes traffic through. Otherwise 503.
 	LegacyAllowNoAuth bool
+	// LegacyBasicAuthConfigured prevents the MCP no-auth bootstrap exception
+	// from accepting Basic credentials when an operator also supplied them.
+	LegacyBasicAuthConfigured bool
+
+	// MCPToken is an optional dedicated bearer credential for the HTTP MCP
+	// route. It mirrors the Stage/Mesh service-token connection shape while
+	// keeping the existing per-user API-token path intact. MCPUser is the
+	// bounded identity assigned only after the dedicated token matches.
+	MCPToken string
+	MCPUser  auth.User
+}
+
+// bearerAuthorization accepts the HTTP authentication scheme without
+// depending on its presentation casing. RFC 9110 defines auth-scheme as
+// case-insensitive; MCP clients commonly send "Bearer", but lower-case
+// "bearer" is equally valid. The second return value distinguishes a
+// recognized-but-empty bearer credential so /mcp can reject it with the
+// dedicated challenge instead of falling through to another identity source.
+func bearerAuthorization(header string) (string, bool) {
+	fields := strings.Fields(header)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "Bearer") {
+		return "", false
+	}
+	if len(fields) == 1 {
+		return "", true
+	}
+	return strings.Join(fields[1:], " "), true
 }
 
 // SessionAuth returns the middleware. Resolution order:
 //
-//  1. Cookie `reactor_sess` -> session store lookup.
-//  2. `Authorization: Bearer <token>` -> api_tokens store lookup.
-//  3. `Authorization: Basic <user>:<pw>` -> Authenticate via the users
+//  1. On `/mcp`, only an `Authorization: Bearer` connection identity is
+//     accepted when the auth store is configured. A cookie or Basic credential
+//     cannot silently change the tenant bound to an MCP client. Explicit
+//     local no-auth bootstrap remains available with no users or MCP token.
+//  2. Cookie `reactor_sess` -> session store lookup.
+//  3. `Authorization: Bearer <token>` -> api_tokens store lookup.
+//  4. `Authorization: Basic <user>:<pw>` -> Authenticate via the users
 //     table when at least one user exists, else fall back to the
 //     legacy env-var BasicAuth (the layer below this one).
-//  4. None of the above + no users + no env creds -> redirect to
+//  5. None of the above + no users + no env creds -> redirect to
 //     /login when a browser arrives (Accept: text/html), else 401.
 //
-// Public routes (healthz, webhook, signal, mcp, login, assets) skip
+// Public routes (healthz, readyz, webhook, signal, login, assets, docs) skip
 // the gate.
+// /mcp remains authenticated so its dedicated or per-user bearer identity
+// reaches the admin and tenant-scoping layers.
 func SessionAuth(cfg SessionAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,13 +139,75 @@ func SessionAuth(cfg SessionAuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 			if cfg.Store == nil {
-				// No store wired (test deployments); defer to the legacy
-				// BasicAuth middleware in the chain.
+				// A dedicated MCP bearer is an independent connection contract,
+				// not a database API-token lookup. Keep enforcing it even in a
+				// minimal/embedded deployment that has no auth store wired; otherwise
+				// BasicAuth's explicit no-auth mode would accidentally expose /mcp
+				// without the configured Stage/Mesh-style bearer credential.
+				if r.URL.Path == "/mcp" && strings.TrimSpace(cfg.MCPToken) != "" {
+					raw, ok := bearerAuthorization(r.Header.Get("Authorization"))
+					if !ok || raw == "" || subtle.ConstantTimeCompare([]byte(raw), []byte(cfg.MCPToken)) != 1 {
+						rejectMCPBearer(w, "Unauthorized")
+						return
+					}
+					u := cfg.MCPUser
+					if u.ID == "" {
+						u.ID = "mcp-http"
+					}
+					if u.Role == "" {
+						u.Role = auth.RoleAdmin
+					}
+					r = r.WithContext(withUser(r.Context(), u))
+				}
+				// No store wired (test/embedded deployments); defer to the legacy
+				// BasicAuth middleware for all other routes.
 				next.ServeHTTP(w, r)
 				return
 			}
 
 			ctx := r.Context()
+
+			// MCP is a bearer-only connection surface when the auth store is
+			// configured. Never let a dashboard cookie or Basic credential
+			// select its tenant or role, including when the Bearer is absent.
+			if r.URL.Path == "/mcp" {
+				if raw, ok := bearerAuthorization(r.Header.Get("Authorization")); ok {
+					if raw == "" {
+						rejectMCPBearer(w, "unauthorized")
+						return
+					}
+					if u, err := cfg.Store.ResolveAPIToken(ctx, raw); err == nil {
+						r = r.WithContext(withUser(r.Context(), u))
+						next.ServeHTTP(w, r)
+						return
+					}
+					if cfg.MCPToken != "" && subtle.ConstantTimeCompare([]byte(raw), []byte(cfg.MCPToken)) == 1 {
+						u := cfg.MCPUser
+						if u.ID == "" {
+							u.ID = "mcp-http"
+						}
+						if u.Role == "" {
+							u.Role = auth.RoleAdmin
+						}
+						r = r.WithContext(withUser(r.Context(), u))
+						next.ServeHTTP(w, r)
+						return
+					}
+					rejectMCPBearer(w, "unauthorized")
+					return
+				}
+				// Local bootstrap can intentionally run with no users and no
+				// bearer. Startup validates that this configuration binds only
+				// to loopback; a configured MCP token always takes precedence.
+				if cfg.LegacyAllowNoAuth && !cfg.LegacyBasicAuthConfigured && cfg.MCPToken == "" {
+					if n, err := cfg.Store.CountUsers(ctx); err == nil && n == 0 {
+						next.ServeHTTP(w, r)
+						return
+					}
+				}
+				rejectMCPBearer(w, "Unauthorized")
+				return
+			}
 
 			// (1) cookie -> session.
 			if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
@@ -143,8 +245,7 @@ func SessionAuth(cfg SessionAuthConfig) func(http.Handler) http.Handler {
 			// mfa_pending gate, and because this branch never stashes a session
 			// state, requireStepUp always fails for a token, so a token cannot
 			// reach step-up-gated surfaces either.
-			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-				raw := strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+			if raw, ok := bearerAuthorization(r.Header.Get("Authorization")); ok {
 				if raw != "" {
 					if u, err := cfg.Store.ResolveAPIToken(ctx, raw); err == nil {
 						r = r.WithContext(withUser(ctx, u))
@@ -203,6 +304,15 @@ func SessionAuth(cfg SessionAuthConfig) func(http.Handler) http.Handler {
 	}
 }
 
+// rejectMCPBearer writes a challenge for the bearer-only connection contract.
+// Keep this scoped to /mcp: dashboard callers may still authenticate with a
+// session cookie or HTTP Basic and must not receive a misleading bearer
+// challenge from those surfaces.
+func rejectMCPBearer(w http.ResponseWriter, message string) {
+	w.Header().Set("WWW-Authenticate", mcpBearerChallenge)
+	http.Error(w, message, http.StatusUnauthorized)
+}
+
 // isSessionAuthExempt mirrors isPublicRoute but also exempts /login
 // and /assets so the operator can reach the login form + its CSS
 // without already being logged in.
@@ -210,9 +320,25 @@ func isSessionAuthExempt(path string) bool {
 	switch {
 	case path == "/healthz":
 		return true
+	case path == "/readyz":
+		// Readiness is an unauthenticated probe just like liveness. It must
+		// reach the dependency checks even when the users table already has
+		// accounts; otherwise this middleware would turn a healthy probe into
+		// a login redirect/401 before BasicAuth can apply its public-route
+		// exemption.
+		return true
+	case path == "/oauth/callback":
+		// The provider redirect carries no dashboard credentials. The OAuth
+		// store's single-use state and PKCE verifier are the callback
+		// capability, so requiring a session here would make MCP-started
+		// consent fail for a browser that is not signed in (or whose session
+		// expired while the provider was open).
+		return true
 	case path == "/login":
 		return true
 	case strings.HasPrefix(path, "/webhook/"):
+		return true
+	case strings.HasPrefix(path, "/command-webhook/"):
 		return true
 	case strings.HasPrefix(path, "/signal/"):
 		return true

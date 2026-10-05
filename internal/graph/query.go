@@ -3,8 +3,18 @@ package graph
 import (
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
+)
+
+const (
+	// Graph attributes include workflow-controlled diagnostics such as DLQ
+	// error text. Keep BM25 preparation bounded even when the graph contains a
+	// large legacy value; the MCP response has a separate projection bound.
+	maxGraphSearchAttrBytes = 8 << 10
+	maxGraphSearchTextBytes = 64 << 10
 )
 
 // scoreNodes ranks nodes by BM25 over (label + flattened attr values)
@@ -83,7 +93,14 @@ func scoreNodes(nodes map[string]Node, query string) []Node {
 			hits = append(hits, scored{node: n, score: score})
 		}
 	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].score != hits[j].score {
+			return hits[i].score > hits[j].score
+		}
+		// scoreNodes iterates a map, so equal-scoring results need an explicit
+		// tie-breaker or the MCP graph context changes between identical calls.
+		return hits[i].node.ID < hits[j].node.ID
+	})
 	out := make([]Node, len(hits))
 	for i, h := range hits {
 		out[i] = h.node
@@ -91,9 +108,11 @@ func scoreNodes(nodes map[string]Node, query string) []Node {
 	return out
 }
 
-// flattenAttrs concatenates string attr values into one searchable
-// stream. Non-string values are coerced via toString so any JSON-able
-// value can still match the query.
+// flattenAttrs concatenates scalar attr values into one searchable stream.
+// Nested maps and slices are deliberately skipped: marshaling an imported
+// value just to search it can allocate an unbounded temporary and would put
+// opaque payloads into the prompt-selection index. The MCP projection has a
+// separate, explicit recursive policy for values that are safe to display.
 func flattenAttrs(attrs map[string]any) string {
 	if len(attrs) == 0 {
 		return ""
@@ -105,15 +124,76 @@ func flattenAttrs(attrs map[string]any) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, k := range keys {
-		switch v := attrs[k].(type) {
-		case string:
-			b.WriteString(v)
-		default:
-			b.WriteString(toString(v))
+		value, ok := scalarSearchText(attrs[k])
+		if !ok {
+			continue
 		}
+		value = truncateGraphSearchText(value, maxGraphSearchAttrBytes)
+		remaining := maxGraphSearchTextBytes - b.Len() - 1
+		if remaining <= 0 {
+			break
+		}
+		value = truncateGraphSearchText(value, remaining)
+		if value == "" {
+			continue
+		}
+		b.WriteString(value)
 		b.WriteByte(' ')
 	}
 	return b.String()
+}
+
+func scalarSearchText(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return v, true
+	case bool:
+		return strconv.FormatBool(v), true
+	case int:
+		return strconv.Itoa(v), true
+	case int8:
+		return strconv.FormatInt(int64(v), 10), true
+	case int16:
+		return strconv.FormatInt(int64(v), 10), true
+	case int32:
+		return strconv.FormatInt(int64(v), 10), true
+	case int64:
+		return strconv.FormatInt(v, 10), true
+	case uint:
+		return strconv.FormatUint(uint64(v), 10), true
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10), true
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10), true
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10), true
+	case uint64:
+		return strconv.FormatUint(v, 10), true
+	case float32:
+		return strconv.FormatFloat(float64(v), 'g', -1, 32), true
+	case float64:
+		return strconv.FormatFloat(v, 'g', -1, 64), true
+	default:
+		return "", false
+	}
+}
+
+func truncateGraphSearchText(value string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(value) <= max {
+		return value
+	}
+	value = strings.ToValidUTF8(value[:max], "�")
+	for len(value) > max {
+		_, size := utf8.DecodeLastRuneInString(value)
+		if size <= 0 || size > len(value) {
+			return ""
+		}
+		value = value[:len(value)-size]
+	}
+	return value
 }
 
 func tokenize(s string) []string {

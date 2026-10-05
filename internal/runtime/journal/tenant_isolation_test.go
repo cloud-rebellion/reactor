@@ -46,6 +46,13 @@ func TestTenantIsolationIsRealNow(t *testing.T) {
 	if gotB != "wf_b" {
 		t.Fatalf("tenant-b resolved %q, want wf_b", gotB)
 	}
+	owners, err := j.WorkflowTenantsBySlug(ctx, "shared-slug")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(owners, ",") != "tenant-a,tenant-b" {
+		t.Fatalf("workflow slug owners = %v, want [tenant-a tenant-b]", owners)
+	}
 
 	// A tenant that owns nothing gets nothing rather than someone else's row.
 	if _, err := j.WorkflowIDBySlugInTenant(ctx, "shared-slug", "tenant-c"); !errors.Is(err, ErrNotFound) {

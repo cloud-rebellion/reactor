@@ -19,6 +19,7 @@ func NewLens(store *knowledge.Store, g *graph.Graph) *PromptLens {
 	}
 	lens := &PromptLens{KnowledgeLimit: 5}
 	if store != nil {
+		redactor := knowledge.NewRedactor()
 		lens.Search = func(ctx context.Context, query string, limit int) ([]LensHit, error) {
 			hits, err := store.Search(ctx, query, limit)
 			if err != nil {
@@ -27,10 +28,10 @@ func NewLens(store *knowledge.Store, g *graph.Graph) *PromptLens {
 			out := make([]LensHit, 0, len(hits))
 			for _, h := range hits {
 				out = append(out, LensHit{
-					ID:    h.Entry.Frontmatter.ID,
-					Topic: h.Entry.Frontmatter.Topic,
-					Title: h.Entry.Frontmatter.Title,
-					Body:  h.Entry.Body,
+					ID:    redactor.Scrub(h.Entry.Frontmatter.ID),
+					Topic: redactor.Scrub(h.Entry.Frontmatter.Topic),
+					Title: redactor.Scrub(h.Entry.Frontmatter.Title),
+					Body:  redactor.Scrub(h.Entry.Body),
 					Score: h.Score,
 					Gold:  h.Entry.Frontmatter.Gold,
 				})

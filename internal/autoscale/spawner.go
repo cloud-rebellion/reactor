@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -47,9 +48,11 @@ type ProcessSpawner struct {
 	Env []string
 	Log *slog.Logger
 
-	mu    sync.Mutex
-	procs map[string]*exec.Cmd
-	seq   int
+	mu     sync.Mutex
+	procs  map[string]*exec.Cmd
+	guards map[string]*os.File
+	ids    []string // managed child ids in spawn order, newest last
+	seq    int
 }
 
 // NewProcessSpawner builds a same-host process spawner.
@@ -57,25 +60,50 @@ func NewProcessSpawner(binary string, args, env []string, log *slog.Logger) *Pro
 	if log == nil {
 		log = slog.Default()
 	}
-	return &ProcessSpawner{Binary: binary, Args: args, Env: env, Log: log, procs: map[string]*exec.Cmd{}}
+	return &ProcessSpawner{Binary: binary, Args: args, Env: env, Log: log, procs: map[string]*exec.Cmd{}, guards: map[string]*os.File{}}
 }
 
 // Spawn starts an `reactor worker` child process.
-func (p *ProcessSpawner) Spawn(_ context.Context) (string, error) {
-	cmd := exec.Command(p.Binary, p.Args...)
-	if p.Env != nil {
-		cmd.Env = p.Env
+func (p *ProcessSpawner) Spawn(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
+	parentRead, parentWrite, err := os.Pipe()
+	if err != nil {
+		return "", fmt.Errorf("autoscale: parent liveness pipe: %w", err)
+	}
+	cmd := exec.Command(p.Binary, p.Args...)
+	childEnv := p.Env
+	if childEnv == nil {
+		childEnv = os.Environ()
+	}
+	cmd.Env = make([]string, 0, len(childEnv)+1)
+	for _, entry := range childEnv {
+		if !strings.HasPrefix(entry, "REACTOR_WORKER_PARENT_FD=") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "REACTOR_WORKER_PARENT_FD=3")
+	// ExtraFiles[0] is descriptor 3 in the child. The parent keeps the write
+	// end open for exactly this worker's lifetime; an abrupt serve crash
+	// closes it in the kernel, so the worker drains on EOF instead of becoming
+	// an invisible orphan that a new leader can duplicate beyond Max.
+	cmd.ExtraFiles = []*os.File{parentRead}
 	// Inherit stdout/stderr so worker logs surface alongside the daemon's.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
+		parentRead.Close()
+		parentWrite.Close()
 		return "", fmt.Errorf("autoscale: spawn worker: %w", err)
 	}
+	parentRead.Close()
 	p.mu.Lock()
 	p.seq++
 	id := fmt.Sprintf("proc-%d-%d", cmd.Process.Pid, p.seq)
 	p.procs[id] = cmd
+	p.guards[id] = parentWrite
+	p.ids = append(p.ids, id)
 	p.mu.Unlock()
 	p.Log.Info("autoscale: spawned worker", "id", id, "pid", cmd.Process.Pid)
 	// Reap on exit so Running() reflects reality even if a worker dies on
@@ -83,7 +111,15 @@ func (p *ProcessSpawner) Spawn(_ context.Context) (string, error) {
 	go func() {
 		_ = cmd.Wait()
 		p.mu.Lock()
+		parentWrite.Close()
 		delete(p.procs, id)
+		delete(p.guards, id)
+		for i, tracked := range p.ids {
+			if tracked == id {
+				p.ids = append(p.ids[:i], p.ids[i+1:]...)
+				break
+			}
+		}
 		p.mu.Unlock()
 		p.Log.Info("autoscale: worker exited", "id", id)
 	}()
@@ -113,11 +149,7 @@ func (p *ProcessSpawner) Running() int {
 func (p *ProcessSpawner) IDs() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make([]string, 0, len(p.procs))
-	for id := range p.procs {
-		out = append(out, id)
-	}
-	return out
+	return append([]string(nil), p.ids...)
 }
 
 // StopAll drains every managed worker.

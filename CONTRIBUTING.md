@@ -11,7 +11,7 @@ go build ./...
 go test ./...
 ```
 
-Go 1.22+ is required. There is no frontend build step: the dashboard is
+Go 1.26.5 is required. There is no frontend build step: the dashboard is
 server-rendered Go.
 
 ## Gates (run before every PR)
@@ -58,14 +58,14 @@ as a competing hosted service. By submitting a contribution you agree that
 it is licensed under the same terms and that the Licensor (Bright
 Interaction) may also include it in commercially-licensed distributions.
 This keeps a single, relicensable codebase. For anything the license does
-not permit, email licensing@brightinteraction.com.
+not permit, email tom@cloudrebellion.se.
 
 ## Running a workflow locally
 
 ```bash
 reactor setup --root /tmp/reactor-dev --non-interactive \
   --db sqlite:///tmp/reactor-dev/reactor.db --admin-user dev --admin-password devdevdev
-source /tmp/reactor-dev/reactor.env
+set -a; source /tmp/reactor-dev/reactor.env; set +a
 reactor serve --root /tmp/reactor-dev
 ```
 

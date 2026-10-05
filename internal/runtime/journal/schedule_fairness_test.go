@@ -235,3 +235,84 @@ func TestFindDueSchedulesHonoursConcurrencyCap(t *testing.T) {
 		t.Fatalf("uncapped tenant got %d of 5 due rows; max_concurrent_runs=0 must mean unlimited", got)
 	}
 }
+
+// ClaimScheduleResume is the last mutation gate after FindDueSchedules. A
+// scheduler can select a row immediately before tenant policy changes, so the
+// claim must recheck the tenant kill switch and concurrency budget in its own
+// transaction rather than trusting the earlier read.
+func TestClaimScheduleResumeRechecksTenantAdmission(t *testing.T) {
+	t.Parallel()
+
+	t.Run("disabled tenant", func(t *testing.T) {
+		t.Parallel()
+		j, cleanup := newTestJournal(t)
+		defer cleanup()
+		ctx := context.Background()
+		mkWorkflowTenant(t, j, ctx, "wf_resume_disabled", "resume-disabled")
+		if err := j.CreateRun(ctx, "run_resume_disabled", "wf_resume_disabled", "manual", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		scheduleID, err := j.ScheduleSleep(ctx, "run_resume_disabled", "wait", time.Now().UTC().Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET status = 'suspended' WHERE id = $1`), "run_resume_disabled"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.ExecContext(ctx, j.bind(`INSERT INTO tenants (tenant_id, disabled) VALUES ($1, $2)`), "resume-disabled", j.boolValue(true)); err != nil {
+			t.Fatal(err)
+		}
+
+		claimed, err := j.ClaimScheduleResume(ctx, scheduleID, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed {
+			t.Fatal("tenant-disabled wake-up was claimed")
+		}
+		if run, err := j.GetRun(ctx, "run_resume_disabled"); err != nil || run.Status != "suspended" {
+			t.Fatalf("tenant-disabled resume changed run = %+v, %v", run, err)
+		}
+		if schedule, err := j.FindLatestSleepSchedule(ctx, "run_resume_disabled", "wait"); err != nil || schedule.Fired {
+			t.Fatalf("tenant-disabled resume consumed schedule = %+v, %v", schedule, err)
+		}
+	})
+
+	t.Run("concurrency cap", func(t *testing.T) {
+		t.Parallel()
+		j, cleanup := newTestJournal(t)
+		defer cleanup()
+		ctx := context.Background()
+		mkWorkflowTenant(t, j, ctx, "wf_resume_capped", "resume-capped")
+		if err := j.CreateRun(ctx, "run_resume_capped", "wf_resume_capped", "manual", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		scheduleID, err := j.ScheduleSleep(ctx, "run_resume_capped", "wait", time.Now().UTC().Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET status = 'suspended' WHERE id = $1`), "run_resume_capped"); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.CreateRun(ctx, "run_resume_capped_live", "wf_resume_capped", "manual", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.ExecContext(ctx, j.bind(`INSERT INTO tenants (tenant_id, max_concurrent_runs) VALUES ($1, $2)`), "resume-capped", 1); err != nil {
+			t.Fatal(err)
+		}
+
+		claimed, err := j.ClaimScheduleResume(ctx, scheduleID, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed {
+			t.Fatal("tenant-cap wake-up was claimed while the cap was full")
+		}
+		if run, err := j.GetRun(ctx, "run_resume_capped"); err != nil || run.Status != "suspended" {
+			t.Fatalf("tenant-cap resume changed run = %+v, %v", run, err)
+		}
+		if schedule, err := j.FindLatestSleepSchedule(ctx, "run_resume_capped", "wait"); err != nil || schedule.Fired {
+			t.Fatalf("tenant-cap resume consumed schedule = %+v, %v", schedule, err)
+		}
+	})
+}

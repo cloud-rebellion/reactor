@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/bright-interaction/reactor/sdk"
+	reactoremail "github.com/bright-interaction/reactor/sdk/email"
+	reactorhttp "github.com/bright-interaction/reactor/sdk/http"
 	"github.com/bright-interaction/reactor/sdk/vault"
 )
 
@@ -51,6 +53,12 @@ func serve[I any](in io.Reader, out io.Writer, wf reactor.Workflow, _ reactor.Tr
 	vault.BindFunc(func(ctx context.Context, id string) (vault.Secret, error) {
 		return pf.FetchSecret(ctx, id)
 	})
+	// ConnectorGet uses a host-owned account origin and token. An older host
+	// without the advertised broker capability fails before sending a frame.
+	restoreConnector := reactorhttp.BindConnectorRequester(pf.ConnectorRequest)
+	defer restoreConnector()
+	restoreMail := reactoremail.BindMailSender(pf.MailSend)
+	defer restoreMail()
 
 	var input I
 	if rawInput, ok := os.LookupEnv("REACTOR_INPUT"); ok && rawInput != "" {

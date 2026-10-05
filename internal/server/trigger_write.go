@@ -99,13 +99,17 @@ func (s *Server) createWebhookTrigger(w http.ResponseWriter, r *http.Request, sl
 		return
 	}
 	ctx := r.Context()
-	dag, err := s.Journal.WorkflowDAG(ctx, wfID)
+	dag, dagBytes, dagTruncated, err := s.Journal.WorkflowDAGBounded(ctx, wfID, maxFlowDAGBytes)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
 			http.Error(w, "workflow not registered", http.StatusNotFound)
 			return
 		}
 		s.errorPage(w, "load workflow trigger policy", err)
+		return
+	}
+	if dagTruncated {
+		http.Error(w, fmt.Sprintf("workflow webhook trigger policy is unavailable: DAG is %d bytes and exceeds the bounded projection", dagBytes), http.StatusUnprocessableEntity)
 		return
 	}
 	pinnedProvider, err := webhookProviderPinnedByDAG(dag)
@@ -213,43 +217,7 @@ func (s *Server) createWebhookTrigger(w http.ResponseWriter, r *http.Request, sl
 // unsupported declarations fail closed instead of allowing an operator to
 // create a verifier with weaker semantics than the workflow was built for.
 func webhookProviderPinnedByDAG(dag json.RawMessage) (string, error) {
-	var doc struct {
-		Triggers []json.RawMessage `json:"triggers"`
-	}
-	if err := json.Unmarshal(dag, &doc); err != nil {
-		return "", fmt.Errorf("parse dag.json: %w", err)
-	}
-	if strings.TrimSpace(string(dag)) == "null" {
-		return "", errors.New("dag.json must be an object")
-	}
-
-	pinned := ""
-	for i, raw := range doc.Triggers {
-		if strings.TrimSpace(string(raw)) == "null" {
-			return "", fmt.Errorf("triggers[%d] must be an object", i)
-		}
-		var trigger struct {
-			Kind     string `json:"kind"`
-			Provider string `json:"provider"`
-		}
-		if err := json.Unmarshal(raw, &trigger); err != nil {
-			return "", fmt.Errorf("parse triggers[%d]: %w", i, err)
-		}
-		if trigger.Kind != "webhook" || trigger.Provider == "" {
-			continue
-		}
-		if strings.TrimSpace(trigger.Provider) != trigger.Provider {
-			return "", fmt.Errorf("triggers[%d] provider must not contain surrounding whitespace", i)
-		}
-		if !webhook.IsSupportedProvider(trigger.Provider) {
-			return "", fmt.Errorf("triggers[%d] uses unsupported webhook provider %q", i, trigger.Provider)
-		}
-		if pinned != "" && pinned != trigger.Provider {
-			return "", fmt.Errorf("conflicting webhook providers %q and %q", pinned, trigger.Provider)
-		}
-		pinned = trigger.Provider
-	}
-	return pinned, nil
+	return webhook.ProviderPinnedByDAG(dag)
 }
 
 // rollbackWebhookTriggerSetup compensates the dashboard's multi-store create
@@ -394,7 +362,11 @@ curl -X POST http://127.0.0.1:7777/webhook/$TOKEN \
 	}
 
 	if len(d.Triggers) == 0 {
-		b.WriteString(`<p class="muted">No triggers yet. Add a webhook or cron trigger below to start receiving runs.</p>`)
+		if d.ReadOnly {
+			b.WriteString(`<p class="muted">No triggers yet. An administrator can add a webhook, schedule, or chain trigger.</p>`)
+		} else {
+			b.WriteString(`<p class="muted">No triggers yet. Add a webhook or cron trigger below to start receiving runs.</p>`)
+		}
 	} else {
 		b.WriteString(`<table><thead><tr><th>Kind</th><th>State</th><th>Detail</th><th>Last fired</th><th>Error</th><th></th></tr></thead><tbody>`)
 		for _, t := range d.Triggers {
@@ -414,7 +386,7 @@ curl -X POST http://127.0.0.1:7777/webhook/$TOKEN \
 				template.HTMLEscapeString(lastFired),
 				errCell,
 			)
-			if d.TriggerWritesEnabled {
+			if d.TriggerWritesEnabled && !d.ReadOnly {
 				slugEsc := template.URLQueryEscaper(d.Slug)
 				idEsc := template.URLQueryEscaper(t.ID)
 				queryEsc := template.HTMLEscapeString(d.TriggerActionQuery)
@@ -447,8 +419,12 @@ curl -X POST http://127.0.0.1:7777/webhook/$TOKEN \
 		b.WriteString(`</tbody></table>`)
 	}
 
+	if d.ReadOnly {
+		b.WriteString(`<p class="muted">Trigger management is admin-only.</p>`)
+		return b.String()
+	}
 	if !d.TriggerWritesEnabled {
-		b.WriteString(`<p class="muted">Trigger writes disabled (server started without a vault). Use <code>reactor</code> CLI to manage triggers.</p>`)
+		b.WriteString(`<p class="muted">Trigger writes disabled (server started without a vault). Use the <code>reactor</code> CLI to manage triggers.</p>`)
 		return b.String()
 	}
 

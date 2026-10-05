@@ -39,19 +39,24 @@ const Version = "wire.v1"
 type Kind string
 
 const (
-	KindHello         Kind = "hello"          // bidirectional handshake
-	KindStepStart     Kind = "step_start"     // workflow -> host
-	KindStepEnd       Kind = "step_end"       // workflow -> host
-	KindStepReply     Kind = "step_reply"     // host -> workflow (proceed | replay)
-	KindAck           Kind = "ack"            // host -> workflow
-	KindSleep         Kind = "sleep"          // workflow -> host
-	KindAwaitSignal   Kind = "await_signal"   // workflow -> host
-	KindSignalDeliver Kind = "signal_deliver" // host -> workflow
-	KindSecretFetch   Kind = "secret_fetch"   // workflow -> host
-	KindSecretReply   Kind = "secret_reply"   // host -> workflow
-	KindLog           Kind = "log"            // workflow -> host (one-way)
-	KindCancel        Kind = "cancel"         // host -> workflow (graceful exit)
-	KindError         Kind = "error"          // either direction (out-of-band)
+	KindHello            Kind = "hello"             // bidirectional handshake
+	KindStepStart        Kind = "step_start"        // workflow -> host
+	KindStepEnd          Kind = "step_end"          // workflow -> host
+	KindBlockReceipt     Kind = "block_receipt"     // workflow -> host; SDK-reported, value-free
+	KindStepReply        Kind = "step_reply"        // host -> workflow (proceed | replay)
+	KindAck              Kind = "ack"               // host -> workflow
+	KindSleep            Kind = "sleep"             // workflow -> host
+	KindAwaitSignal      Kind = "await_signal"      // workflow -> host
+	KindSignalDeliver    Kind = "signal_deliver"    // host -> workflow
+	KindSecretFetch      Kind = "secret_fetch"      // workflow -> host
+	KindSecretReply      Kind = "secret_reply"      // host -> workflow
+	KindConnectorRequest Kind = "connector_request" // workflow -> host; host attaches a credential
+	KindConnectorReply   Kind = "connector_reply"   // host -> workflow; never contains a credential
+	KindMailSendRequest  Kind = "mail_send_request" // workflow -> host; host owns provider endpoint and token
+	KindMailSendReply    Kind = "mail_send_reply"   // host -> workflow; never contains a credential
+	KindLog              Kind = "log"               // workflow -> host (one-way)
+	KindCancel           Kind = "cancel"            // host -> workflow (graceful exit)
+	KindError            Kind = "error"             // either direction (out-of-band)
 )
 
 // Frame is the on-wire envelope. Body is opaque per Kind so each side can
@@ -76,6 +81,38 @@ type Hello struct {
 	// URLs/logs, so a party who knows only the runID cannot forge signal
 	// tokens. Empty selects the legacy runID-only derivation.
 	SignalKey string `json:"signal_key,omitempty"`
+	// ObservedBlocks gates the additive block-receipt extension on a host that
+	// can persist it. A new SDK fails closed on an older host instead of waiting
+	// for an ACK that the older host will never send.
+	ObservedBlocks bool `json:"observed_blocks,omitempty"`
+	// ConnectorBroker advertises host-owned credential attachment for supported
+	// connector requests. A new SDK fails closed on older hosts without it.
+	ConnectorBroker bool `json:"connector_broker,omitempty"`
+	// MailBroker advertises the host-owned Google/Microsoft send route. Older
+	// hosts fail closed in the SDK before a workflow sends a mail frame.
+	MailBroker bool `json:"mail_broker,omitempty"`
+}
+
+// BlockReceipt is SDK-reported metadata for one operation inside a claimed
+// durable Step attempt. It deliberately contains no row, key, or error text.
+type BlockReceipt struct {
+	StepName    string `json:"step_name"`
+	Seq         int64  `json:"seq"`
+	Attempt     int    `json:"attempt"`
+	CallOrdinal int    `json:"call_ordinal"`
+	BlockID     string `json:"block_id"`
+	Kind        string `json:"kind"`
+	Mode        string `json:"mode"`
+	LeftRows    int    `json:"left_rows"`
+	RightRows   int    `json:"right_rows"`
+	// For iterate and aggregate, OutputRows is the count of mapped items or
+	// the one final accumulator. No item or accumulator value is sent.
+	OutputRows int    `json:"output_rows"`
+	MaxRows    int    `json:"max_rows"`
+	InputRows  *int   `json:"input_rows,omitempty"`
+	YesRows    *int   `json:"yes_rows,omitempty"`
+	NoRows     *int   `json:"no_rows,omitempty"`
+	Outcome    string `json:"outcome"`
 }
 
 // StepStart is what the workflow sends at every Step boundary. The host
@@ -113,6 +150,10 @@ type StepStart struct {
 type StepReply struct {
 	Replay bool            `json:"replay"`
 	Output json.RawMessage `json:"output,omitempty"` // present when Replay=true
+	// RetryWaitMs means the previous retryable attempt's provider window has
+	// not expired. The host has not allocated the next attempt; wait and send
+	// the same StepStart again. Only new workflow binaries use this field.
+	RetryWaitMs int64 `json:"retry_wait_ms,omitempty"`
 
 	// Attempt is the host-assigned durable attempt number. Zero means the host
 	// predates durable attempt allocation and the SDK falls back to its local
@@ -140,6 +181,10 @@ type StepEnd struct {
 	Output    json.RawMessage `json:"output,omitempty"`
 	ErrorText string          `json:"error_text,omitempty"`
 	Retryable bool            `json:"retryable,omitempty"`
+	// RetryAfterMs persists a provider's bounded minimum wait before the next
+	// durable attempt. The host validates it and computes the deadline using
+	// its own clock, so process restarts cannot lose the provider window.
+	RetryAfterMs int64 `json:"retry_after_ms,omitempty"`
 }
 
 // Sleep yields the workflow until the wake time. For short sleeps the host
@@ -198,6 +243,54 @@ type SecretReply struct {
 	NotFound    bool   `json:"not_found,omitempty"`
 }
 
+// ConnectorRequest asks the host to perform a credential-bound HTTP call.
+// The child supplies only a credential reference and provider-relative path;
+// it cannot choose an origin or provide an Authorization header. The first
+// supported operation is Salesforce GET under /services/data/.
+type ConnectorRequest struct {
+	CredentialID string `json:"credential_id"`
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+}
+
+// ConnectorReply returns a bounded provider response. Body contains only a
+// successful GET response; errors expose stable codes and HTTP status, never
+// provider error bodies, credentials, or request URLs.
+type ConnectorReply struct {
+	Status       int    `json:"status,omitempty"`
+	Body         []byte `json:"body,omitempty"`
+	RetryAfterMs int64  `json:"retry_after_ms,omitempty"`
+	ErrorCode    string `json:"error_code,omitempty"`
+}
+
+// MailSendRequest carries only a connection reference and a structured
+// message. The host chooses the provider, HTTPS origin, path, and token.
+type MailSendRequest struct {
+	CredentialID   string      `json:"credential_id"`
+	Message        MailMessage `json:"message"`
+	StepName       string      `json:"step_name"`
+	StepSeq        int64       `json:"step_seq"`
+	StepAttempt    int         `json:"step_attempt"`
+	IdempotencyKey string      `json:"idempotency_key"`
+}
+
+type MailMessage struct {
+	From    string   `json:"from"`
+	To      []string `json:"to"`
+	Cc      []string `json:"cc,omitempty"`
+	Subject string   `json:"subject"`
+	Text    string   `json:"text,omitempty"`
+	HTML    string   `json:"html,omitempty"`
+}
+
+// MailSendReply exposes a provider message ID when available (Gmail) and a
+// stable error code. Provider response bodies and tokens never cross the pipe.
+type MailSendReply struct {
+	MessageID string `json:"message_id,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	Status    int    `json:"status,omitempty"`
+}
+
 // Log is one-way. The host forwards to its slog handler with run_id +
 // workflow_slug attached so dashboard streaming gets a correctly-tagged line.
 type Log struct {
@@ -224,10 +317,26 @@ type Error struct {
 // hostile or buggy workflow output.
 var ErrFrameTooLarge = errors.New("wire: frame exceeds maximum line length")
 
+// ErrMalformedFrame is intentionally value-free. Workflow stdout can contain
+// credentials or customer data, so decode errors must never echo its bytes
+// into host logs or persisted run failures.
+var ErrMalformedFrame = errors.New("wire: malformed frame")
+
+// ErrMalformedBody is value-free for the same reason as ErrMalformedFrame:
+// a child can place credential-like text in a JSON field name or value.
+var ErrMalformedBody = errors.New("wire: malformed frame body")
+
 // MaxFrameBytes caps a single frame at 1 MiB. Step outputs larger than
 // this should land in object storage with a reference; this is checked
 // at validation time.
 const MaxFrameBytes = 1 << 20
+
+// MaxSignalPayloadBytes is the largest JSON payload accepted by the public
+// signal ingress. SignalDeliver wraps a payload in a JSON frame, so the
+// payload must leave headroom for the frame envelope (signal name, token,
+// reply ids, and future additive fields). Keeping this budget in the wire
+// package lets HTTP, MCP, and the supervisor share the same transport bound.
+const MaxSignalPayloadBytes = MaxFrameBytes - (64 << 10)
 
 // Encoder writes frames to an io.Writer. Safe for one writer per Encoder.
 type Encoder struct {
@@ -272,42 +381,48 @@ func NewDecoder(r io.Reader) *Decoder {
 
 // Decode reads the next frame. Returns io.EOF when the pipe closes.
 func (d *Decoder) Decode() (Frame, error) {
-	var line []byte
+	// Skip blank lines iteratively. A workflow subprocess is untrusted and can
+	// emit arbitrary stdout; recursively calling Decode for each blank line
+	// lets it grow the host stack until a panic before a valid frame arrives.
 	for {
-		seg, err := d.r.ReadSlice('\n')
-		if err == bufio.ErrBufferFull {
-			line = append(line, seg...)
-			if len(line) > MaxFrameBytes {
-				return Frame{}, ErrFrameTooLarge
+		var line []byte
+		for {
+			seg, err := d.r.ReadSlice('\n')
+			if err == bufio.ErrBufferFull {
+				line = append(line, seg...)
+				if len(line) > MaxFrameBytes {
+					return Frame{}, ErrFrameTooLarge
+				}
+				continue
 			}
+			if err != nil {
+				if errors.Is(err, io.EOF) && len(seg) > 0 {
+					line = append(line, seg...)
+					break
+				}
+				return Frame{}, err
+			}
+			line = append(line, seg...)
+			break
+		}
+		if len(line) > MaxFrameBytes {
+			return Frame{}, ErrFrameTooLarge
+		}
+		// Strip trailing newline + optional \r.
+		for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
+			line = line[:len(line)-1]
+		}
+		if len(line) == 0 {
+			// Empty line: continue without recursion. Surface EOF if the next
+			// read has no more data.
 			continue
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) && len(seg) > 0 {
-				line = append(line, seg...)
-				break
-			}
-			return Frame{}, err
+		var f Frame
+		if err := json.Unmarshal(line, &f); err != nil {
+			return Frame{}, ErrMalformedFrame
 		}
-		line = append(line, seg...)
-		break
+		return f, nil
 	}
-	if len(line) > MaxFrameBytes {
-		return Frame{}, ErrFrameTooLarge
-	}
-	// Strip trailing newline + optional \r.
-	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
-		line = line[:len(line)-1]
-	}
-	if len(line) == 0 {
-		// Empty line: ask the caller to retry. Surface EOF if next call returns EOF.
-		return d.Decode()
-	}
-	var f Frame
-	if err := json.Unmarshal(line, &f); err != nil {
-		return Frame{}, fmt.Errorf("wire: decode: %w (raw=%q)", err, snippet(line))
-	}
-	return f, nil
 }
 
 // Wrap is a convenience for marshalling a typed body into a Frame.
@@ -327,14 +442,8 @@ func Unwrap(f Frame, into any) error {
 	if len(f.Body) == 0 {
 		return nil
 	}
-	return json.Unmarshal(f.Body, into)
-}
-
-// snippet returns a short, log-safe excerpt of a malformed line.
-func snippet(b []byte) string {
-	const max = 80
-	if len(b) <= max {
-		return string(b)
+	if err := json.Unmarshal(f.Body, into); err != nil {
+		return ErrMalformedBody
 	}
-	return string(b[:max]) + "..."
+	return nil
 }

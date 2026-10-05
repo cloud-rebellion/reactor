@@ -18,8 +18,10 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/bright-interaction/reactor/internal/safehttp"
 	"github.com/bright-interaction/reactor/sdk/esign"
 	"github.com/bright-interaction/reactor/sdk/esign/internal/strictjson"
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
 const (
@@ -63,7 +65,13 @@ func NewClient(baseURL, bearer string, httpClient *http.Client) (*Client, error)
 
 	client := httpClient
 	if client == nil {
-		client = &http.Client{Timeout: defaultTimeout}
+		// Workflow-facing egress must use the same connect-time SSRF guard as
+		// sdk/http. A public hostname can resolve to a private address after
+		// URL validation (DNS rebinding), so refusing redirects alone is not
+		// sufficient. Literal loopback is retained for local development;
+		// link-local and metadata ranges remain blocked in either mode.
+		client = safehttp.Client(isLoopback(endpoint.Hostname()))
+		client.Timeout = defaultTimeout
 	} else {
 		clone := *client
 		client = &clone
@@ -84,6 +92,9 @@ func NewClient(baseURL, bearer string, httpClient *http.Client) (*Client, error)
 // success response is ambiguous and must be retried with the same event.
 func (c *Client) DeliverLifecycleEvent(ctx context.Context, event esign.LifecycleEvent) (Receipt, error) {
 	var receipt Receipt
+	if ahttp.IsDryRun() {
+		return receipt, ahttp.ErrDryRun
+	}
 	if c == nil || c.baseURL == nil || c.httpClient == nil {
 		return receipt, errors.New("brightcrm lifecycle: nil or uninitialized client")
 	}

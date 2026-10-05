@@ -54,3 +54,26 @@ func TestShellSingleQuoteIdempotent(t *testing.T) {
 		t.Fatalf("input not preserved: %q -> %q", in, got)
 	}
 }
+
+func TestReactorEnvBodyUsesSystemdAssignmentsAndPreservesPHC(t *testing.T) {
+	t.Parallel()
+	body := reactorEnvBody(
+		"sqlite:///var/lib/reactor/reactor.db",
+		"admin",
+		"$argon2id$v=19$m=65536,t=3,p=2$salt$hash",
+		"/var/lib/reactor",
+	)
+	for _, want := range []string{
+		"REACTOR_DB_URL='sqlite:///var/lib/reactor/reactor.db'",
+		"REACTOR_BASIC_AUTH_USER='admin'",
+		"REACTOR_BASIC_AUTH_PASSWORD_SHA256='$argon2id$v=19$m=65536,t=3,p=2$salt$hash'",
+		"REACTOR_ROOT='/var/lib/reactor'",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("environment body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "export REACTOR_") {
+		t.Fatalf("environment body uses shell-only export syntax:\n%s", body)
+	}
+}

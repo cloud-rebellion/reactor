@@ -115,6 +115,15 @@ func (j *Journal) RecoverLocalInterruptedRun(ctx context.Context, runID string, 
 			}
 		}
 	}
+	// Recovery can commit a terminal outcome without a live supervisor or
+	// dispatcher callback to publish it. Keep the notification/chain handoff
+	// durable in the same transaction as the status transition; the leader's
+	// terminal-effect loop will deliver it after startup (or a later retry).
+	if committedStatus == "failed" {
+		if err := j.enqueueTerminalEffectTx(ctx, tx, runID, committedStatus); err != nil {
+			return "", err
+		}
+	}
 
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("journal: commit local interruption recovery: %w", err)
@@ -208,7 +217,8 @@ func (j *Journal) RecoverOwnedPendingDeadLetterRedrive(ctx context.Context, runI
 		return false, fmt.Errorf("journal: begin owned redrive recovery: %w", err)
 	}
 	defer tx.Rollback()
-	if err := j.lockOwnedLease(ctx, tx, runID, owner); err != nil {
+	leaseDeadline, err := j.lockOwnedLease(ctx, tx, runID, owner)
+	if err != nil {
 		return false, err
 	}
 
@@ -231,6 +241,9 @@ func (j *Journal) RecoverOwnedPendingDeadLetterRedrive(ctx context.Context, runI
 		return false, err
 	}
 	if !recovered {
+		if err := checkOwnedLeaseDeadline(runID, leaseDeadline); err != nil {
+			return false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("journal: commit unused owned redrive recovery probe: %w", err)
 		}
@@ -245,6 +258,9 @@ func (j *Journal) RecoverOwnedPendingDeadLetterRedrive(ctx context.Context, runI
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, fmt.Errorf("%w: recover redrive run=%s", ErrLeaseOwnershipLost, runID)
+	}
+	if err := checkOwnedLeaseDeadline(runID, leaseDeadline); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("journal: commit owned redrive recovery: %w", err)
@@ -345,5 +361,9 @@ func finishRecoveredRedriveTx(ctx context.Context, tx *sql.Tx, j *Journal, runID
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("journal: recovered redrive run changed concurrently")
 	}
-	return nil
+	// The exact-redrive recovery path terminalizes the run inside a repair
+	// transaction, before any dispatcher callback exists. Persist the same
+	// terminal-effect receipt as the normal finish path so failed_dlq
+	// notifications and chains remain recoverable after a crash.
+	return j.enqueueTerminalEffectTx(ctx, tx, runID, "failed_dlq")
 }

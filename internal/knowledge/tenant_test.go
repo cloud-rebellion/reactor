@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,27 @@ func TestCorpusTenancy(t *testing.T) {
 		}
 	})
 
+	t.Run("search keeps the same tenant boundary", func(t *testing.T) {
+		hits, err := s.SearchForTenant(ctx, "billing failed", 10, "acme")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, hit := range hits {
+			if hit.Entry.Frontmatter.Tenant == "globex" || strings.Contains(hit.Entry.Frontmatter.Title, "globex") {
+				t.Fatalf("cross-tenant search hit: %+v", hit.Entry.Frontmatter)
+			}
+		}
+		foundAcme := false
+		for _, hit := range hits {
+			if hit.Entry.Frontmatter.ID == acme.Frontmatter.ID {
+				foundAcme = true
+			}
+		}
+		if !foundAcme {
+			t.Fatalf("tenant search omitted own post-mortem: %+v", hits)
+		}
+	})
+
 	t.Run("direct fetch of another tenant's entry is not found", func(t *testing.T) {
 		if _, err := s.GetForTenant(ctx, other.Frontmatter.ID, "acme"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("GetForTenant across the boundary returned %v, want ErrNotFound; guessing an id must not work either", err)
@@ -127,4 +149,43 @@ func TestCorpusTenancy(t *testing.T) {
 			t.Fatalf("tenant did not persist in frontmatter, got %q; scoping would silently fail after a restart", e.Frontmatter.Tenant)
 		}
 	})
+}
+
+func TestSupersedeForTenantPrefersExactTenantOnCollidingIDs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(ctx, Entry{Frontmatter: Frontmatter{
+		ID: "collision", Topic: "globex", Title: "Globex lesson", Tenant: "globex",
+	}, Body: "globex body"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(ctx, Entry{Frontmatter: Frontmatter{
+		ID: "collision", Topic: "acme", Title: "Acme lesson", Tenant: "acme",
+	}, Body: "acme body"}); err != nil {
+		t.Fatal(err)
+	}
+
+	revised, err := s.SupersedeForTenant(ctx, "collision", "acme", Entry{
+		Frontmatter: Frontmatter{CreatedBy: "claude", Tenant: "acme"},
+		Body:        "revised acme body",
+	}, "updated guidance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revised.Frontmatter.Topic != "acme" || revised.Frontmatter.Title != "Acme lesson" {
+		t.Fatalf("supersede selected the wrong tenant entry: topic=%q title=%q", revised.Frontmatter.Topic, revised.Frontmatter.Title)
+	}
+	if len(revised.Frontmatter.Supersedes) != 1 || revised.Frontmatter.Supersedes[0] != "collision" {
+		t.Fatalf("supersedes chain = %v", revised.Frontmatter.Supersedes)
+	}
+	if got, err := s.GetForTenant(ctx, revised.Frontmatter.ID, "acme"); err != nil || strings.TrimSpace(got.Body) != "revised acme body" {
+		t.Fatalf("revised acme entry = (body=%q, %+v, %v)", got.Body, got, err)
+	}
+	if got, err := s.GetForTenant(ctx, "collision", "globex"); err != nil || strings.TrimSpace(got.Body) != "globex body" {
+		t.Fatalf("globex source was changed: (%+v, %v)", got, err)
+	}
 }

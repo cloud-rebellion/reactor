@@ -135,7 +135,8 @@ func (s *Server) knowledgeSupersede(w http.ResponseWriter, r *http.Request) {
 }
 
 // workflowNewForm renders the upload-workflow form. Accepts a .tar.gz
-// of a single directory containing main.go + dag.json (optional).
+// of a single directory containing main.go and, when it uses durable Reactor
+// nodes, a matching visual dag.json.
 func (s *Server) workflowNewForm(w http.ResponseWriter, r *http.Request) {
 	tenants, current := s.availableTenants(r)
 	s.renderPage(w, r, page{
@@ -299,7 +300,7 @@ func workflowNewBody(errMsg string, tenants []journal.Tenant, currentTenant stri
 		b.WriteString(`<div class="err">` + template.HTMLEscapeString(errMsg) + `</div>`)
 	}
 	b.WriteString(`<form method="POST" action="/workflows" enctype="multipart/form-data" class="form">
-  <p class="muted">Upload a tar.gz containing a single directory with main.go (required) + dag.json (optional). The server extracts, runs go vet + reactor lint + go build, then registers the workflow + builds the binary. Use this when you have Go source on disk and don't want the AI codegen path; for non-devs, the home page Generate form is faster.</p>
+  <p class="muted">Upload a tar.gz containing a single directory with main.go (required) and a matching visual dag.json whenever the source uses durable Reactor nodes. The server extracts, runs go vet + reactor lint + go build, then registers the workflow + builds the binary. Use this when you have Go source on disk and don't want the AI codegen path; for non-devs, the home page Generate form is faster.</p>
   <label>Slug <input type="text" name="slug" required pattern="[a-z][a-z0-9-]*" title="lowercase letters/digits/hyphen, must start with a letter" autocomplete="off"></label>
   <label>Tarball <input type="file" name="tarball" required accept=".tgz,.tar.gz,application/gzip,application/x-gzip,application/x-tar"></label>` +
 		tenantSelect(tenants, currentTenant) + `

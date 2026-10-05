@@ -19,8 +19,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -110,22 +108,19 @@ func Run(ctx context.Context, flow reactor.Flow, in Payload) error {
 
 // fetchPage GETs the homepage and returns the lowercased body + key headers.
 func fetchPage(ctx context.Context, url string) (Page, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return Page{}, err
-	}
 	c := &ahttp.Client{UserAgent: "reactor-cms-detect/0.1"}
-	resp, err := c.Do(req)
+	_, headers, body, err := c.GetRaw(ctx, url)
 	if err != nil {
 		return Page{}, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	h := map[string]string{}
 	for _, k := range []string{"X-Powered-By", "X-Generator", "X-Pingback", "X-Drupal-Cache", "Server", "X-Shopid", "Set-Cookie", "Link"} {
-		if v := resp.Header.Get(k); v != "" {
-			h[k] = strings.ToLower(v)
+		if v := headers[k]; v != "" {
+			h[strings.ToLower(k)] = strings.ToLower(v)
 		}
+	}
+	if len(body) > 512*1024 {
+		body = body[:512*1024]
 	}
 	return Page{BodyLower: strings.ToLower(string(body)), Headers: h}, nil
 }
@@ -191,20 +186,17 @@ func confidence(signals []string) string {
 // probeWordPressAPI does a non-destructive GET of /wp-json/ to confirm the REST
 // API (which the wordpress connector uses) is reachable.
 func probeWordPressAPI(ctx context.Context, base string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/wp-json/", nil)
-	if err != nil {
-		return false
-	}
 	c := &ahttp.Client{UserAgent: "reactor-cms-detect/0.1"}
-	resp, err := c.Do(req)
+	status, _, body, err := c.GetRaw(ctx, base+"/wp-json/")
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if status < 200 || status >= 300 {
 		return false
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if len(body) > 64*1024 {
+		body = body[:64*1024]
+	}
 	b := strings.ToLower(string(body))
 	return strings.Contains(b, "wp/v2") || strings.Contains(b, `"routes"`) || strings.Contains(b, "wp-json")
 }

@@ -15,14 +15,28 @@ User=reactor
 Group=reactor
 WorkingDirectory=/var/lib/reactor
 
-# Boot-once init: run reactor init + migrate the first time, then
-# disable this command (or keep --root + --db idempotent across reboots).
-# This unit assumes init has already run; flip the wrapper script to
-# `reactor init && reactor migrate && reactor serve` if you want
-# zero-touch first boot.
+# First boot: run `reactor setup --root /var/lib/reactor` before enabling this
+# unit. Setup creates the master key, runs migrations, seeds the first admin,
+# and writes reactor.env. The unit intentionally does not run setup itself.
 Environment=REACTOR_DB_URL=sqlite:///var/lib/reactor/reactor.db
+# Older packages instructed operators to keep this file under /etc. Preserve
+# those database and auth settings across upgrades; the setup-generated state
+# file below takes precedence when both files exist.
 EnvironmentFile=-/etc/reactor/reactor.env
-ExecStart=/usr/local/bin/reactor serve --root /var/lib/reactor
+# `reactor setup --root /var/lib/reactor` writes this file with assignments
+# valid for both systemd and shell loading. Keep it beside the protected state
+# so setup's generated database/auth configuration is the one this unit uses.
+EnvironmentFile=-/var/lib/reactor/reactor.env
+# Native packages bundle the SDK module used by MCP/dashboard workflow builds.
+# The state env file is writable by the reactor user, so pin the module path
+# in ExecStart after that file is loaded. Go 1.26.5+ must be installed on PATH.
+# nfpm installs the release binary at /usr/bin/reactor. Keep the manual
+# walkthrough on the same canonical path so package installs can start the
+# exact unit they ship.
+# The default listener is loopback so the local HTTP MCP/dashboard example
+# cannot expose bearer-authenticated MCP on every interface. A reverse-proxy
+# deployment may override this with a reviewed TLS/proxy configuration.
+ExecStart=/usr/bin/env REACTOR_SDK_REPLACE=/usr/lib/reactor-sdk PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin /usr/bin/reactor serve --root /var/lib/reactor --addr 127.0.0.1:7777
 
 # Hardening. Daemon needs network + the state dir; deny everything else.
 Restart=on-failure

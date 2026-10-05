@@ -49,7 +49,7 @@ func NewRedactor() *Redactor {
 		},
 		{
 			name:    "keyed-credential",
-			re:      regexp.MustCompile(`(?i)\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|authorization|password|secret)\s*[:=]\s*["']?[A-Za-z0-9_\-.~+/=]{8,}["']?`),
+			re:      regexp.MustCompile(`(?i)\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|private[_-]?key|client[_-]?secret|authorization|password|secret)\s*[:=]\s*["']?[A-Za-z0-9_\-.~+/=]{8,}["']?`),
 			example: "access_token=abc123...",
 		},
 		{
@@ -85,9 +85,9 @@ func (r *Redactor) Scrub(body string) string {
 	return body
 }
 
-// RedactionFinding describes one rule hit. Sample is a small slice of
-// the matched text (capped) so callers can show a hint without echoing
-// the full secret.
+// RedactionFinding describes one rule hit. Sample is retained for in-process
+// tests/metrics, but public error formatting deliberately omits it: even a
+// short prefix of a bearer token or email address is still a data leak.
 type RedactionFinding struct {
 	Rule   string
 	Sample string
@@ -121,7 +121,7 @@ func (r *Redactor) Format(findings []RedactionFinding) string {
 	}
 	out := fmt.Sprintf("knowledge: redactor blocked %d finding(s):", len(findings))
 	for _, f := range findings {
-		out += fmt.Sprintf("\n  - %s at offset %d: %s", f.Rule, f.Offset, f.Sample)
+		out += fmt.Sprintf("\n  - %s at offset %d", f.Rule, f.Offset)
 	}
 	return out
 }

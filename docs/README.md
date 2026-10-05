@@ -7,7 +7,7 @@ Reactor ships every doc with the binary. The dashboard renders them at `/docs`; 
 - **[Architecture](/docs/architecture)** - what the daemon is, what runs where, per-run lifecycle, where features live in the source tree.
 - **[Dashboard pages + endpoints](/docs/dashboard)** - every page in the dashboard with auth, request shapes, status codes.
 - **[REST API reference](/docs/api)** - the canonical HTTP API: auth modes, endpoint catalogue, error responses, sample curl flow.
-- **[MCP server + tool reference](/docs/mcp)** - Streamable HTTP + stdio transports, all 15 tools with input schema + payload examples.
+- **[MCP server + tool reference](/docs/mcp)** - canonical Streamable HTTP transport, compatibility stdio notes, and all tools with input schema + payload examples.
 
 ## Features
 
@@ -19,12 +19,14 @@ Reactor ships every doc with the binary. The dashboard renders them at `/docs`; 
 ## Operating reactor
 
 - **[Operations runbook](/docs/operations)** - quickstart, backup/restore, database migration to Postgres, scaling notes.
+- **[Internal readiness runbook](/docs/internal-readiness)** - least-privilege MCP setup, authoring sequence, and acceptance evidence.
 - **[Security threat model](/docs/security)** - secret handling, MCP boundary, supervisor sandbox, audit posture.
 - **[Credential rotation](/docs/rotation)** - six supported rotation targets (cloudflare, github_secret, dockyard_vault, aws_iam, file_write, forgejo_secret), rotation runner schedule.
 
 ## SDK + codegen
 
 - **[SDK reference](/docs/sdk)** - the public surface workflow authors import: `sdk`, `sdk/runtime`, `sdk/http`, `sdk/vault`, `sdk/wire`, `sdk/idempotency`.
+- **[Connector execution contracts](/docs/integration-contracts)** - bounded pagination, safe continuation URLs, provider rate limits, and write idempotency.
 - **[Codegen pipeline](/docs/codegen)** - Anthropic prompt assembly, lens-aware context, validator chain, retry policy.
 
 ## Editing docs

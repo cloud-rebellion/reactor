@@ -61,6 +61,12 @@ func TestMapFilterReduce(t *testing.T) {
 	if got := Reduce(in, 0, func(a, v int) int { return a + v }); got != 10 {
 		t.Errorf("Reduce got %d", got)
 	}
+	if got := Iterate(in, func(v int) int { return v * 3 }); !reflect.DeepEqual(got, []int{3, 6, 9, 12}) {
+		t.Errorf("Iterate got %v", got)
+	}
+	if got := Aggregate(in, 0, func(a, v int) int { return a + v }); got != 10 {
+		t.Errorf("Aggregate got %d", got)
+	}
 	// Input not mutated.
 	if !reflect.DeepEqual(in, []int{1, 2, 3, 4}) {
 		t.Errorf("input mutated: %v", in)
@@ -121,9 +127,19 @@ func TestMerges(t *testing.T) {
 	if got := Append([]int{1, 2}, []int{3}, []int{4, 5}); !reflect.DeepEqual(got, []int{1, 2, 3, 4, 5}) {
 		t.Errorf("Append got %v", got)
 	}
+	if got := Merge([]int{1, 2}, []int{3}); !reflect.DeepEqual(got, []int{1, 2, 3}) {
+		t.Errorf("Merge got %v", got)
+	}
 	zipped := Zip([]int{1, 2, 3}, []string{"a", "b"}, func(n int, s string) string { return fmt.Sprintf("%d%s", n, s) })
 	if !reflect.DeepEqual(zipped, []string{"1a", "2b"}) { // stops at shorter
 		t.Errorf("Zip got %v", zipped)
+	}
+}
+
+func TestSplit(t *testing.T) {
+	yes, no := Split([]int{1, 2, 3, 4}, func(v int) bool { return v%2 == 0 })
+	if !reflect.DeepEqual(yes, []int{2, 4}) || !reflect.DeepEqual(no, []int{1, 3}) {
+		t.Fatalf("Split got yes=%v no=%v", yes, no)
 	}
 }
 

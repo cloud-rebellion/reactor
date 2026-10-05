@@ -1,7 +1,9 @@
 package safehttp
 
 import (
+	"context"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -21,7 +23,7 @@ func TestBlockedIP(t *testing.T) {
 		// private, so it used to pass even with allowPrivate=false (the
 		// enforcing configuration used for notification webhooks).
 		{"CGNAT tailnet blocked", "100.101.102.103", false, true},
-		{"CGNAT tailnet blocked even when private is allowed", "100.64.0.1", true, false},
+		{"CGNAT tailnet blocked even when private is allowed", "100.64.0.1", true, true},
 
 		// Always blocked, regardless of allowPrivate: the cloud metadata
 		// endpoint is the classic SSRF credential-theft prize.
@@ -60,6 +62,13 @@ func TestBlockedIP(t *testing.T) {
 				t.Fatalf("BlockedIP(%s, allowPrivate=%v) = %v, want %v", tc.ip, tc.allowPrivate, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDialContextAppliesSSRFPolicyToNonHTTPProtocols(t *testing.T) {
+	_, err := DialContext(context.Background(), "tcp", "127.0.0.1:1", false)
+	if err == nil || !strings.Contains(err.Error(), "ssrf: refusing") {
+		t.Fatalf("DialContext error=%v, want SSRF refusal", err)
 	}
 }
 

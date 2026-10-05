@@ -107,6 +107,22 @@ func TestNodeCodeGetUnknownStep404(t *testing.T) {
 	}
 }
 
+func TestNodeCodeGetRejectsOversizedSource(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	seedWorkflow(t, root, "oversized", strings.Repeat("x", maxFlowSourceBytes+1))
+	srv := &Server{WorkflowsRoot: root, CodeValidator: &stubValidator{}}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/workflows/oversized/node/step/code", nil)
+	nodeRouter(srv).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), strings.Repeat("x", 64)) {
+		t.Fatalf("oversized source bytes leaked in response: %s", recorder.Body.String())
+	}
+}
+
 func TestNodeCodeSaveSplicesAndWrites(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

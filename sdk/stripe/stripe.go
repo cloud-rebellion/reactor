@@ -15,6 +15,7 @@ package stripe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,12 +26,25 @@ import (
 	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
-// BaseURL is a var so tests can point it at a fake server.
-var BaseURL = "https://api.stripe.com/v1"
+// baseURL is package-owned so workflow input cannot redirect a Stripe key to
+// another origin. Tests in this package can point it at a fake server.
+var baseURL = "https://api.stripe.com/v1"
 
 // Client holds the Stripe secret key (sk_...).
 type Client struct {
 	Key string
+}
+
+// APIError classifies a failed Stripe response by HTTP status. Provider error
+// bodies are untrusted and may echo credentials or customer data, so they are
+// never copied into its loggable text.
+type APIError struct{ Status int }
+
+func (e *APIError) Error() string {
+	if e == nil {
+		return "stripe: HTTP error"
+	}
+	return fmt.Sprintf("stripe: HTTP %d", e.Status)
 }
 
 // Customer is the subset of a Stripe customer workflows usually need.
@@ -151,7 +165,7 @@ func (c *Client) CreateRefund(ctx context.Context, paymentIntentID string, amoun
 
 // GetPaymentIntent fetches the current state of a payment intent.
 func (c *Client) GetPaymentIntent(ctx context.Context, id string) (PaymentIntent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, BaseURL+"/payment_intents/"+url.PathEscape(id), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/payment_intents/"+url.PathEscape(id), nil)
 	if err != nil {
 		return PaymentIntent{}, err
 	}
@@ -160,7 +174,7 @@ func (c *Client) GetPaymentIntent(ctx context.Context, id string) (PaymentIntent
 }
 
 func (c *Client) post(ctx context.Context, path string, form url.Values, idemKey string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, BaseURL+path, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
@@ -172,28 +186,27 @@ func (c *Client) post(ctx context.Context, path string, form url.Values, idemKey
 }
 
 func (c *Client) do(req *http.Request, out any) error {
-	hc := &ahttp.Client{Bearer: c.Key}
+	base, err := url.Parse(baseURL)
+	if err != nil || base == nil || base.Scheme == "" || base.Host == "" {
+		return errors.New("stripe: invalid API base URL")
+	}
+	hc := &ahttp.Client{Bearer: c.Key, CredentialOrigin: base.Scheme + "://" + base.Host}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("stripe: HTTP %d: %s", resp.StatusCode, trim(body))
+		// Drain only a bounded amount before closing so a hostile error body
+		// cannot consume unbounded memory or stall the worker indefinitely.
+		_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
+		return &APIError{Status: resp.StatusCode}
 	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if out != nil {
 		if err := json.Unmarshal(body, out); err != nil {
 			return fmt.Errorf("stripe: decode: %w", err)
 		}
 	}
 	return nil
-}
-
-func trim(b []byte) string {
-	const max = 300
-	if len(b) <= max {
-		return string(b)
-	}
-	return string(b[:max]) + "..."
 }

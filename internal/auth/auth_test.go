@@ -173,6 +173,40 @@ func TestSetUserRoleAndCountAdmins(t *testing.T) {
 	}
 }
 
+func TestSetUserTenantRequiresRegisteredTenant(t *testing.T) {
+	t.Parallel()
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	id, err := s.CreateUser(ctx, "tenant-user", "secret-pass", RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUserTenant(ctx, id, "missing"); !errors.Is(err, ErrTenantNotFound) {
+		t.Fatalf("missing tenant err = %v, want ErrTenantNotFound", err)
+	}
+	u, err := s.GetUser(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.TenantID != "default" {
+		t.Fatalf("tenant after rejected assignment = %q, want default", u.TenantID)
+	}
+	if _, err := s.db.ExecContext(ctx, s.bind(`INSERT INTO tenants (tenant_id, name, plan) VALUES ($1, $2, $3)`), "acme", "Acme", "custom"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUserTenant(ctx, id, "acme"); err != nil {
+		t.Fatalf("registered tenant assignment: %v", err)
+	}
+	u, err = s.GetUser(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.TenantID != "acme" {
+		t.Fatalf("tenant after assignment = %q, want acme", u.TenantID)
+	}
+}
+
 func TestAPITokenMintListResolveRevoke(t *testing.T) {
 	t.Parallel()
 	s, cleanup := newTestStore(t)
@@ -206,6 +240,24 @@ func TestAPITokenMintListResolveRevoke(t *testing.T) {
 	}
 	if _, err := s.ResolveAPIToken(ctx, raw); !errors.Is(err, ErrSessionExpired) {
 		t.Fatalf("post-revoke err = %v", err)
+	}
+}
+
+func TestAPITokenMalformedExpiryFailsClosed(t *testing.T) {
+	t.Parallel()
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	uid, _ := s.CreateUser(ctx, "expiry-user", "secret-pass", RoleAdmin)
+	raw, _, err := s.MintAPIToken(ctx, uid, "broken-expiry", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, s.bind(`UPDATE api_tokens SET expires_at = $1 WHERE name = $2`), "not-a-timestamp", "broken-expiry"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveAPIToken(ctx, raw); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("malformed expiry error = %v, want ErrSessionExpired", err)
 	}
 }
 

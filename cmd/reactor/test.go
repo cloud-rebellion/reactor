@@ -70,6 +70,20 @@ func cmdTest(ctx context.Context, log *slog.Logger, args []string) error {
 		return err
 	}
 	defer jClose()
+	masterKey, err := decodeMasterKey(masterHex)
+	if err != nil {
+		return err
+	}
+	var previousMaster []byte
+	if prevHex := envFirst("REACTOR_MASTER_KEY_PREVIOUS", "ARACHNE_MASTER_KEY_PREVIOUS"); prevHex != "" {
+		previousMaster, err = decodeMasterKey(prevHex)
+		if err != nil {
+			return fmt.Errorf("REACTOR_MASTER_KEY_PREVIOUS: %w", err)
+		}
+	}
+	if err := j.LoadPayloadEncryption(ctx, masterKey, previousMaster); err != nil {
+		return fmt.Errorf("test: journal payload key: %w", err)
+	}
 
 	wfID, err := defaultTenantWorkflowID(ctx, j, slug)
 	if err != nil {
@@ -137,9 +151,11 @@ func cmdTest(ctx context.Context, log *slog.Logger, args []string) error {
 		Vault:            store,
 		Log:              log,
 		SignalSigningKey: signKey,
-		// Reuse the original trigger meta as the replay input so the
-		// workflow body branches the same way it did originally.
-		Input: run.TriggerMeta,
+		// Reuse the exact bytes captured at dispatch. PostgreSQL's JSONB
+		// trigger_meta projection canonicalises whitespace and object-key order;
+		// feeding that projection to replay can branch differently from the
+		// original run even though the durable input fingerprint is unchanged.
+		Input: replayInputForRun(run),
 	}
 
 	start := time.Now()
@@ -181,4 +197,11 @@ func pickLatestRunForSlug(ctx context.Context, j *journal.Journal, wfID string) 
 		}
 	}
 	return "", errors.New("test: no terminal runs found for this workflow; trigger one first")
+}
+
+// replayInputForRun keeps the replay command on the same exact-input contract
+// as distributed execution. RunInfo.ExecutionInput prefers migration-0040's
+// raw trigger_input and only falls back to trigger_meta for legacy rows.
+func replayInputForRun(run journal.RunInfo) []byte {
+	return run.ExecutionInput()
 }

@@ -45,16 +45,18 @@ func (s *SlackSender) Send(ctx context.Context, cfg json.RawMessage, ev Event) e
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("slack: build request: %w", err)
+		return fmt.Errorf("slack: invalid request URL")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := s.Client
 	if client == nil {
-		client = http.DefaultClient
+		// Keep the safety property even when a caller constructs SlackSender
+		// directly instead of using NewSlackSender.
+		client = ssrfSafeClient(os.Getenv("REACTOR_WEBHOOK_ALLOW_PRIVATE") == "1")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("slack: post: %w", err)
+		return safePostError("slack", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {

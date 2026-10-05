@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/auth"
 )
 
 // hashPass shapes a password the way operators would when they paste a
@@ -169,19 +171,35 @@ func TestBasicAuthRequiresCredentialsWhenConfigured(t *testing.T) {
 func TestBasicAuthSkipsPublicRoutes(t *testing.T) {
 	t.Parallel()
 	mw := BasicAuth(BasicAuthConfig{User: "alice", PasswordSHA256: hashPass("secret")})
-	for _, path := range []string{"/healthz", "/webhook/whk_x", "/signal/sig_x"} {
+	h := mw(silentHandler)
+	for _, path := range []string{"/healthz", "/readyz", "/oauth/callback", "/webhook/whk_x", "/command-webhook/cmdwhk_x", "/signal/sig_x"} {
 		t.Run(path, func(t *testing.T) {
-			srv := httptest.NewServer(mw(silentHandler))
-			defer srv.Close()
-			resp, err := http.Get(srv.URL + path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("public path %s: status = %d, want 200", path, resp.StatusCode)
+			req := httptest.NewRequest(http.MethodGet, "http://reactor.test"+path, nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("public path %s: status = %d, want 200", path, rec.Code)
 			}
 		})
+	}
+}
+
+func TestOAuthCallbackSkipsSessionAuth(t *testing.T) {
+	t.Parallel()
+	// A provider redirect is authenticated by the OAuth state's single-use
+	// state + PKCE verifier, not by a Reactor dashboard session. Keep this
+	// route public so an MCP-started consent flow can finish in a browser that
+	// is not signed in.
+	called := false
+	h := SessionAuth(SessionAuthConfig{Store: &auth.Store{}})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/oauth/callback?state=st_test&code=code", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent || !called {
+		t.Fatalf("OAuth callback status=%d called=%t; want unauthenticated callback to reach handler", rec.Code, called)
 	}
 }
 
@@ -285,12 +303,12 @@ func TestIsTrustedProxy(t *testing.T) {
 	}{
 		{"127.0.0.1", true},
 		{"::1", true},
-		{"10.0.0.5", true},
-		{"192.168.1.1", true},
-		{"172.16.0.1", true},
-		{"172.31.255.254", true},
-		{"fd12:3456::1", true},
-		// Outside RFC1918 but previously matched by HasPrefix "172.":
+		{"10.0.0.5", false},
+		{"192.168.1.1", false},
+		{"172.16.0.1", false},
+		{"172.31.255.254", false},
+		{"fd12:3456::1", false},
+		// Private peers are no longer implicitly trusted proxies.
 		{"172.0.0.1", false},
 		{"172.15.0.1", false},
 		{"172.32.0.1", false},
@@ -327,12 +345,11 @@ func TestClientIPParsesIPv6(t *testing.T) {
 		{"untrusted proxy ignores xff", "203.0.113.5:54321", "evil.example", "203.0.113.5"},
 		{"trusted v4 proxy uses xff", "127.0.0.1:54321", "203.0.113.99", "203.0.113.99"},
 		{"trusted v6 proxy uses xff", "[::1]:54321", "203.0.113.99", "203.0.113.99"},
-		{"trusted proxy chains xff", "10.0.0.1:54321", "203.0.113.99, 10.0.0.1", "203.0.113.99"},
+		{"private peer ignores xff", "10.0.0.1:54321", "203.0.113.99, 10.0.0.1", "10.0.0.1"},
 		// 172.250.x.x previously matched the buggy HasPrefix "172." and
 		// would have trusted the XFF; with the fix it must not.
 		{"172.250 not trusted", "172.250.0.1:54321", "evil.example", "172.250.0.1"},
-		// 172.16 actually is RFC1918, so XFF must be honoured here.
-		{"172.16 trusted", "172.16.0.1:54321", "203.0.113.7", "203.0.113.7"},
+		{"172.16 private ignored", "172.16.0.1:54321", "203.0.113.7", "172.16.0.1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

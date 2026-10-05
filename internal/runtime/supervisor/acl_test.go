@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
@@ -21,7 +22,7 @@ import (
 // newACLEnv builds a journal + vault + a credential that the dispatcher
 // can try to fetch. Workflow is created via the journal; whether the
 // (workflow, credential) grant exists is the test's choice.
-func newACLEnv(t *testing.T) (*journal.Journal, *vault.Store) {
+func newACLEnv(t *testing.T) (*journal.Journal, *vault.Store, *sql.DB) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "acl.db")
@@ -72,7 +73,7 @@ func newACLEnv(t *testing.T) (*journal.Journal, *vault.Store) {
 	if err := v.Put(context.Background(), "cred_secret", []byte("the-plaintext")); err != nil {
 		t.Fatalf("vault put: %v", err)
 	}
-	return j, v
+	return j, v, db
 }
 
 // runHandleSecretFetch constructs a dispatcher with the given ACL
@@ -80,14 +81,20 @@ func newACLEnv(t *testing.T) (*journal.Journal, *vault.Store) {
 // for cred_secret against workflow slug acl-test, and returns the
 // decoded SecretReply that came out of the dispatcher's writer.
 func runHandleSecretFetch(t *testing.T, j *journal.Journal, v *vault.Store, permissive bool) wire.SecretReply {
+	return runHandleSecretFetchOwned(t, j, v, permissive, "")
+}
+
+func runHandleSecretFetchOwned(t *testing.T, j *journal.Journal, v *vault.Store, permissive bool, leaseOwner string) wire.SecretReply {
 	t.Helper()
 	sup := &Supervisor{
 		WorkflowSlug:  "acl-test",
 		RunID:         "run_acl",
+		Mode:          "live",
 		Journal:       j,
 		Vault:         v,
 		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		ACLPermissive: permissive,
+		LeaseOwner:    leaseOwner,
 	}
 	var buf bytes.Buffer
 	disp := &dispatcher{
@@ -116,9 +123,50 @@ func runHandleSecretFetch(t *testing.T, j *journal.Journal, v *vault.Store, perm
 	return sr
 }
 
+func TestSecretFetchWireDeniesExpiredAndReplacedWorkerLease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	j, v, db := newACLEnv(t)
+	if err := j.GrantSecret(ctx, "wf_acl", "cred_secret", "test", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE runs SET status = 'queued' WHERE id = 'run_acl'`); err != nil {
+		t.Fatal(err)
+	}
+	first, err := j.ClaimQueuedRuns(ctx, "worker-secret-a", 1, time.Minute)
+	if err != nil || len(first) != 1 || first[0].RunID != "run_acl" {
+		t.Fatalf("first claim = %+v, %v", first, err)
+	}
+	if reply := runHandleSecretFetchOwned(t, j, v, false, ""); !reply.NotFound || len(reply.Value) != 0 {
+		t.Fatalf("lease-free local child received an owned secret: %+v", reply)
+	}
+	if reply := runHandleSecretFetchOwned(t, j, v, false, first[0].Owner); reply.NotFound || string(reply.Value) != "the-plaintext" {
+		t.Fatalf("current worker secret reply: %+v", reply)
+	}
+	if err := j.ExtendLease(ctx, "run_acl", first[0].Owner, -time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if reply := runHandleSecretFetchOwned(t, j, v, false, first[0].Owner); !reply.NotFound || len(reply.Value) != 0 {
+		t.Fatalf("expired worker received a secret before reap: %+v", reply)
+	}
+	if n, err := j.ReapExpiredLeases(ctx); err != nil || n != 1 {
+		t.Fatalf("reap = %d, %v", n, err)
+	}
+	second, err := j.ClaimQueuedRuns(ctx, "worker-secret-b", 1, time.Minute)
+	if err != nil || len(second) != 1 || second[0].RunID != "run_acl" {
+		t.Fatalf("replacement claim = %+v, %v", second, err)
+	}
+	if reply := runHandleSecretFetchOwned(t, j, v, false, first[0].Owner); !reply.NotFound || len(reply.Value) != 0 {
+		t.Fatalf("replaced worker received a secret: %+v", reply)
+	}
+	if reply := runHandleSecretFetchOwned(t, j, v, false, second[0].Owner); reply.NotFound || string(reply.Value) != "the-plaintext" {
+		t.Fatalf("replacement worker secret reply: %+v", reply)
+	}
+}
+
 func TestSecretFetchEmptyACLStrictDeniesByDefault(t *testing.T) {
 	t.Parallel()
-	j, v := newACLEnv(t)
+	j, v, _ := newACLEnv(t)
 
 	reply := runHandleSecretFetch(t, j, v, false)
 	if !reply.NotFound {
@@ -131,7 +179,7 @@ func TestSecretFetchEmptyACLStrictDeniesByDefault(t *testing.T) {
 
 func TestSecretFetchEmptyACLPermissiveAllows(t *testing.T) {
 	t.Parallel()
-	j, v := newACLEnv(t)
+	j, v, _ := newACLEnv(t)
 
 	reply := runHandleSecretFetch(t, j, v, true)
 	if reply.NotFound {
@@ -142,9 +190,30 @@ func TestSecretFetchEmptyACLPermissiveAllows(t *testing.T) {
 	}
 }
 
+func TestSecretFetchPermissiveDeniesGrantProbeError(t *testing.T) {
+	t.Parallel()
+	j, v, db := newACLEnv(t)
+
+	// A permissive install may allow the explicit empty-table migration fallback,
+	// but it must not treat an actual grant-probe failure as an empty table. Drop
+	// the grants table to reproduce a database/schema error after the workflow
+	// and credential tenant checks have already succeeded.
+	if _, err := db.ExecContext(context.Background(), `DROP TABLE workflow_secret_grants`); err != nil {
+		t.Fatalf("drop grants table: %v", err)
+	}
+
+	reply := runHandleSecretFetch(t, j, v, true)
+	if !reply.NotFound {
+		t.Fatalf("permissive mode allowed a secret when the grant probe failed: reply=%+v", reply)
+	}
+	if len(reply.Value) != 0 {
+		t.Fatalf("grant probe failure leaked plaintext: %q", reply.Value)
+	}
+}
+
 func TestSecretFetchExplicitGrantAllowsRegardlessOfPermissive(t *testing.T) {
 	t.Parallel()
-	j, v := newACLEnv(t)
+	j, v, _ := newACLEnv(t)
 	if err := j.GrantSecret(context.Background(), "wf_acl", "cred_secret", "test", ""); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
@@ -160,7 +229,7 @@ func TestSecretFetchExplicitGrantAllowsRegardlessOfPermissive(t *testing.T) {
 
 func TestSecretFetchNonEmptyACLWithoutGrantDenies(t *testing.T) {
 	t.Parallel()
-	j, v := newACLEnv(t)
+	j, v, _ := newACLEnv(t)
 	// Seed an unrelated grant so the table is non-empty; this
 	// disables the empty-table fallback for both modes.
 	if err := j.GrantSecret(context.Background(), "wf_acl", "cred_other", "test", ""); err != nil {

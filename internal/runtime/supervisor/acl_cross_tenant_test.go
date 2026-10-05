@@ -95,6 +95,7 @@ func TestSecretFetchDoesNotResolveWorkflowAcrossTenants(t *testing.T) {
 	sup := &Supervisor{
 		WorkflowSlug:  "billing",
 		RunID:         "run_attacker",
+		Mode:          "live",
 		Journal:       j,
 		Vault:         v,
 		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -180,27 +181,29 @@ func TestStaleCrossTenantGrantStillDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sup := &Supervisor{
-		WorkflowSlug: "attacker-flow", RunID: "run_a",
-		Journal: j, Vault: v,
-		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
-		ACLPermissive: false,
-	}
-	var buf bytes.Buffer
-	disp := &dispatcher{sup: sup, enc: wire.NewEncoder(&buf), writeMu: &sync.Mutex{}}
-	req, _ := wire.Wrap(1, 0, wire.KindSecretFetch, wire.SecretFetch{ID: "cred_victim"})
-	if err := disp.handleSecretFetch(ctx, req); err != nil {
-		t.Fatal(err)
-	}
-	frame, err := wire.NewDecoder(&buf).Decode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sr wire.SecretReply
-	if err := wire.Unwrap(frame, &sr); err != nil {
-		t.Fatal(err)
-	}
-	if !sr.NotFound || len(sr.Value) > 0 {
-		t.Fatalf("a stale cross-tenant grant row authorised the read (value=%q); the tenant equality check at the gate did not fire", string(sr.Value))
+	for _, permissive := range []bool{false, true} {
+		sup := &Supervisor{
+			WorkflowSlug: "attacker-flow", RunID: "run_a", Mode: "live",
+			Journal: j, Vault: v,
+			Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+			ACLPermissive: permissive,
+		}
+		var buf bytes.Buffer
+		disp := &dispatcher{sup: sup, enc: wire.NewEncoder(&buf), writeMu: &sync.Mutex{}}
+		req, _ := wire.Wrap(1, 0, wire.KindSecretFetch, wire.SecretFetch{ID: "cred_victim"})
+		if err := disp.handleSecretFetch(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		frame, err := wire.NewDecoder(&buf).Decode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sr wire.SecretReply
+		if err := wire.Unwrap(frame, &sr); err != nil {
+			t.Fatal(err)
+		}
+		if !sr.NotFound || len(sr.Value) > 0 {
+			t.Fatalf("permissive=%v: a stale cross-tenant grant row authorised the read (value=%q); the tenant equality check at the gate did not fire", permissive, string(sr.Value))
+		}
 	}
 }

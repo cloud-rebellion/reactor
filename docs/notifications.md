@@ -4,8 +4,8 @@ Failed runs no longer land silently in `/runs`. Every workflow can route termina
 
 ## Quick start
 
-1. Open `/notifications` in the dashboard.
-2. Click **Add channel**, pick a kind, fill in the per-kind fields.
+1. Store each Slack webhook URL, SMTP password, or webhook auth header as a vault credential under `/credentials/new` in the destination tenant.
+2. Open `/notifications` in the dashboard. Click **Add channel**, pick a kind, fill in the non-secret fields, and select the credential ID.
 3. Click **Send test** on the new channel row to verify config without waiting for a real failure.
 4. Open any `/workflows/{slug}` page and use the **Attach channel** form in the Notifications section.
 
@@ -13,7 +13,12 @@ The default route fires on `failed,failed_dlq`. An operator can broaden to `fail
 
 ## Schema
 
-Two tables added by migration 0011.
+The original two tables were added by migration 0011. Migration 0069 adds
+`notification_dispatches` and `notification_deliveries` for durable route
+snapshots and per-channel receipts, plus `runs.terminal_generation` so a
+same-status dead-letter redrive is a new notification event. These ledger tables
+store run, tenant, workflow, channel, status, generation, and timestamps only;
+they never copy channel config or resolved vault values.
 
 ### `notification_channels`
 
@@ -51,15 +56,15 @@ Primary key on `(workflow_id, channel_id)` so re-attaching the same pair upserts
 ### `slack_webhook`
 
 ```json
-{ "url": "https://hooks.slack.com/services/T0/B0/abc123" }
+{ "url_credential_id": "cred_slack" }
 ```
 
-The dashboard form validates that the URL starts with `https://hooks.slack.com/`.
+The dashboard and MCP creation paths require a same-tenant vault credential reference. The webhook URL is resolved in memory immediately before sending.
 
 Sender emits a Block Kit message:
 
 - Header block: `[Reactor FAIL] demo-workflow: failed_dlq`
-- Section block with markdown body (workflow, run id, trigger, status, started, duration, error)
+- Section block with markdown body (workflow, run id, trigger, status, started, duration)
 - Optional "Open run" action button when `REACTOR_DASHBOARD_URL` is set
 
 ### `generic_webhook`
@@ -67,22 +72,24 @@ Sender emits a Block Kit message:
 ```json
 {
   "url": "https://example.com/reactor",
-  "headers": { "X-Auth-Token": "secret" }
+  "header_name": "X-Auth-Token",
+  "header_credential_id": "cred_hook"
 }
 ```
 
-Sender POSTs the full event with snake_case JSON tags:
+Sender POSTs terminal metadata with snake_case JSON tags:
 
 ```json
 {
   "run_id": "run_5b06a401ff4bd96d",
+  "terminal_generation": 1,
+  "notification_channel_id": "nch_ops",
   "workflow_id": "wf_demo",
   "workflow_slug": "demo-workflow",
   "status": "failed_dlq",
   "trigger_kind": "webhook",
   "started_at": "2026-05-31T19:14:07.172Z",
   "finished_at": "2026-05-31T19:14:08.012Z",
-  "error_text": "step 'charge_card' returned 500",
   "dashboard_url": "https://reactor.example.com/runs/run_5b06a401ff4bd96d"
 }
 ```
@@ -96,26 +103,55 @@ Sender POSTs the full event with snake_case JSON tags:
   "host": "smtp.gmail.com",
   "port": 587,
   "username": "alerts@example.com",
-  "password": "...",
+  "password_credential_id": "cred_smtp",
   "from": "alerts@example.com",
   "to": "ops@example.com, oncall@example.com",
   "starttls": true
 }
 ```
 
-`port` defaults to 587; `starttls` defaults to true on 587. The `to` field accepts comma-separated recipients. PLAIN auth.
+`port` defaults to 587. Port 587 requires STARTTLS by default: if the server does not advertise it or TLS validation fails, Reactor sends neither credentials nor a message. Port 465 uses certificate-verified implicit TLS; MCP-created channels store `starttls:false`, and explicit `starttls:true` is rejected. On other ports, MCP-created channels request STARTTLS by default; legacy/operator configs with `starttls` omitted use plain SMTP. The `to` field accepts comma-separated recipients. The sender uses SMTP PLAIN authentication when a username is configured.
 
 The email body is plain text mirroring the Slack message's content.
 
-> **Keep the password out of `config_json`.** Instead of a plaintext `password`, set `"password_credential_id": "cred_..."` to reference a vault credential. The notifier resolves it from the vault at send time, so the secret never sits in the channel row at rest. The create form exposes both: leave the plaintext field blank and fill the credential-id field. The generic webhook channel takes the same treatment for an auth header via `header_name` + `header_credential_id`. A channel that references a credential the vault can't resolve fails the send closed (it is not sent with a blank secret).
+Raw step error text is omitted from Slack, generic webhook JSON, and email
+notifications. Errors may contain credentials or other untrusted data. The run
+ID, status, and dashboard link remain available so operators can inspect the
+error in Reactor's authenticated run view. This is a fixed egress policy; channel
+configuration cannot enable raw error delivery.
+
+The dashboard and MCP creation paths reject plaintext credentials. With journal payload encryption enabled, new channel configs are sealed at rest and bound to their tenant and channel identity. Existing version-zero channels may still contain inline plaintext and need migration to vault references. For referenced channels, the notifier checks that the credential still belongs to the channel's tenant and resolves it from the vault at send time, including **Send test**. A missing or cross-tenant credential fails the send closed.
 
 ## Fire path
 
-Every workflow run that lands in a terminal status (`failed`, `failed_dlq`, `succeeded`) drives the dispatcher's `OnTerminal` callback. The callback calls `notifier.Notify(ctx, event)`. The notifier:
+Every workflow run that lands in a terminal status (`failed`, `failed_dlq`, `succeeded`) drives the dispatcher's `OnTerminal` callback. The daemon calls `notifier.NotifyClaimed(ctx, event, terminalEffectClaim)`. The notifier:
 
-1. Looks up routed channels via `Journal.ChannelsForRunTerminal(workflow_id, status)` (one SQL query, returns matching channels with config already loaded).
-2. Fans out to every channel in parallel under a per-send timeout (5 seconds default).
-3. Logs sender failures at WARN. The dispatcher's terminal path is never blocked by a Slack outage.
+1. Freezes the matching channel IDs once for the run's current terminal generation under the exact terminal-effect claim. Route changes during a retry do not add or remove recipients from that generation. A deleted destination is recorded as skipped and never sent after deletion.
+2. Reads pending destinations in pages of at most 16 configs, and fans out with at most 16 concurrent sends across the notifier instance. Each send has a 5-second timeout by default; capacity exhaustion defers unattempted channels for a terminal-effect retry.
+3. Records each confirmed channel send separately. A failed channel stays pending while successful peers are excluded from the next retry. The outer `terminal_effects` receipt is acknowledged only after every snapshot recipient was delivered or explicitly skipped; the database rejects an old daemon's acknowledgement while active routes or pending receipts lack a completed snapshot.
+
+Route snapshots are capped at **256 routes per workflow** (including routes for
+other statuses), and a legacy status filter longer than 4 KiB is rejected before
+materialization. If a workflow exceeds either bound, terminal notification
+delivery remains retryable and the daemon logs the error. An operator can reduce
+the route count or shorten the status filter; the next terminal-effect retry
+will create the snapshot. No recipient is silently truncated.
+
+External delivery is **at least once**. A provider may accept a send just before
+the process crashes or the receipt write fails; that channel can be sent again.
+Generic webhook receivers that require deduplication can key on `run_id`,
+`terminal_generation`, and `notification_channel_id` (legacy terminal rows may
+omit a zero generation). Configuration remains attached to the channel, so an operator
+may update or remove a destination after the membership snapshot; a removed
+channel is skipped rather than contacted.
+
+Migration 0069 is a coordinated daemon upgrade boundary. An older daemon can
+still attempt a send, but the database refuses its terminal-effect
+acknowledgement when a workflow has routes or an unfinished snapshot. Drain old
+terminal handlers before enabling the new schema and restart them on the new
+binary; a mixed-version period can repeat provider sends while old handlers
+retry. The migration does not backfill success receipts for alerts sent before
+the upgrade.
 
 `suspended` runs do not fire notifications. Only terminal statuses do.
 
@@ -130,7 +166,7 @@ Fires a synthetic alert via the channel:
   "run_id": "test_20260601T191407Z",
   "workflow_slug": "(test channel)",
   "status": "test",
-  "error_text": "Test message from Reactor. Channel is wired correctly."
+  "trigger_kind": "test"
 }
 ```
 
@@ -161,6 +197,6 @@ The `DeleteWorkflow` transaction explicitly drops `workflow_notification_routes`
 ## Tests
 
 - Journal: channel CRUD, upsert normalisation, status filter, delete-in-use rejection, cascade-on-workflow-delete, empty-statuses rejection.
-- Notifier: fanout, swallowed sender errors, unregistered-kind skip, `TestChannel` delivery, Slack + webhook POST round-trip, non-2xx surfacing, empty-URL rejection, per-send timeout honoured.
+- Notifier: fanout, aggregate sender errors, unregistered-kind errors, `TestChannel` delivery, Slack + webhook POST round-trip, non-2xx surfacing, empty-URL rejection, per-send timeout honoured.
 - Server: page renders, bad Slack URL 422, happy path 303, test button 503 when notifier nil, per-workflow attach + list + detach round-trip.
 - Dispatcher integration: drives the OnTerminal closure with a synthetic TerminalEvent and asserts the receiver got the right JSON.

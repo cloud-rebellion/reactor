@@ -50,6 +50,38 @@ func TestGetDeadLetterMissing(t *testing.T) {
 	}
 }
 
+func TestGetDeadLetterItemForTenantFencesTheParentRun(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := j.CreateWorkflowInTenant(ctx, "wf_dlq_acme", "dlq-acme", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateRun(ctx, "run_dlq_acme", "wf_dlq_acme", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MoveStepToDeadLetter(ctx, "run_dlq_acme", "send", "private failure", json.RawMessage(`{"private":"payload"}`)); err != nil {
+		t.Fatal(err)
+	}
+	item, err := j.GetDeadLetterItem(ctx, "")
+	if err == nil || item.ID != "" {
+		t.Fatalf("empty unscoped id = item=%+v err=%v, want not found", item, err)
+	}
+	items, err := j.ListDeadLetterItemsForTenant(ctx, 1, 0, "acme")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("list tenant dead letters = %d, err=%v", len(items), err)
+	}
+	if _, err := j.GetDeadLetterItemForTenant(ctx, items[0].ID, "other"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign tenant lookup = %v, want ErrNotFound", err)
+	}
+	got, err := j.GetDeadLetterItemForTenant(ctx, items[0].ID, "acme")
+	if err != nil || string(got.Payload) != `{"private":"payload"}` {
+		t.Fatalf("same tenant lookup = %+v err=%v", got, err)
+	}
+}
+
 func TestListDeadLetterPagination(t *testing.T) {
 	t.Parallel()
 	j, cleanup := newTestJournal(t)

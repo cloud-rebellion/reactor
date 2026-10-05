@@ -6,12 +6,14 @@
 // Routes:
 //
 //	GET  /healthz           liveness probe (returns 200 + JSON)
+//	GET  /readyz            readiness probe (database + artifact store + MCP + runtime)
 //	GET  /                  home: workflows + recent runs
 //	GET  /runs              full runs list
 //	GET  /runs/{id}         run timeline
 //	GET  /credentials       credentials with rotation state
 //	GET  /credentials/{id}  credential detail + audit log
 //	POST /webhook/{token}   trigger payload (HMAC-verified)
+//	POST /command-webhook/{token} dedicated command-plan ingress
 //	POST /signal/{token}    AwaitSignal external delivery
 package server
 
@@ -22,8 +24,11 @@ import (
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +36,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/bright-interaction/reactor/internal/auth"
 	"github.com/bright-interaction/reactor/internal/credentials"
 	"github.com/bright-interaction/reactor/internal/flarereport"
 	"github.com/bright-interaction/reactor/internal/graph"
@@ -38,6 +44,7 @@ import (
 	"github.com/bright-interaction/reactor/internal/oauth"
 	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runlogs"
+	"github.com/bright-interaction/reactor/internal/runtime/commandwebhook"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/webhook"
 	"github.com/bright-interaction/reactor/internal/vault"
@@ -46,15 +53,16 @@ import (
 // Server wires every HTTP-facing component together. The daemon
 // constructs one + serves it; tests can mount sub-routers selectively.
 type Server struct {
-	Journal     *journal.Journal
-	Credentials *credentials.Repo
-	OAuth       *oauth.Store
-	Registry    *registry.FileRegistry
-	Knowledge   *knowledge.Store
-	Graph       *graph.Graph
-	Webhook     *webhook.Receiver
-	Log         *slog.Logger
-	Version     string
+	Journal        *journal.Journal
+	Credentials    *credentials.Repo
+	OAuth          *oauth.Store
+	Registry       *registry.FileRegistry
+	Knowledge      *knowledge.Store
+	Graph          *graph.Graph
+	Webhook        *webhook.Receiver
+	CommandWebhook *commandwebhook.Receiver
+	Log            *slog.Logger
+	Version        string
 
 	// WorkflowsRoot is the parent directory for workflow source files
 	// (workflow.go + dag.json), not the binary registry. Used by the
@@ -83,9 +91,9 @@ type Server struct {
 	// /runs/{id}/cancel route returns 503 + the Cancel button is hidden.
 	RunCanceller RunCanceller
 
-	// BasicAuth gates every route except /healthz + /webhook/* +
-	// /signal/* (those have their own auth contracts: HMAC for webhook,
-	// 128-bit token for signal, intentionally-public for healthz).
+	// BasicAuth gates every route except /healthz + /readyz + /webhook/* +
+	// /command-webhook/* + /signal/* (those have their own auth contracts: HMAC for webhook,
+	// 128-bit token for signal, intentionally-public for health/readiness).
 	// Empty User or PasswordSHA256 disables auth (local-demo mode).
 	BasicAuth BasicAuthConfig
 
@@ -99,6 +107,9 @@ type Server struct {
 	// Refill is the steady-state per-second rate. Zero on either field
 	// disables the limiter.
 	RateLimit RateLimitConfig
+	// TrustedProxies names the socket peers allowed to supply forwarded
+	// client IP and origin headers. Loopback is trusted by default.
+	TrustedProxies TrustedProxyPolicy
 
 	// Vault is the credential store used by the dashboard's create-
 	// credential form. When nil, /credentials/new returns 503 (the
@@ -121,6 +132,10 @@ type Server struct {
 	// generated workflow binaries land. Required by the codegen prompt
 	// bar's auto-build step. Falls back to s.Registry.Root when empty.
 	State string
+	// WorkerArtifactRoot is the serving daemon's read-only view of the
+	// distributed workers' artifact tree. Dashboard activation verifies the
+	// reviewed version there as well as in State when it is configured.
+	WorkerArtifactRoot string
 
 	// MCPHandler, when non-nil, is mounted at POST /mcp as the
 	// Streamable HTTP MCP transport. The daemon constructs an
@@ -165,6 +180,19 @@ type Server struct {
 	// from the users table.
 	Auth AuthAdmin
 
+	// MCPBearerToken enables the Stage/Mesh-style dedicated bearer connection
+	// for /mcp. MCPBearerUser is the bounded admin identity assigned to that
+	// token; database API tokens still resolve through Auth first.
+	MCPBearerToken string
+	MCPBearerUser  auth.User
+
+	// RuntimeReady is an optional daemon-owned health callback. It lets the
+	// long-running serve loop withdraw readiness when an essential component
+	// (HTTP listener, scheduler, cron, or rotation runner) exits. Minimal
+	// embedded/test servers leave it nil, which preserves their dependency-only
+	// readiness behavior.
+	RuntimeReady func() bool
+
 	// flash is the single-use encrypted store for one-time payloads surfaced
 	// on the next page load (e.g. a freshly-minted webhook HMAC secret). When
 	// Journal is wired, the ciphertext is shared across replicas while the
@@ -183,39 +211,107 @@ type Server struct {
 	// daemon.
 	adminMu sync.Mutex
 
-	// analytics cache: the home page's rollup GROUP-BYs the whole runs
-	// table + runs one query per workflow. Cache it for a few seconds so a
-	// burst of page loads (or many tabs) doesn't re-scan history each time.
+	// analytics cache: the home page's rollup still scans retained history.
+	// Cache it briefly so a burst of page loads does not repeat that work.
 	analyticsMu    sync.Mutex
 	analyticsCache journal.Analytics
 	analyticsAt    time.Time
 	analyticsOK    bool
+	// Tenant dashboards use the same bounded rollup but must never reuse the
+	// estate-wide cache. Keep a small per-tenant cache so a burst of member page
+	// loads does not rescan the runs table while preserving the tenant fence.
+	analyticsTenantCache map[string]analyticsCacheEntry
 }
+
+type analyticsCacheEntry struct {
+	value journal.Analytics
+	at    time.Time
+}
+
+// analyticsSnapshot keeps the values separate from their freshness. A failed
+// first read must not be rendered as a real zero-run fleet, while a failed
+// refresh may still show the last good values with their original timestamp.
+type analyticsSnapshot struct {
+	value     journal.Analytics
+	asOf      time.Time
+	available bool
+	stale     bool
+}
+
+const maxTenantAnalyticsCacheEntries = 256
 
 // analyticsTTL is how long a computed home-page rollup is reused.
 const analyticsTTL = 10 * time.Second
 
+// The home table renders at most ten rows. Keep its cached result at the
+// same bound instead of retaining every workflow in a large tenant or fleet.
+const homeAnalyticsWorkflowLimit = 10
+
 // cachedAnalytics returns the home-page rollup, recomputing only when the
 // cached copy is older than analyticsTTL. On a recompute error it returns
-// the last good value (if any) so a transient DB hiccup doesn't blank the
-// dashboard.
-func (s *Server) cachedAnalytics(ctx context.Context) (journal.Analytics, error) {
+// the last good value (if any) as stale along with the error, so the page
+// can show an honest as-of marker instead of a false zero or fresh count.
+func (s *Server) cachedAnalytics(ctx context.Context) (analyticsSnapshot, error) {
 	s.analyticsMu.Lock()
 	defer s.analyticsMu.Unlock()
 	if s.analyticsOK && time.Since(s.analyticsAt) < analyticsTTL {
-		return s.analyticsCache, nil
+		return analyticsSnapshot{value: s.analyticsCache, asOf: s.analyticsAt, available: true}, nil
 	}
-	a, err := s.Journal.AnalyticsSummary(ctx)
+	a, _, err := s.Journal.AnalyticsSummaryPage(ctx, homeAnalyticsWorkflowLimit, 0)
 	if err != nil {
 		if s.analyticsOK {
-			return s.analyticsCache, nil // serve stale rather than fail
+			return analyticsSnapshot{value: s.analyticsCache, asOf: s.analyticsAt, available: true, stale: true}, err
 		}
-		return a, err
+		return analyticsSnapshot{}, err
 	}
 	s.analyticsCache = a
 	s.analyticsAt = time.Now()
 	s.analyticsOK = true
-	return a, nil
+	return analyticsSnapshot{value: a, asOf: s.analyticsAt, available: true}, nil
+}
+
+// cachedTenantAnalytics is the member equivalent of cachedAnalytics. The
+// tenant id is part of the cache key and the journal query repeats the same
+// predicate in every aggregate, so a member can only ever receive its own
+// metrics. Entries are bounded to avoid turning a large tenant fleet into an
+// unbounded in-process cache.
+func (s *Server) cachedTenantAnalytics(ctx context.Context, tenantID string) (analyticsSnapshot, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return analyticsSnapshot{}, errors.New("tenant analytics requires tenant")
+	}
+	s.analyticsMu.Lock()
+	defer s.analyticsMu.Unlock()
+	if s.analyticsTenantCache == nil {
+		s.analyticsTenantCache = make(map[string]analyticsCacheEntry)
+	}
+	if cached, ok := s.analyticsTenantCache[tenantID]; ok && time.Since(cached.at) < analyticsTTL {
+		return analyticsSnapshot{value: cached.value, asOf: cached.at, available: true}, nil
+	}
+	a, _, err := s.Journal.AnalyticsSummaryForTenantPage(ctx, tenantID, homeAnalyticsWorkflowLimit, 0)
+	if err != nil {
+		if cached, ok := s.analyticsTenantCache[tenantID]; ok {
+			return analyticsSnapshot{value: cached.value, asOf: cached.at, available: true, stale: true}, err
+		}
+		return analyticsSnapshot{}, err
+	}
+	if len(s.analyticsTenantCache) >= maxTenantAnalyticsCacheEntries {
+		// Evict the oldest entry. This is deliberately a simple bounded cache;
+		// exact LRU ordering is unnecessary for a ten-second dashboard TTL.
+		oldestID := ""
+		var oldest time.Time
+		for id, entry := range s.analyticsTenantCache {
+			if oldestID == "" || entry.at.Before(oldest) {
+				oldestID, oldest = id, entry.at
+			}
+		}
+		if oldestID != "" {
+			delete(s.analyticsTenantCache, oldestID)
+		}
+	}
+	asOf := time.Now()
+	s.analyticsTenantCache[tenantID] = analyticsCacheEntry{value: a, at: asOf}
+	return analyticsSnapshot{value: a, asOf: asOf, available: true}, nil
 }
 
 // loginThrottle returns the lazily-initialised failed-login limiter.
@@ -285,6 +381,14 @@ type WorkflowRegistrar interface {
 	RegisterFromDir(ctx context.Context, slug, dir, tenantID string) (workflowID string, err error)
 }
 
+// WorkflowRegistrarWithExpectedVersion is the optional dashboard editor
+// surface for journal-backed revisions. Keeping it separate preserves source
+// compatibility for upload-only registrars while letting the editor fail
+// closed when an adapter cannot atomically fence a reviewed version.
+type WorkflowRegistrarWithExpectedVersion interface {
+	RegisterFromDirExpected(ctx context.Context, slug, dir, tenantID string, expectedVersion int) (workflowID string, err error)
+}
+
 // CodeValidator is the editor save's validation surface. The daemon
 // wires the existing codegen.GoBuildValidator here so a save runs the
 // same gates as a generate. The minimal shape avoids an import cycle.
@@ -308,7 +412,8 @@ type RateLimitConfig struct {
 // Mount registers every route on the given chi router. Middleware
 // wraps in order: SecurityHeaders (always), RateLimit (if configured),
 // BasicAuth (always; fail-closed when creds are unset unless
-// AllowNoAuth is true), CSRF (always; exempts /webhook, /signal, /mcp).
+// AllowNoAuth is true), CSRF (always; exempts /webhook, /command-webhook,
+// /signal, /mcp).
 //
 // Routes are mounted via per-feature helpers so a missing capability
 // (e.g. Vault nil for read-only deployments) skips an entire route
@@ -355,10 +460,11 @@ func (s *Server) Mount(r chi.Router) {
 	// (tests, --insecure-no-auth bootstrap) the gate passes through.
 	r.Group(func(ar chi.Router) {
 		ar.Use(s.requireAdminMW)
+		ar.Get("/oauth-broker-policies", s.oauthBrokerPolicies)
+		ar.Post("/oauth-broker-policies/{id}", s.oauthBrokerPolicyApprove)
 		// MCP is host-adjacent authoring/introspection (workflow build = code
-		// execution; read tools are not tenant-scoped). Gate it behind admin
-		// like every other write surface so a member token cannot reach the
-		// cross-tenant read tools or any future write tool wired over HTTP.
+		// execution). Gate it behind admin like every other write surface; its
+		// handlers still apply the configured tenant scope to all estate reads.
 		s.mountMCPRoute(ar)
 		// /graph.json serialises the WHOLE estate graph: every tenant's
 		// workflow slugs, the full workflow->credential grant matrix,
@@ -375,6 +481,7 @@ func (s *Server) Mount(r chi.Router) {
 		s.mountWorkflowLifecycleRoutes(ar)
 		s.mountGenerateRoute(ar)
 		s.mountDLQRoute(ar)
+		ar.Get("/mail-sends", s.mailSendQueue)
 		s.mountKnowledgeWriteRoutes(ar)
 		s.mountWorkflowUploadRoutes(ar)
 		s.mountAuditRoute(ar)
@@ -482,6 +589,7 @@ func (s *Server) mountMiddleware(r chi.Router) {
 	// so this must catch them from every layer below, report to Flare,
 	// and render the 500 itself (it does not re-panic).
 	r.Use(flarereport.FlareRecoverer)
+	r.Use(TrustedProxyContext(s.TrustedProxies))
 	r.Use(SecurityHeaders)
 	if s.RateLimit.Burst > 0 && s.RateLimit.Refill > 0 {
 		r.Use(RateLimit(s.RateLimit.Burst, s.RateLimit.Refill))
@@ -493,8 +601,11 @@ func (s *Server) mountMiddleware(r chi.Router) {
 	// env-var BasicAuth (or fails closed per Pass A).
 	if s.Auth != nil {
 		r.Use(SessionAuth(SessionAuthConfig{
-			Store:             sessionStoreAdapter{a: s.Auth},
-			LegacyAllowNoAuth: s.BasicAuth.AllowNoAuth,
+			Store:                     sessionStoreAdapter{a: s.Auth},
+			LegacyAllowNoAuth:         s.BasicAuth.AllowNoAuth,
+			LegacyBasicAuthConfigured: s.BasicAuth.User != "" || s.BasicAuth.PasswordSHA256 != "",
+			MCPToken:                  s.MCPBearerToken,
+			MCPUser:                   s.MCPBearerUser,
 		}))
 	}
 	r.Use(BasicAuth(s.BasicAuth))
@@ -502,13 +613,14 @@ func (s *Server) mountMiddleware(r chi.Router) {
 }
 
 // mountReadRoutes registers the always-present read surfaces:
-// healthz, metrics, home, runs list/detail, credentials list/detail,
+// healthz/readyz, metrics, home, runs list/detail, credentials list/detail,
 // workflow detail, assets, onboarding. None gated by a capability;
 // every route uses the journal so a daemon spawned without one would
 // have crashed earlier. Tests that care only about a subset can mount
 // the helpers they need rather than calling full Mount.
 func (s *Server) mountReadRoutes(r chi.Router) {
 	r.Get("/healthz", s.healthz)
+	r.Get("/readyz", s.readyz)
 	r.Get("/metrics", s.metrics)
 	r.Get("/", s.home)
 	r.Get("/onboarding", s.onboarding)
@@ -524,7 +636,7 @@ func (s *Server) mountReadRoutes(r chi.Router) {
 }
 
 func (s *Server) mountVaultRoutes(r chi.Router) {
-	if s.Vault == nil {
+	if s.Vault == nil || s.Credentials == nil {
 		return
 	}
 	r.Get("/credentials/new", s.credentialNewForm)
@@ -535,10 +647,10 @@ func (s *Server) mountVaultRoutes(r chi.Router) {
 // value update. Each has a different capability dependency so the
 // gates split intentionally.
 func (s *Server) mountCredentialOpRoutes(r chi.Router) {
-	if s.Rotator != nil {
+	if s.Rotator != nil && s.Credentials != nil {
 		r.Post("/credentials/{id}/rotate", s.credentialRotate)
 	}
-	if s.Journal != nil {
+	if s.Journal != nil && s.Credentials != nil {
 		r.Post("/credentials/{id}/grants", s.credentialGrant)
 		r.Post("/credentials/{id}/grants/{workflow_id}/revoke", s.credentialRevoke)
 	}
@@ -635,14 +747,23 @@ func (s *Server) mountMCPRoute(r chi.Router) {
 	if s.MCPHandler == nil {
 		return
 	}
-	r.Handle("/mcp", s.MCPHandler)
+	// Keep the route contract explicit at the router boundary. Streamable HTTP
+	// uses POST for JSON-RPC requests; the handler still owns the protocol-level
+	// 405 response, but registering every method with Handle would make a future
+	// handler change accidentally expose PUT/DELETE/PATCH on the MCP surface.
+	// This matches Stage/Mesh's method-scoped /mcp registration while preserving
+	// the existing middleware and handler semantics for POST.
+	r.Post("/mcp", s.MCPHandler.ServeHTTP)
 }
 
 func (s *Server) mountDLQRoute(r chi.Router) {
-	if s.DLQRetry == nil {
+	if s.Journal == nil {
 		return
 	}
-	r.Post("/dlq/{id}/retry", s.dlqRetry)
+	r.Get("/dlq", s.dlq)
+	if s.DLQRetry != nil {
+		r.Post("/dlq/{id}/retry", s.dlqRetry)
+	}
 }
 
 func (s *Server) mountKnowledgeWriteRoutes(r chi.Router) {
@@ -672,10 +793,12 @@ func (s *Server) mountAuditRoute(r chi.Router) {
 }
 
 func (s *Server) mountWebhookRoutes(r chi.Router) {
-	if s.Webhook == nil {
-		return
+	if s.Webhook != nil {
+		s.Webhook.Mount(r)
 	}
-	s.Webhook.Mount(r)
+	if s.CommandWebhook != nil {
+		s.CommandWebhook.Mount(r)
+	}
 }
 
 // healthz returns a tiny JSON liveness response. Includes the version
@@ -685,6 +808,75 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":      true,
 		"version": s.Version,
+	})
+}
+
+// readyz reports whether the daemon can accept durable automation work. A
+// process can have a live HTTP listener while its database has been closed or
+// its state root has disappeared; treating that as ready makes an orchestrator
+// route MCP calls into guaranteed failures. Keep this endpoint unauthenticated
+// like healthz so container/systemd probes can use it without credentials.
+// Dependency details are intentionally coarse: the endpoint is public and
+// must not expose database or filesystem error text.
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	checks := make(map[string]string, 3)
+	ready := true
+
+	if s.Journal == nil {
+		checks["database"] = "missing"
+		ready = false
+	} else {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		err := s.Journal.Ping(ctx)
+		cancel()
+		if err != nil {
+			checks["database"] = "unavailable"
+			ready = false
+		} else {
+			checks["database"] = "ok"
+		}
+	}
+
+	// The workflow directory is created lazily by the first build, so check
+	// its state-root parent rather than requiring an empty fresh install to
+	// have a workflows/ directory already present.
+	if s.Registry == nil || strings.TrimSpace(s.Registry.Root) == "" {
+		checks["artifact_store"] = "missing"
+		ready = false
+	} else {
+		info, err := os.Stat(filepath.Dir(s.Registry.Root))
+		if err != nil || !info.IsDir() {
+			checks["artifact_store"] = "unavailable"
+			ready = false
+		} else {
+			checks["artifact_store"] = "ok"
+		}
+	}
+
+	if s.MCPHandler == nil {
+		checks["mcp_http"] = "missing"
+		ready = false
+	} else {
+		checks["mcp_http"] = "ok"
+	}
+
+	if s.RuntimeReady != nil && !s.RuntimeReady() {
+		checks["runtime"] = "unavailable"
+		ready = false
+	} else {
+		checks["runtime"] = "ok"
+	}
+
+	status := http.StatusOK
+	if !ready {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":      ready,
+		"version": s.Version,
+		"checks":  checks,
 	})
 }
 
@@ -713,7 +905,7 @@ func (s *Server) runInScope(r *http.Request, runID string) bool {
 	if scope == "" {
 		return true
 	}
-	info, err := s.Journal.GetRun(r.Context(), runID)
+	info, err := s.Journal.GetRunForTenantMetadata(r.Context(), runID, scope, 0)
 	return err == nil && info.TenantID == scope
 }
 
@@ -749,45 +941,92 @@ func (s *Server) home(w http.ResponseWriter, r *http.Request) {
 		s.errorPage(w, "list runs", err)
 		return
 	}
-	// Estate-wide analytics (aggregate counts + a per-workflow table that names
-	// other tenants' slugs) are NOT tenant-scoped, so only compute them for
-	// global viewers (admins). A member gets a zero strip rather than a
-	// cross-tenant metadata leak. (Per-tenant analytics is a product follow-up.)
-	var analytics journal.Analytics
-	if viewerScope(r) == "" {
-		var aErr error
-		if analytics, aErr = s.cachedAnalytics(ctx); aErr != nil {
-			// Don't fail the page if analytics can't be computed (e.g. a
-			// transient sqlite write contention). Log + render with zeros
-			// so the operator still sees workflows + recent runs.
-			s.Log.Warn("home: analytics summary failed", "err", aErr)
-		}
+	// Global viewers receive the estate rollup; members receive the same
+	// dashboard shape restricted to their tenant. Never substitute the global
+	// cache for a member: the per-workflow table contains slugs and run counts.
+	var analytics analyticsSnapshot
+	var aErr error
+	if scope == "" {
+		analytics, aErr = s.cachedAnalytics(ctx)
+	} else {
+		analytics, aErr = s.cachedTenantAnalytics(ctx, scope)
 	}
-	available, _ := s.Registry.List()
-	availableSet := map[string]bool{}
-	for _, slug := range available {
-		availableSet[slug] = true
+	if aErr != nil {
+		// Keep the rest of the page available during an analytics failure.
+		// A last-good snapshot is visibly stale; a cold failure omits KPI
+		// values rather than presenting false zeroes.
+		s.Log.Warn("home: analytics summary failed", "err", aErr, "tenant_id", scope)
 	}
+	availableSet := s.availableHomeWorkflows(wfs)
 
 	// Distributed-mode fleet: count workers heartbeating in the last 30s.
 	// Returns 0 in local mode (no workers register), so the fleet line
 	// stays hidden there.
 	workerCount, workerCap, _ := s.Journal.WorkerCapacity(ctx, 30*time.Second)
+	adminActions := true
+	if user, ok := UserFromContext(r.Context()); ok {
+		adminActions = user.IsAdmin()
+	}
+	var generatorTenants []journal.Tenant
+	generatorTenant := ""
+	if s.Generator != nil && adminActions {
+		generatorTenants, generatorTenant = s.availableTenants(r)
+	}
 
 	s.renderPage(w, r, page{
 		Title:   "Reactor",
 		Heading: "Reactor",
 		Body: template.HTML(homeBody(homeData{
+			AdminActions:     adminActions,
 			ShowTenant:       scope == "",
 			Workflows:        wfs,
 			Available:        availableSet,
 			Runs:             runs,
-			GeneratorEnabled: s.Generator != nil,
+			GeneratorEnabled: s.Generator != nil && adminActions,
+			GeneratorTenants: generatorTenants,
+			GeneratorTenant:  generatorTenant,
 			Analytics:        analytics,
 			WorkerCount:      workerCount,
 			WorkerCapacity:   workerCap,
 		})),
 	})
+}
+
+// workflowHomeKey keeps deployment status bound to the same tenant+slug pair
+// that identifies a journal workflow. A slug-only set is ambiguous on the
+// admin home page once two tenants own the same workflow slug.
+type workflowHomeKey struct {
+	TenantID string
+	Slug     string
+}
+
+func (s *Server) availableHomeWorkflows(workflows []journal.Workflow) map[workflowHomeKey]bool {
+	available := make(map[workflowHomeKey]bool)
+	if s.Registry == nil {
+		return available
+	}
+	seenTenants := make(map[string]bool)
+	for _, workflow := range workflows {
+		tenantID := workflow.TenantID
+		if seenTenants[tenantID] {
+			continue
+		}
+		seenTenants[tenantID] = true
+		slugs, err := s.Registry.ListForTenant(tenantID)
+		if err != nil {
+			// Availability is a display hint. A failed tenant-owned registry
+			// probe must not turn another tenant's same-slug binary into a
+			// deployed badge or a Run now control.
+			if s.Log != nil {
+				s.Log.Warn("home: tenant workflow availability failed", "tenant_id", tenantID, "err", err)
+			}
+			continue
+		}
+		for _, slug := range slugs {
+			available[workflowHomeKey{TenantID: tenantID, Slug: slug}] = true
+		}
+	}
+	return available
 }
 
 // runs lists runs with optional workflow_id + status filters and
@@ -843,7 +1082,7 @@ func (s *Server) runs(w http.ResponseWriter, r *http.Request) {
 // runDetail shows a run's metadata + step timeline.
 func (s *Server) runDetail(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	info, err := s.Journal.GetRun(r.Context(), id)
+	info, err := s.Journal.GetRunForTenantMetadata(r.Context(), id, viewerScope(r), 0)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
 			http.Error(w, "run not found", http.StatusNotFound)
@@ -858,7 +1097,11 @@ func (s *Server) runDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "run not found", http.StatusNotFound)
 		return
 	}
-	steps, err := s.Journal.ListSteps(r.Context(), id)
+	// Historical step output is untrusted data. Use the bounded tenant-scoped
+	// projection so one imported run cannot allocate an arbitrary output/error
+	// blob while the dashboard builds its flow and timeline. The renderer keeps
+	// durable size receipts for values omitted by this read boundary.
+	steps, stepHistoryOmitted, err := s.runDetailSteps(r.Context(), id, info.TenantID)
 	if err != nil {
 		s.errorPage(w, "list steps", err)
 		return
@@ -874,23 +1117,78 @@ func (s *Server) runDetail(w http.ResponseWriter, r *http.Request) {
 	// rows once the ring has expired (e.g. reading a run from last night).
 	var logs []string
 	if s.LogBuffer != nil {
-		logs = s.LogBuffer.Snapshot(id)
+		logs = boundRunDetailLogs(s.LogBuffer.Snapshot(id))
 	}
 	if len(logs) == 0 {
-		logs, _ = s.Journal.GetRunLogs(r.Context(), id)
+		if persisted, logErr := s.Journal.GetRunLogsPageForTenantBounded(r.Context(), id, info.TenantID, maxRunDetailLogLines, 0, maxRunDetailLogLineBytes); logErr == nil {
+			logs = boundRunDetailPersistedLogs(persisted)
+		}
 	}
 	canCancel := s.RunCanceller != nil && (info.Status == "running" || info.Status == "suspended")
-	// Flow diagram: overlay the run's per-step status + output on the workflow
-	// DAG. Best-effort -- a missing/unparseable DAG just omits the diagram.
-	flow := ""
-	if dag, dErr := s.Journal.WorkflowDAG(r.Context(), info.WorkflowID); dErr == nil {
-		flow = runFlowDiagram(dag, steps)
-	}
+	flow, flowNotice := s.runFlowForRunWithStepHistory(r.Context(), info, steps, stepHistoryOmitted)
 	s.renderPage(w, r, page{
 		Title:   "Run " + info.ID,
 		Heading: "Run " + info.ID,
-		Body:    template.HTML(runDetailBody(info, steps, flow, dlqID, logs, canCancel)),
+		Body:    template.HTML(runDetailBodyWithStepHistory(info, steps, flow, flowNotice, dlqID, logs, canCancel, stepHistoryOmitted)),
 	})
+}
+
+// runDetailSteps keeps the read tenant-scoped and bounded. A one-row probe is
+// needed at the exact page limit: without it the newest 1,000 attempts look
+// like the complete history even when older attempts were omitted.
+func (s *Server) runDetailSteps(ctx context.Context, runID, tenantID string) ([]journal.StepRow, bool, error) {
+	steps, err := s.Journal.ListLatestStepsPageForTenantBounded(ctx, runID, tenantID, maxRunDetailStepRows, 0, maxRunDetailStepOutputBytes, maxRunDetailStepErrorBytes)
+	if err != nil || len(steps) < maxRunDetailStepRows {
+		return steps, false, err
+	}
+	older, err := s.Journal.ListLatestStepsPageForTenantBounded(ctx, runID, tenantID, 1, maxRunDetailStepRows, 0, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	return steps, len(older) > 0, nil
+}
+
+// runFlowForRun reads the DAG recorded with the run's exact workflow version.
+// Reading workflows.dag_json here would put new nodes and edges over an old
+// run after an edit or rollback, falsely presenting them as executed work.
+// Legacy unpinned rows have no reliable version relationship to reconstruct.
+func (s *Server) runFlowForRun(ctx context.Context, info journal.RunInfo, steps []journal.StepRow) (flow, notice string) {
+	return s.runFlowForRunWithStepHistory(ctx, info, steps, false)
+}
+
+func (s *Server) runFlowForRunWithStepHistory(ctx context.Context, info journal.RunInfo, steps []journal.StepRow, stepHistoryOmitted bool) (flow, notice string) {
+	if info.WorkflowVersion < 1 {
+		return "", "Flow unavailable: this run predates workflow version pinning. The step timeline below is authoritative."
+	}
+	version, err := s.Journal.WorkflowVersionAtBounded(ctx, info.WorkflowID, info.WorkflowVersion, maxFlowDAGBytes)
+	if err != nil {
+		return "", "Flow unavailable: the recorded workflow version could not be loaded. The step timeline below is authoritative."
+	}
+	if version.DAGTruncated {
+		return "", fmt.Sprintf("Flow unavailable: the recorded workflow DAG is %d bytes and exceeds the bounded visual projection. The step timeline below is authoritative.", version.DAGBytes)
+	}
+	if info.WorkflowArtifactSHA256 == "" || version.ArtifactSHA256 == "" || version.ArtifactSHA256 != info.WorkflowArtifactSHA256 {
+		return "", "Flow unavailable: the run's artifact identity cannot be verified against its recorded workflow version. The step timeline below is authoritative."
+	}
+	receipts, receiptMore, receiptErr := s.Journal.ListBlockReceiptsForTenant(ctx, info.ID, info.TenantID, maxRunDetailBlockReceiptRows, 0)
+	if receiptErr != nil {
+		flow = runFlowDiagramWithHistory(version.DAG, steps, stepHistoryOmitted)
+		return flow, "SDK-reported block observations are unavailable; durable step receipts remain authoritative."
+	}
+	observed, presenceErr := s.Journal.ObservedBlockIdentitiesForTenant(ctx, info.ID, info.TenantID)
+	if presenceErr != nil {
+		flow = runFlowDiagramWithHistory(version.DAG, steps, stepHistoryOmitted)
+		return flow, "SDK-reported block observations are unavailable; durable step receipts remain authoritative."
+	}
+	// Distinguish a complete empty read from a nil/unavailable projection.
+	if observed == nil {
+		observed = []journal.ObservedBlockIdentity{}
+	}
+	flow = runFlowDiagramWithObservations(version.DAG, steps, stepHistoryOmitted, receipts, observed, receiptMore)
+	if flow == "" {
+		return "", "Flow unavailable: this workflow version has no renderable DAG. The step timeline below is authoritative."
+	}
+	return flow, ""
 }
 
 // runStatus serves GET /runs/{id}/status as JSON for the live page's finalize
@@ -899,7 +1197,7 @@ func (s *Server) runDetail(w http.ResponseWriter, r *http.Request) {
 // timeline.
 func (s *Server) runStatus(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	info, err := s.Journal.GetRun(r.Context(), id)
+	info, err := s.Journal.GetRunForTenantMetadata(r.Context(), id, viewerScope(r), 0)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
 			http.Error(w, "run not found", http.StatusNotFound)
@@ -1068,44 +1366,75 @@ func (s *Server) errorPage(w http.ResponseWriter, op string, err error) {
 // Page shell + base CSS + render() now live in render.go.
 
 type homeData struct {
+	AdminActions bool
 	// ShowTenant is set when the viewer can see more than one tenant (an admin).
 	// Slugs are unique only PER TENANT, so a bare /workflows/<slug> link is
 	// ambiguous for them and one tenant's workflow would be unreachable; the
 	// links carry ?tenant= so clicking through lands on the row you clicked.
 	ShowTenant       bool
 	Workflows        []journal.Workflow
-	Available        map[string]bool
+	Available        map[workflowHomeKey]bool
 	Runs             []journal.RunInfo
 	GeneratorEnabled bool
-	Analytics        journal.Analytics
+	// GeneratorTenants/GeneratorTenant back the dashboard codegen target
+	// selector. Generated workflows are staged disabled, so the operator must
+	// review and enable the artifact in the selected tenant before dispatch.
+	GeneratorTenants []journal.Tenant
+	GeneratorTenant  string
+	Analytics        analyticsSnapshot
 	WorkerCount      int
 	WorkerCapacity   int
 }
 
 func homeBody(d homeData) string {
 	var b strings.Builder
+	if d.Analytics.available && d.Analytics.stale {
+		fmt.Fprintf(&b, `<p class="warn" role="status">Analytics refresh failed. Showing the last successful snapshot from <time datetime="%s">%s</time>.</p>`,
+			d.Analytics.asOf.UTC().Format(time.RFC3339), d.Analytics.asOf.UTC().Format("2006-01-02 15:04:05 UTC"))
+	}
 	// Fleet line: shown only in distributed mode (i.e. when workers have
 	// registered a heartbeat). Lets a non-developer see the queue draining
 	// + how many workers are running, no CLI required.
 	if d.WorkerCount > 0 {
-		fmt.Fprintf(&b, `<p class="muted">Fleet: <strong>%d</strong> worker(s) active, %d total concurrency, <strong>%d</strong> run(s) queued.</p>`,
-			d.WorkerCount, d.WorkerCapacity, d.Analytics.RunsByStatus["queued"])
+		fmt.Fprintf(&b, `<p class="muted">Fleet: <strong>%d</strong> worker(s) active, %d total concurrency`,
+			d.WorkerCount, d.WorkerCapacity)
+		if d.Analytics.available {
+			fmt.Fprintf(&b, `, <strong>%d</strong> run(s) queued`, d.Analytics.value.RunsByStatus["queued"])
+			if d.Analytics.stale {
+				b.WriteString(` (last analytics snapshot)`)
+			}
+		}
+		b.WriteString(`.</p>`)
 	}
-	b.WriteString(renderAnalyticsStrip(d.Analytics))
-	b.WriteString(`<h2>Author a workflow</h2>`)
-	b.WriteString(`<p>Reactor's builder is your AI coding client. Ask <strong>Claude Code</strong> or <strong>Codex</strong> (connected over MCP with <code>--allow-write</code>) something like "build a Reactor workflow that emails a welcome message when a webhook fires" and it writes + registers the Go. New here? See the <a href="/onboarding">setup walkthrough</a> (2 commands).</p>`)
+	if d.Analytics.available {
+		b.WriteString(renderAnalyticsStrip(d.Analytics.value))
+	} else {
+		b.WriteString(`<p class="warn" role="status">Analytics unavailable. Run counts, durations, and estimated time saved could not be loaded.</p>`)
+	}
+	if d.AdminActions {
+		b.WriteString(`<h2>Author a workflow</h2>`)
+		b.WriteString(`<p>Reactor's builder is your AI coding client. Ask <strong>Claude Code</strong> or <strong>Codex</strong> (connected over MCP with <code>--mcp-allow-authoring</code>) something like "build a Reactor workflow that emails a welcome message when a webhook fires" and it writes + registers the Go. New here? See the <a href="/onboarding">setup walkthrough</a> (2 commands).</p>`)
+	} else {
+		b.WriteString(`<p class="muted">Workflow authoring and configuration are administrator-only. You can inspect and run workflows in your tenant.</p>`)
+	}
 	if d.GeneratorEnabled {
 		b.WriteString(`<h3>Or generate it here (optional)</h3>`)
 		b.WriteString(`<form method="POST" action="/generate" class="form">
   <label>Brief
     <textarea name="brief" rows="5" required placeholder="Describe in plain English what the workflow should do. Reference credentials by name (e.g. crm-api-key) so the generated code can vault.MustGet() them at run time."></textarea>
   </label>
-  <p class="muted">Claude reads your environment lens (services, credential metadata, knowledge corpus) and emits a workflow.go + dag.json. The orchestrator then runs go vet + reactor lint + go build with retries, commits to git, builds the binary, and registers it. Synchronous; usually 15-45s.</p>
+`)
+		if len(d.GeneratorTenants) > 0 {
+			b.WriteString(tenantSelect(d.GeneratorTenants, d.GeneratorTenant))
+		}
+		b.WriteString(`<p class="muted">Claude reads your environment lens (services, credential metadata, knowledge corpus) and emits a workflow.go + dag.json. The orchestrator then runs go vet + reactor lint + go build with retries, optionally commits to git, and stages the immutable artifact disabled for review. Enable it from the workflow page only after checking the source and flow. Synchronous; usually 15-45s.</p>
   <button type="submit" class="btn-primary">Generate</button>
 </form>`)
 	}
 	b.WriteString(`<h2>Workflows</h2>`)
-	b.WriteString(`<p><a href="/workflows/new" class="btn-secondary">Upload workflow (tar.gz)</a></p>`)
+	if d.AdminActions {
+		b.WriteString(`<p><a href="/workflows/new" class="btn-secondary">Upload workflow (tar.gz)</a></p>`)
+	}
 	if len(d.Workflows) == 0 {
 		b.WriteString(`<p class="empty">No workflows yet. Ask your connected AI client (Claude Code / Codex) to build one over MCP, scaffold with <code>reactor new</code>, or upload a tarball.</p>`)
 	} else {
@@ -1115,14 +1444,18 @@ func homeBody(d homeData) string {
 			b.WriteString(`<table><thead><tr><th>Slug</th><th>ID</th><th>SDK</th><th>Binary</th><th>Updated</th><th></th></tr></thead><tbody>`)
 		}
 		for _, w := range d.Workflows {
+			available := d.Available[workflowHomeKey{TenantID: w.TenantID, Slug: w.Slug}]
 			binStatus := `<span class="warn">missing</span>`
-			if d.Available[w.Slug] {
+			if available {
 				binStatus = `<span class="tag tag-on">deployed</span>`
 			}
 			runBtn := ""
-			if d.Available[w.Slug] {
-				runBtn = fmt.Sprintf(`<form method="POST" action="/workflows/%s/run" class="form-inline"><button type="submit" class="btn-link">run now</button></form>`,
-					template.URLQueryEscaper(w.Slug))
+			if available {
+				runAction := "/workflows/" + template.URLQueryEscaper(w.Slug) + "/run"
+				if d.ShowTenant {
+					runAction += "?tenant=" + template.URLQueryEscaper(w.TenantID)
+				}
+				runBtn = fmt.Sprintf(`<form method="POST" action="%s" class="form-inline"><button type="submit" class="btn-link">run now</button></form>`, runAction)
 			}
 			// ?tenant= only for a viewer who can see several tenants; a member's
 			// own scope already resolves the slug unambiguously.
@@ -1242,12 +1575,43 @@ func runsTable(runs []journal.RunInfo) string {
 	return b.String()
 }
 
-func runDetailBody(info journal.RunInfo, steps []journal.StepRow, flow, dlqID string, logs []string, canCancel bool) string {
+func runDetailBody(info journal.RunInfo, steps []journal.StepRow, flow, flowNotice, dlqID string, logs []string, canCancel bool) string {
+	return runDetailBodyWithStepHistory(info, steps, flow, flowNotice, dlqID, logs, canCancel, false)
+}
+
+func runDetailBodyWithStepHistory(info journal.RunInfo, steps []journal.StepRow, flow, flowNotice, dlqID string, logs []string, canCancel, stepHistoryOmitted bool) string {
 	var b strings.Builder
+	// Keep this renderer safe even when called by an embedding or test helper
+	// with a raw in-memory log slice instead of the bounded route projection.
+	logs = boundRunDetailLogs(logs)
 	fmt.Fprintf(&b, `<table><tr><th>Workflow</th><td><code>%s</code></td></tr>`, template.HTMLEscapeString(info.WorkflowID))
 	fmt.Fprintf(&b, `<tr><th>Trigger</th><td>%s</td></tr>`, template.HTMLEscapeString(info.TriggerKind))
 	fmt.Fprintf(&b, `<tr><th>Status</th><td><span class="tag tag-%s">%s</span></td></tr>`,
 		template.HTMLEscapeString(info.Status), template.HTMLEscapeString(info.Status))
+	// Keep the run's executable and input identity visible beside the timeline.
+	// The payload itself remains an explicit MCP read (it may contain secrets or
+	// personal data), while this bounded receipt lets an operator correlate a
+	// run with its exact dispatch bytes and immutable artifact safely.
+	inputHash := strings.TrimSpace(info.InputSHA256)
+	if inputHash == "" {
+		inputHash = "-"
+	}
+	inputBytes, inputSource := len(info.TriggerInput), "captured bytes"
+	if info.TriggerInput != nil {
+		// Explicit worker/replay reads may carry the exact bytes.
+	} else if info.TriggerInputPresent || info.TriggerInputBytes > 0 {
+		inputBytes, inputSource = info.TriggerInputBytes, "durable input bytes"
+	} else {
+		inputBytes, inputSource = len(info.TriggerMeta), "stored metadata bytes"
+	}
+	fmt.Fprintf(&b, `<tr><th>Input SHA-256</th><td><code>%s</code> <span class="muted">(%d %s)</span></td></tr>`,
+		template.HTMLEscapeString(inputHash), inputBytes, inputSource)
+	if info.WorkflowVersion > 0 {
+		fmt.Fprintf(&b, `<tr><th>Workflow version</th><td><code>%d</code></td></tr>`, info.WorkflowVersion)
+	}
+	if artifact := strings.TrimSpace(info.WorkflowArtifactSHA256); artifact != "" {
+		fmt.Fprintf(&b, `<tr><th>Artifact SHA-256</th><td><code>%s</code></td></tr>`, template.HTMLEscapeString(artifact))
+	}
 	fmt.Fprintf(&b, `<tr><th>Started</th><td>%s</td></tr>`, formatTime(info.StartedAt))
 	fmt.Fprintf(&b, `<tr><th>Finished</th><td>%s</td></tr>`, formatTime(info.FinishedAt))
 	b.WriteString(`</table>`)
@@ -1270,28 +1634,40 @@ func runDetailBody(info journal.RunInfo, steps []journal.StepRow, flow, dlqID st
 	// Flow diagram (how it ran + where the data ended up), when a DAG exists.
 	if flow != "" {
 		b.WriteString(flow)
+	} else if flowNotice != "" {
+		b.WriteString(`<h2>Flow</h2><p class="muted">` + template.HTMLEscapeString(flowNotice) + `</p>`)
 	}
 
 	b.WriteString(`<h2>Steps</h2>`)
+	if stepHistoryOmitted {
+		fmt.Fprintf(&b, `<p class="callout" role="status">Showing the most recent %d recorded step attempts from this read. A bounded check found additional attempts outside this view. Live runs may change while the page loads. Flow statuses and compute reflect only the displayed attempts.</p>`, len(steps))
+	}
 	if len(steps) == 0 {
 		b.WriteString(`<p class="empty">No steps recorded.</p>`)
 	} else {
-		b.WriteString(`<table><thead><tr><th>Step</th><th>Attempt</th><th>Status</th><th>Duration</th><th>Output / Error</th></tr></thead><tbody>`)
+		b.WriteString(`<p class="muted">Each row is one attempt. Call numbers distinguish repeated executions of a step; attempt numbers distinguish retries of that call. Legacy rows may lack a call number.</p>`)
+		b.WriteString(`<table><thead><tr><th>Step</th><th>Call</th><th>Attempt</th><th>Status</th><th>Duration</th><th>Output / Error</th></tr></thead><tbody>`)
 		for _, s := range steps {
 			dur := ""
 			if !s.StartedAt.IsZero() && !s.FinishedAt.IsZero() {
 				dur = fmt.Sprintf("%dms", s.FinishedAt.Sub(s.StartedAt).Milliseconds())
 			}
 			detail := ""
-			if s.ErrorText != "" {
+			if s.ErrorTruncated {
+				detail = fmt.Sprintf(`<span class="muted">error omitted (%d durable bytes)</span>`, s.ErrorBytes)
+			} else if s.ErrorText != "" {
 				detail = `<span class="err">` + template.HTMLEscapeString(truncate(s.ErrorText, 240)) + `</span>`
+			} else if s.OutputTruncated {
+				detail = fmt.Sprintf(`<span class="muted">output omitted (%d durable bytes)</span>`, s.OutputBytes)
+			} else if len(s.OutputJSONB) > maxRunDetailStepOutputBytes {
+				detail = fmt.Sprintf(`<span class="muted">output omitted (%d in-memory bytes)</span>`, len(s.OutputJSONB))
 			} else if len(s.OutputJSONB) > 0 && string(s.OutputJSONB) != "null" {
 				detail = `<details><summary>output_jsonb</summary><pre>` +
-					template.HTMLEscapeString(prettyJSON(string(s.OutputJSONB))) +
+					template.HTMLEscapeString(truncate(prettyJSON(string(s.OutputJSONB)), maxFlowOutputDisplayBytes)) +
 					`</pre></details>`
 			}
-			fmt.Fprintf(&b, `<tr><td><code>%s</code></td><td>%d</td><td><span class="tag tag-%s">%s</span></td><td class="muted">%s</td><td>%s</td></tr>`,
-				template.HTMLEscapeString(s.StepName), s.Attempt,
+			fmt.Fprintf(&b, `<tr><td><code>%s</code></td><td>%s</td><td>%d</td><td><span class="tag tag-%s">%s</span></td><td class="muted">%s</td><td>%s</td></tr>`,
+				template.HTMLEscapeString(s.StepName), flowCallLabel(s.Seq), s.Attempt,
 				template.HTMLEscapeString(s.Status), template.HTMLEscapeString(s.Status),
 				dur, detail)
 		}
@@ -1504,10 +1880,15 @@ func credentialDetailBody(c credentials.Credential, rows []credentials.AuditEntr
 		rotateConfirm = ` data-confirm="Provider ` + template.HTMLEscapeString(c.Provider) +
 			` REPLACES the stored value with a NEW RANDOM secret. The current value is discarded and cannot be recovered. If this credential was issued by another service, that service keeps the old value and the integration will break. Continue?"`
 	}
+	localMintAck := ""
+	if rot.mintsLocally {
+		localMintAck = `<label class="inline"><input type="checkbox" name="allow_local_mint" value="on" required> I understand this provider replaces the stored value with a newly generated random secret.</label>`
+	}
 	fmt.Fprintf(&b, `<form method="POST" action="/credentials/%s/rotate" class="form-inline"%s>
+  %s
   <button type="submit" class="btn-primary">Rotate now</button>
   <span class="muted">%s</span>
-</form>`, template.URLQueryEscaper(c.ID), rotateConfirm, template.HTMLEscapeString(rot.hint))
+	</form>`, template.URLQueryEscaper(c.ID), rotateConfirm, localMintAck, template.HTMLEscapeString(rot.hint))
 
 	fmt.Fprintf(&b, `<form method="POST" action="/credentials/%s/delete" class="form-inline" data-confirm="Delete this credential? The secret is removed from the vault and cannot be recovered. The row is kept as a tombstone so the audit trail survives, and the name becomes reusable.">
   <button type="submit" class="btn-link">Delete credential</button>
@@ -1576,10 +1957,10 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// TLSConfig optionally turns the listener into HTTPS. Both fields
-// must be set; either path empty disables TLS and the server uses
-// plain HTTP. Production deploys mount cert + key from a secret
-// manager (or a Caddy / Traefik sidecar) and pass them in here.
+// TLSConfig optionally turns the listener into HTTPS. Both fields must be set
+// together; an empty pair disables TLS and the server uses plain HTTP.
+// Production deploys mount cert + key from a secret manager (or a Caddy /
+// Traefik sidecar) and pass them in here.
 type TLSConfig struct {
 	CertFile string
 	KeyFile  string
@@ -1593,18 +1974,32 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 
 // RunWithTLS is Run plus an optional TLS config. When tls.CertFile +
 // tls.KeyFile are both set, the server boots over HTTPS via
-// ListenAndServeTLS; otherwise it falls back to plain HTTP. The
+// ListenAndServeTLS; when both are empty it serves plain HTTP. A partial
+// pair is rejected before opening a listener. The
 // SecurityHeaders middleware notices r.TLS != nil and emits HSTS
 // automatically, so flipping this flag is the only HTTPS change
 // operators need to make.
 func (s *Server) RunWithTLS(ctx context.Context, addr string, tls TLSConfig) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// An empty pair explicitly selects plain HTTP. A partial pair must never
+	// silently fall back to it: callers outside cmd/reactor can wire this
+	// method directly, and a path typo should stop startup before a listener
+	// exposes bearer-authenticated MCP over an unintended cleartext socket.
+	if (strings.TrimSpace(tls.CertFile) == "") != (strings.TrimSpace(tls.KeyFile) == "") {
+		return errors.New("server: TLS certificate and key must be provided together")
+	}
 	router := chi.NewRouter()
 	s.Mount(router)
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := newHTTPServer(addr, router)
+	// Tie every request to the daemon lifecycle. http.Server.Shutdown closes
+	// listeners and waits for handlers, but it does not cancel the contexts of
+	// requests that are already in flight. MCP deliberately permits bounded
+	// long polls (reactor_wait_for_run), so without this base context a shutdown
+	// can return after its ten-second grace period while a handler keeps using
+	// the journal and vault that the caller is about to close.
+	srv.BaseContext = func(net.Listener) context.Context { return ctx }
 	useTLS := tls.CertFile != "" && tls.KeyFile != ""
 	errCh := make(chan error, 1)
 	go func() {
@@ -1632,6 +2027,26 @@ func (s *Server) RunWithTLS(ctx context.Context, addr string, tls TLSConfig) err
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
+	}
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		// Bound the time spent receiving a request body as well as its headers.
+		// MCP already caps the body at 1 MiB, but without ReadTimeout a peer can
+		// drip that bounded body forever and pin a connection. WriteTimeout must
+		// cover the longest bounded MCP request (including
+		// reactor_wait_for_run) while still fencing a client that stops reading
+		// the response. The MCP handler caps one HTTP execution at 150 seconds;
+		// leave 30 seconds for serialization and a slow but progressing socket.
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 180 * time.Second,
+		// Bound idle keep-alive resources.
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 32 << 10,
 	}
 }
 

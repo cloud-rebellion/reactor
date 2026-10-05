@@ -41,6 +41,8 @@ var navItems = []navItem{
 	{"/notifications", "Notifications", "Workspace", true},
 	{"/oauth-providers", "OAuth providers", "Workspace", true},
 	{"/postmortems", "Post-mortems", "Monitor", true},
+	{"/dlq", "Dead letters", "Monitor", true},
+	{"/mail-sends", "Mail send reconciliation", "Monitor", true},
 	{"/audit", "Audit", "Monitor", true},
 	{"/tenants", "Tenants", "Billing & access", true},
 	{"/plans", "Plans", "Billing & access", true},
@@ -251,12 +253,14 @@ h3 { font-family:var(--display); font-size:15px; font-weight:400; letter-spacing
 .flow-status { font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--faint); white-space:nowrap; font-weight:600; }
 .flow-dur { font:11.5px var(--mono); color:var(--muted); margin-right:8px; }
 .flow-meta { color:var(--muted); font-size:12px; margin-top:4px; }
+.flow-note { color:var(--muted); font-size:12px; max-width:920px; }
 .flow-data { margin-top:9px; }
 .flow-data summary { cursor:pointer; font-size:12px; color:var(--accent); font-weight:500; }
 .flow-data pre { margin:7px 0 0; max-height:260px; font-size:12px; }
 .flow-err { color:var(--err); }
-.flow-conn { width:2px; height:24px; background:var(--border-strong); margin:5px auto; position:relative; }
-.flow-conn::after { content:""; position:absolute; bottom:-1px; left:-3px; width:0; height:0; border:4px solid transparent; border-top-color:var(--border-strong); }
+.flow-edges { display:flex; flex-wrap:wrap; justify-content:center; gap:5px 8px; margin:9px 0; }
+.flow-edge { display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border:1px solid var(--border-strong); border-radius:var(--radius-xs); color:var(--muted); background:var(--surface); font-size:11px; }
+.flow-edge code { font-size:inherit; color:var(--fg); }
 .flow-succeeded { border-left-color:var(--ok); }
 .flow-failed, .flow-failed_dlq { border-left-color:var(--err); }
 .flow-running { border-left-color:var(--warn); animation:flowpulse 1.6s ease-in-out infinite; }
@@ -283,6 +287,16 @@ h3 { font-family:var(--display); font-size:15px; font-weight:400; letter-spacing
 .wf-tab.is-active { background:var(--accent); color:var(--accent-fg); border-color:var(--accent); }
 .wf-toolbar-hint { color:var(--faint); font-size:12px; margin-left:auto; }
 .wf-canvas { width:100%; height:420px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); }
+.wf-blockflow-canvas { width:100%; height:420px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); }
+.wf-drawer-blockflow { border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px; background:var(--surface-2); }
+.wf-drawer-blockflow[hidden] { display:none; }
+.wf-block-list, .wf-block-edges { margin:8px 0 0; padding-left:22px; font-size:12px; line-height:1.65; }
+.wf-block-list li, .wf-block-edges li { overflow-wrap:anywhere; }
+.wf-block-step { margin-top:10px; }
+.wf-block-step > summary { cursor:pointer; font-size:12px; color:var(--accent); }
+.wf-block-flow-summary { margin:8px 0; }
+.wf-block-flow-summary .flow-note { margin:0 0 8px; }
+.wf-blockflow-list { margin-top:8px; max-height:180px; overflow:auto; }
 .wf-steptable { margin-top:12px; }
 .wf-steptable > summary { cursor:pointer; font-size:12px; color:var(--accent); font-weight:500; }
 .wf-codearea { width:100%; font:12.5px/1.55 var(--mono); background:var(--surface); color:var(--fg); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 14px; resize:vertical; tab-size:2; }

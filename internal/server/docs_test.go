@@ -2,9 +2,12 @@ package server
 
 import (
 	"io"
+	"io/fs"
 	"net/http"
 	"strings"
 	"testing"
+
+	docsfs "github.com/bright-interaction/reactor/docs"
 )
 
 func TestDocsIndexRendersEveryDoc(t *testing.T) {
@@ -44,6 +47,28 @@ func TestDocsPageRendersMarkdownAsHTML(t *testing.T) {
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("doc page missing %q\n--- snip ---\n%s", want, s[:min(len(s), 2000)])
+		}
+	}
+}
+
+func TestDocsAPIReferencesDedicatedCommandWebhookIngress(t *testing.T) {
+	t.Parallel()
+	raw, err := fs.ReadFile(docsfs.FS, "api.md")
+	if err != nil {
+		t.Fatalf("read embedded REST API docs: %v", err)
+	}
+	body, err := renderMarkdown(raw)
+	if err != nil {
+		t.Fatalf("render embedded REST API docs: %v", err)
+	}
+	s := body
+	for _, want := range []string{
+		"/command-webhook/{token_id}",
+		"dedicated command-automation HMAC binding",
+		"request bodies never enter the command",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("REST API docs missing %q", want)
 		}
 	}
 }

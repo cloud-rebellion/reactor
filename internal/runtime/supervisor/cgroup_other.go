@@ -11,8 +11,9 @@ import (
 // kernel infrastructure. macOS / Windows / FreeBSD daemons rely on the
 // outer container or VM for memory + pid bounds.
 type cgroupHandle struct {
-	Fd      int
-	Cleanup func()
+	Fd       int
+	Killable bool
+	Cleanup  func()
 }
 
 var noopCgroupHandle = cgroupHandle{Fd: -1, Cleanup: func() {}}

@@ -80,7 +80,7 @@ func TestUIAssetIsServedAndReferenced(t *testing.T) {
 // CSP had silenced on this page specifically.
 func TestDestructiveChannelActionsCarryConfirm(t *testing.T) {
 	t.Parallel()
-	html := notificationsBody([]journal.NotificationChannel{
+	html := notificationsBody([]journal.NotificationChannelMetadata{
 		{ID: "ch1", Name: "ops-slack", Kind: "slack_webhook"},
 	}, "", nil, "")
 	if !strings.Contains(html, `data-confirm="Delete channel `) {

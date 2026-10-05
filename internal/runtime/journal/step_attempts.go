@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/bright-interaction/reactor/internal/runtime/payloadcrypto"
 )
 
 // ErrStepAttemptDivergence means a restarted workflow reached the same durable
@@ -46,6 +49,7 @@ type StepAttemptState struct {
 	Status         string
 	Output         json.RawMessage
 	ErrorText      string
+	RetryNotBefore time.Time
 }
 
 // StepAttemptClaim is the result of host-owned attempt allocation. Exhausted
@@ -56,6 +60,7 @@ type StepAttemptClaim struct {
 	Attempt       int
 	BudgetAttempt int
 	Exhausted     bool
+	RetryWait     time.Duration
 	Previous      *StepAttemptState
 }
 
@@ -69,32 +74,30 @@ type StepAttemptClaim struct {
 // An interrupted StatusRunning row without a finite bound fails closed when
 // maxAttempts is zero because the host cannot prove another call is allowed.
 func (j *Journal) ClaimStepAttemptSeq(ctx context.Context, runID, stepName string, seq int64, maxAttempts int, idemKey, inputHash string) (StepAttemptClaim, error) {
+	return j.claimStepAttemptSeq(ctx, runID, "", stepName, seq, maxAttempts, idemKey, inputHash)
+}
+
+// ClaimOwnedStepAttemptSeq fences a distributed StepStart to the exact live
+// lease generation before it grants permission to execute the closure.
+func (j *Journal) ClaimOwnedStepAttemptSeq(ctx context.Context, runID, owner, stepName string, seq int64, maxAttempts int, idemKey, inputHash string) (StepAttemptClaim, error) {
+	if owner == "" {
+		return StepAttemptClaim{}, errors.New("journal: claim owned step: empty lease owner")
+	}
+	return j.claimStepAttemptSeq(ctx, runID, owner, stepName, seq, maxAttempts, idemKey, inputHash)
+}
+
+func (j *Journal) claimStepAttemptSeq(ctx context.Context, runID, owner, stepName string, seq int64, maxAttempts int, idemKey, inputHash string) (StepAttemptClaim, error) {
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return StepAttemptClaim{}, fmt.Errorf("journal: begin step attempt claim: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Serialize allocation on the parent run. PostgreSQL needs an explicit row
-	// lock; SQLite's no-op UPDATE obtains its single-writer lock before the
-	// latest-attempt read. Distributed workers require PostgreSQL, but keeping
-	// the SQLite path atomic makes local restart tests representative.
-	if j.engine == EnginePostgres {
-		var lockedID string
-		if err := tx.QueryRowContext(ctx, j.bind(`SELECT id FROM runs WHERE id = $1 FOR UPDATE`), runID).Scan(&lockedID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return StepAttemptClaim{}, ErrNotFound
-			}
-			return StepAttemptClaim{}, fmt.Errorf("journal: lock run for step attempt: %w", err)
-		}
-	} else {
-		res, err := tx.ExecContext(ctx, j.bind(`UPDATE runs SET id = id WHERE id = $1`), runID)
-		if err != nil {
-			return StepAttemptClaim{}, fmt.Errorf("journal: lock run for step attempt: %w", err)
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return StepAttemptClaim{}, ErrNotFound
-		}
+	// Lock lease before run, matching reaping/finalization. This also makes
+	// allocation atomic with a replacement worker taking over the same run.
+	leaseDeadline, err := j.lockStepMutation(ctx, tx, runID, owner)
+	if err != nil {
+		return StepAttemptClaim{}, err
 	}
 
 	previous, found, err := latestStepAttemptTx(ctx, tx, j, runID, stepName, seq)
@@ -119,7 +122,7 @@ func (j *Journal) ClaimStepAttemptSeq(ctx context.Context, runID, stepName strin
 			if maxAttempts <= 0 {
 				claim.Attempt = previous.Attempt
 				claim.Exhausted = true
-				return commitStepAttemptClaim(tx, claim)
+				return commitStepAttemptClaim(tx, runID, leaseDeadline, claim)
 			}
 		case StatusRetrying:
 			// step_end durably recorded that the policy authorized one more.
@@ -133,7 +136,7 @@ func (j *Journal) ClaimStepAttemptSeq(ctx context.Context, runID, stepName strin
 				claim.BudgetAttempt = previous.Attempt
 			}
 			claim.Exhausted = true
-			return commitStepAttemptClaim(tx, claim)
+			return commitStepAttemptClaim(tx, runID, leaseDeadline, claim)
 		default:
 			return StepAttemptClaim{}, fmt.Errorf("journal: unsupported step status %q for run=%s step=%s seq=%d", previous.Status, runID, stepName, seq)
 		}
@@ -149,7 +152,16 @@ func (j *Journal) ClaimStepAttemptSeq(ctx context.Context, runID, stepName strin
 
 	if maxAttempts > 0 && claim.BudgetAttempt > maxAttempts {
 		claim.Exhausted = true
-		return commitStepAttemptClaim(tx, claim)
+		return commitStepAttemptClaim(tx, runID, leaseDeadline, claim)
+	}
+	if found && previous.Status == StatusRetrying && !previous.RetryNotBefore.IsZero() {
+		if wait := time.Until(previous.RetryNotBefore); wait > 0 {
+			// Do not consume a retry budget slot while merely waiting. The
+			// deadline survives a host/worker crash and is rechecked by the
+			// next claimant under the same run lock.
+			claim.RetryWait = wait
+			return commitStepAttemptClaim(tx, runID, leaseDeadline, claim)
+		}
 	}
 	if found && previous.Status == StatusRunning {
 		const fence = `UPDATE steps SET status = $1, finished_at = $2
@@ -173,6 +185,9 @@ func (j *Journal) ClaimStepAttemptSeq(ctx context.Context, runID, stepName strin
 	); err != nil {
 		return StepAttemptClaim{}, fmt.Errorf("journal: insert durable step_start: %w", err)
 	}
+	if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+		return StepAttemptClaim{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return StepAttemptClaim{}, fmt.Errorf("journal: commit step attempt claim: %w", err)
 	}
@@ -189,26 +204,149 @@ func redriveBaseAttemptTx(ctx context.Context, tx *sql.Tx, j *Journal, runID, st
 	return base, nil
 }
 
-func commitStepAttemptClaim(tx *sql.Tx, claim StepAttemptClaim) (StepAttemptClaim, error) {
+func commitStepAttemptClaim(tx *sql.Tx, runID string, leaseDeadline time.Time, claim StepAttemptClaim) (StepAttemptClaim, error) {
+	if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+		return StepAttemptClaim{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return StepAttemptClaim{}, fmt.Errorf("journal: commit exhausted step attempt claim: %w", err)
 	}
 	return claim, nil
 }
 
+// lockStepMutation uses the lease -> run order shared by the reaper and run
+// finalizer. Local steps still serialize on the run; owned steps additionally
+// require the exact generation and a running parent before any step mutation.
+func (j *Journal) lockStepMutation(ctx context.Context, tx *sql.Tx, runID, owner string) (time.Time, error) {
+	var deadline time.Time
+	if owner != "" {
+		var err error
+		deadline, err = j.lockOwnedLease(ctx, tx, runID, owner)
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+	if err := lockRunForStepRepair(ctx, tx, j, runID); err != nil {
+		return time.Time{}, err
+	}
+	if owner != "" {
+		var status string
+		if err := tx.QueryRowContext(ctx, j.bind(`SELECT status FROM runs WHERE id = $1`), runID).Scan(&status); err != nil {
+			return time.Time{}, fmt.Errorf("journal: read owned step run status: %w", err)
+		}
+		if status != "running" {
+			return time.Time{}, fmt.Errorf("%w: step run=%s status=%s", ErrLeaseOwnershipLost, runID, status)
+		}
+	}
+	return deadline, nil
+}
+
+func checkStepMutationDeadline(runID string, deadline time.Time) error {
+	if !deadline.IsZero() {
+		return checkOwnedLeaseDeadline(runID, deadline)
+	}
+	return nil
+}
+
+// RecordOwnedStepStartSeq retains old wire-client compatibility while fencing
+// its non-durable StepStart to the exact distributed lease generation.
+func (j *Journal) RecordOwnedStepStartSeq(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, idemKey, inputHash string) (bool, error) {
+	if owner == "" {
+		return false, errors.New("journal: record owned step start: empty lease owner")
+	}
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("journal: begin owned step start: %w", err)
+	}
+	defer tx.Rollback()
+	deadline, err := j.lockStepMutation(ctx, tx, runID, owner)
+	if err != nil {
+		return false, err
+	}
+	const q = `INSERT INTO steps
+		(run_id, step_name, seq, attempt, idempotency_key, input_hash, status, started_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING`
+	res, err := tx.ExecContext(ctx, j.bind(q), runID, stepName, seq, attempt, nullable(idemKey), inputHash, StatusRunning, j.now())
+	if err != nil {
+		return false, fmt.Errorf("journal: insert owned step start: %w", err)
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("journal: inspect owned step start: %w", err)
+	}
+	if err := checkStepMutationDeadline(runID, deadline); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("journal: commit owned step start: %w", err)
+	}
+	return inserted == 1, nil
+}
+
+// RecordOwnedStepEndSeq is the old wire-client outcome path. A stale worker
+// cannot overwrite a replacement's attempt or cached result.
+func (j *Journal) RecordOwnedStepEndSeq(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, output json.RawMessage, errText string) error {
+	if owner == "" {
+		return errors.New("journal: record owned step end: empty lease owner")
+	}
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("journal: begin owned step end: %w", err)
+	}
+	defer tx.Rollback()
+	deadline, err := j.lockStepMutation(ctx, tx, runID, owner)
+	if err != nil {
+		return err
+	}
+	payload, err := j.prepareStepPayload(ctx, tx, runID, stepName, seq, attempt, output, errText)
+	if err != nil {
+		return err
+	}
+	status := StatusSucceeded
+	if errText != "" {
+		status = StatusFailed
+	}
+	const q = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4,
+		payload_crypto_version = $5, output_plaintext_bytes = $6, error_plaintext_bytes = $7
+		WHERE run_id = $8 AND step_name = $9 AND seq = $10 AND attempt = $11 AND status = $12`
+	res, err := tx.ExecContext(ctx, j.bind(q), status, payload.output, payload.errorText, j.now(),
+		payload.version, payload.outputBytes, payload.errorBytes, runID, stepName, seq, attempt, StatusRunning)
+	if err != nil {
+		return fmt.Errorf("journal: update owned step end: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: (%s, %s, seq=%d, attempt=%d)", ErrStepAttemptNotRunning, runID, stepName, seq, attempt)
+	}
+	if err := checkStepMutationDeadline(runID, deadline); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("journal: commit owned step end: %w", err)
+	}
+	return nil
+}
+
 func latestStepAttemptTx(ctx context.Context, tx *sql.Tx, j *Journal, runID, stepName string, seq int64) (StepAttemptState, bool, error) {
-	const q = `SELECT step_name, seq, attempt, idempotency_key, input_hash, status, output_jsonb, error_text
-		FROM steps WHERE run_id = $1 AND seq = $2 AND step_name = $3
-		ORDER BY attempt DESC LIMIT 1`
-	return scanStepAttempt(tx.QueryRowContext(ctx, j.bind(q), runID, seq, stepName), runID, stepName, seq)
+	q := fmt.Sprintf(`SELECT steps.step_name, steps.seq, steps.attempt, steps.idempotency_key, steps.input_hash,
+		steps.status, %s, %s, steps.retry_not_before,
+		runs.tenant_id, steps.payload_crypto_version, steps.output_plaintext_bytes, steps.error_plaintext_bytes,
+		steps.output_jsonb IS NOT NULL, steps.error_text IS NOT NULL
+		FROM steps JOIN runs ON runs.id = steps.run_id
+		WHERE steps.run_id = $1 AND steps.seq = $2 AND steps.step_name = $3
+		ORDER BY steps.attempt DESC LIMIT 1`, stepOutputReplayValue(j.engine), stepErrorReplayValue(j.engine))
+	return scanStepAttempt(j, tx.QueryRowContext(ctx, j.bind(q), runID, seq, stepName), runID, stepName, seq)
 }
 
 // LatestStepAttemptSeq returns the newest row for an exact logical step call.
 func (j *Journal) LatestStepAttemptSeq(ctx context.Context, runID, stepName string, seq int64) (StepAttemptState, error) {
-	const q = `SELECT step_name, seq, attempt, idempotency_key, input_hash, status, output_jsonb, error_text
-		FROM steps WHERE run_id = $1 AND seq = $2 AND step_name = $3
-		ORDER BY attempt DESC LIMIT 1`
-	state, found, err := scanStepAttempt(j.db.QueryRowContext(ctx, j.bind(q), runID, seq, stepName), runID, stepName, seq)
+	q := fmt.Sprintf(`SELECT steps.step_name, steps.seq, steps.attempt, steps.idempotency_key, steps.input_hash,
+		steps.status, %s, %s, steps.retry_not_before,
+		runs.tenant_id, steps.payload_crypto_version, steps.output_plaintext_bytes, steps.error_plaintext_bytes,
+		steps.output_jsonb IS NOT NULL, steps.error_text IS NOT NULL
+		FROM steps JOIN runs ON runs.id = steps.run_id
+		WHERE steps.run_id = $1 AND steps.seq = $2 AND steps.step_name = $3
+		ORDER BY steps.attempt DESC LIMIT 1`, stepOutputReplayValue(j.engine), stepErrorReplayValue(j.engine))
+	state, found, err := scanStepAttempt(j, j.db.QueryRowContext(ctx, j.bind(q), runID, seq, stepName), runID, stepName, seq)
 	if err != nil {
 		return StepAttemptState{}, err
 	}
@@ -222,23 +360,45 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanStepAttempt(row rowScanner, runID, stepName string, seq int64) (StepAttemptState, bool, error) {
+func scanStepAttempt(j *Journal, row rowScanner, runID, stepName string, seq int64) (StepAttemptState, bool, error) {
 	var (
-		state   StepAttemptState
-		idem    sql.NullString
-		output  []byte
-		errText sql.NullString
+		state          StepAttemptState
+		idem           sql.NullString
+		output         []byte
+		errText        sql.NullString
+		retryNotBefore sql.NullString
+		tenantID       string
+		version        int
+		outputBytes    sql.NullInt64
+		errorBytes     sql.NullInt64
+		outputPresent  bool
+		errorPresent   bool
 	)
-	if err := row.Scan(&state.StepName, &state.Seq, &state.Attempt, &idem, &state.InputHash, &state.Status, &output, &errText); err != nil {
+	if err := row.Scan(&state.StepName, &state.Seq, &state.Attempt, &idem, &state.InputHash, &state.Status,
+		&output, &errText, &retryNotBefore, &tenantID, &version, &outputBytes, &errorBytes,
+		&outputPresent, &errorPresent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return StepAttemptState{}, false, nil
 		}
 		return StepAttemptState{}, false, fmt.Errorf("journal: latest step attempt for run=%s step=%s seq=%d: %w", runID, stepName, seq, err)
 	}
 	state.IdempotencyKey = idem.String
-	state.ErrorText = errText.String
-	if len(output) > 0 {
-		state.Output = append(json.RawMessage(nil), output...)
+	if version == 1 && (outputPresent != outputBytes.Valid || errorPresent != errorBytes.Valid ||
+		outputPresent && output == nil || errorPresent && !errText.Valid) {
+		return StepAttemptState{}, false, payloadcrypto.ErrInvalidEnvelope
+	}
+	openedOutput, openedError, err := j.openStepValues(tenantID, runID, state.StepName, state.Seq, state.Attempt,
+		version, outputBytes, errorBytes, output, errText)
+	if err != nil {
+		return StepAttemptState{}, false, fmt.Errorf("journal: open step attempt: %w", err)
+	}
+	state.Output, state.ErrorText = openedOutput, openedError
+	if retryNotBefore.Valid {
+		parsed, err := j.parseTime(retryNotBefore.String)
+		if err != nil {
+			return StepAttemptState{}, false, fmt.Errorf("journal: invalid retry deadline for run=%s step=%s seq=%d: %w", runID, stepName, seq, err)
+		}
+		state.RetryNotBefore = parsed
 	}
 	return state, true, nil
 }
@@ -264,10 +424,16 @@ func (j *Journal) RecordStepEndWithRetrySeq(ctx context.Context, runID, stepName
 			status = StatusRetrying
 		}
 	}
-	const q = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4
-		WHERE run_id = $5 AND step_name = $6 AND seq = $7 AND attempt = $8 AND status = $9`
+	payload, err := j.prepareStepPayload(ctx, j.db, runID, stepName, seq, attempt, output, errText)
+	if err != nil {
+		return err
+	}
+	const q = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4,
+		payload_crypto_version = $5, output_plaintext_bytes = $6, error_plaintext_bytes = $7
+		WHERE run_id = $8 AND step_name = $9 AND seq = $10 AND attempt = $11 AND status = $12`
 	res, err := j.db.ExecContext(ctx, j.bind(q),
-		status, outputArg(output, j.engine), nullable(errText), j.now(), runID, stepName, seq, attempt, StatusRunning,
+		status, payload.output, payload.errorText, j.now(), payload.version, payload.outputBytes, payload.errorBytes,
+		runID, stepName, seq, attempt, StatusRunning,
 	)
 	if err != nil {
 		return fmt.Errorf("journal: update durable step_end: %w", err)
@@ -284,11 +450,41 @@ func (j *Journal) RecordStepEndWithRetrySeq(ctx context.Context, runID, stepName
 // retry/finalize it; Reactor never acknowledges a terminal failed row that has
 // silently fallen out of the operator queue.
 func (j *Journal) FinalizeStepAttemptSeq(ctx context.Context, runID, stepName string, seq int64, attempt int, output json.RawMessage, errText string, retryable bool) (deadLettered bool, err error) {
+	return j.FinalizeStepAttemptSeqWithRetryAfter(ctx, runID, stepName, seq, attempt, output, errText, retryable, 0)
+}
+
+// FinalizeStepAttemptSeqWithRetryAfter also persists the provider's minimum
+// wait for a retryable attempt. The next claim checks it before allocating a
+// new attempt, including after a worker crash or lease reap.
+func (j *Journal) FinalizeStepAttemptSeqWithRetryAfter(ctx context.Context, runID, stepName string, seq int64, attempt int, output json.RawMessage, errText string, retryable bool, retryAfter time.Duration) (deadLettered bool, err error) {
+	return j.finalizeStepAttemptSeqWithRetryAfter(ctx, runID, "", stepName, seq, attempt, output, errText, retryable, retryAfter)
+}
+
+// FinalizeOwnedStepAttemptSeqWithRetryAfter rejects outcomes from a worker
+// whose claim expired or was replaced, including an otherwise valid StepEnd.
+func (j *Journal) FinalizeOwnedStepAttemptSeqWithRetryAfter(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, output json.RawMessage, errText string, retryable bool, retryAfter time.Duration) (bool, error) {
+	if owner == "" {
+		return false, errors.New("journal: finalize owned step: empty lease owner")
+	}
+	return j.finalizeStepAttemptSeqWithRetryAfter(ctx, runID, owner, stepName, seq, attempt, output, errText, retryable, retryAfter)
+}
+
+func (j *Journal) finalizeStepAttemptSeqWithRetryAfter(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, output json.RawMessage, errText string, retryable bool, retryAfter time.Duration) (deadLettered bool, err error) {
+	if retryAfter < 0 || retryAfter > 30*time.Second || (retryAfter > 0 && (!retryable || errText == "")) {
+		return false, errors.New("journal: invalid provider retry delay")
+	}
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("journal: begin durable step finalize: %w", err)
 	}
 	defer tx.Rollback()
+	var leaseDeadline time.Time
+	if owner != "" {
+		leaseDeadline, err = j.lockStepMutation(ctx, tx, runID, owner)
+		if err != nil {
+			return false, err
+		}
+	}
 
 	status := StatusSucceeded
 	if errText != "" {
@@ -297,10 +493,23 @@ func (j *Journal) FinalizeStepAttemptSeq(ctx context.Context, runID, stepName st
 			status = StatusRetrying
 		}
 	}
-	const update = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4
-		WHERE run_id = $5 AND step_name = $6 AND seq = $7 AND attempt = $8 AND status = $9`
+	payload, err := j.prepareStepPayload(ctx, tx, runID, stepName, seq, attempt, output, errText)
+	if err != nil {
+		return false, err
+	}
+	var retryNotBefore any
+	if retryAfter > 0 {
+		// SQLite stores millisecond timestamps. Round up so formatting never
+		// shaves time off the provider's minimum wait.
+		deadline := time.Now().UTC().Add(retryAfter).Add(time.Millisecond - 1).Truncate(time.Millisecond)
+		retryNotBefore = j.formatTime(deadline)
+	}
+	const update = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4, retry_not_before = $5,
+		payload_crypto_version = $6, output_plaintext_bytes = $7, error_plaintext_bytes = $8
+		WHERE run_id = $9 AND step_name = $10 AND seq = $11 AND attempt = $12 AND status = $13`
 	res, err := tx.ExecContext(ctx, j.bind(update),
-		status, outputArg(output, j.engine), nullable(errText), j.now(), runID, stepName, seq, attempt, StatusRunning,
+		status, payload.output, payload.errorText, j.now(), retryNotBefore,
+		payload.version, payload.outputBytes, payload.errorBytes, runID, stepName, seq, attempt, StatusRunning,
 	)
 	if err != nil {
 		return false, fmt.Errorf("journal: update durable step outcome: %w", err)
@@ -314,20 +523,25 @@ func (j *Journal) FinalizeStepAttemptSeq(ctx context.Context, runID, stepName st
 		if idErr != nil {
 			return false, idErr
 		}
-		payload := output
-		if len(payload) == 0 || string(payload) == "null" {
-			payload = json.RawMessage("{}")
+		order, orderErr := j.nextDeadLetterFailureOrder(ctx, tx, runID)
+		if orderErr != nil {
+			return false, orderErr
 		}
-		const insertDLQ = `INSERT INTO dead_letter
-			(id, run_id, step_name, step_seq, step_attempt, failure_order, error_text, payload)
-			SELECT $1, $2, $3, $4, $5, COALESCE(MAX(failure_order), 0) + 1, $6, $7
-			FROM dead_letter WHERE run_id = $8`
-		if _, err := tx.ExecContext(ctx, j.bind(insertDLQ), id, runID, stepName, seq, attempt, errText, outputArg(payload, j.engine), runID); err != nil {
+		sealed, sealErr := j.prepareDeadLetterPayload(ctx, tx, id, runID, stepName, &seq, &attempt, order, errText, output)
+		if sealErr != nil {
+			return false, sealErr
+		}
+		if _, err := tx.ExecContext(ctx, j.bind(insertDeadLetterSQL),
+			id, runID, stepName, seq, attempt, order, sealed.errorText, sealed.payload,
+			sealed.version, sealed.errorBytes, sealed.payloadBytes); err != nil {
 			return false, fmt.Errorf("journal: insert terminal step dead_letter: %w", err)
 		}
 		deadLettered = true
 	}
 
+	if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("journal: commit durable step finalize: %w", err)
 	}
@@ -340,17 +554,40 @@ func (j *Journal) FinalizeStepAttemptSeq(ctx context.Context, runID, stepName st
 // StepStart) and retrying (mismatched/hostile continuation hint) are valid
 // predecessors; the failed checkpoint and exact DLQ row commit together.
 func (j *Journal) FinalizeExhaustedStepAttemptSeq(ctx context.Context, runID, stepName string, seq int64, attempt int, output json.RawMessage, errText string) error {
+	return j.finalizeExhaustedStepAttemptSeq(ctx, runID, "", stepName, seq, attempt, output, errText)
+}
+
+func (j *Journal) FinalizeOwnedExhaustedStepAttemptSeq(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, output json.RawMessage, errText string) error {
+	if owner == "" {
+		return errors.New("journal: finalize owned exhausted step: empty lease owner")
+	}
+	return j.finalizeExhaustedStepAttemptSeq(ctx, runID, owner, stepName, seq, attempt, output, errText)
+}
+
+func (j *Journal) finalizeExhaustedStepAttemptSeq(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, output json.RawMessage, errText string) error {
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("journal: begin exhausted step finalize: %w", err)
 	}
 	defer tx.Rollback()
+	var leaseDeadline time.Time
+	if owner != "" {
+		leaseDeadline, err = j.lockStepMutation(ctx, tx, runID, owner)
+		if err != nil {
+			return err
+		}
+	}
+	payload, err := j.prepareStepPayload(ctx, tx, runID, stepName, seq, attempt, output, errText)
+	if err != nil {
+		return err
+	}
 
-	const update = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4
-		WHERE run_id = $5 AND step_name = $6 AND seq = $7 AND attempt = $8
-			AND status IN ($9, $10)`
+	const update = `UPDATE steps SET status = $1, output_jsonb = $2, error_text = $3, finished_at = $4,
+		payload_crypto_version = $5, output_plaintext_bytes = $6, error_plaintext_bytes = $7
+		WHERE run_id = $8 AND step_name = $9 AND seq = $10 AND attempt = $11
+			AND status IN ($12, $13)`
 	res, err := tx.ExecContext(ctx, j.bind(update),
-		StatusFailed, outputArg(output, j.engine), nullable(errText), j.now(),
+		StatusFailed, payload.output, payload.errorText, j.now(), payload.version, payload.outputBytes, payload.errorBytes,
 		runID, stepName, seq, attempt, StatusRunning, StatusRetrying,
 	)
 	if err != nil {
@@ -364,17 +601,22 @@ func (j *Journal) FinalizeExhaustedStepAttemptSeq(ctx context.Context, runID, st
 	if err != nil {
 		return err
 	}
-	if len(output) == 0 || string(output) == "null" {
-		output = json.RawMessage("{}")
+	order, err := j.nextDeadLetterFailureOrder(ctx, tx, runID)
+	if err != nil {
+		return err
 	}
-	const insert = `INSERT INTO dead_letter
-		(id, run_id, step_name, step_seq, step_attempt, failure_order, error_text, payload)
-		SELECT $1, $2, $3, $4, $5, COALESCE(MAX(failure_order), 0) + 1, $6, $7
-		FROM dead_letter WHERE run_id = $8`
-	if _, err := tx.ExecContext(ctx, j.bind(insert),
-		id, runID, stepName, seq, attempt, errText, outputArg(output, j.engine), runID,
+	sealed, err := j.prepareDeadLetterPayload(ctx, tx, id, runID, stepName, &seq, &attempt, order, errText, output)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, j.bind(insertDeadLetterSQL),
+		id, runID, stepName, seq, attempt, order, sealed.errorText, sealed.payload,
+		sealed.version, sealed.errorBytes, sealed.payloadBytes,
 	); err != nil {
 		return fmt.Errorf("journal: insert exhausted step dead_letter: %w", err)
+	}
+	if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("journal: commit exhausted step finalize: %w", err)
@@ -419,13 +661,25 @@ func (j *Journal) HasDeadLetterForStepAttempt(ctx context.Context, runID, stepNa
 // visible to the lease reaper and the next worker retries repair without ever
 // invoking the closure again.
 func (j *Journal) EnsureStepAttemptDeadLetter(ctx context.Context, runID, stepName string, seq int64, attempt int, errorText string, payload json.RawMessage) (bool, error) {
+	return j.ensureStepAttemptDeadLetter(ctx, runID, "", stepName, seq, attempt, errorText, payload)
+}
+
+func (j *Journal) EnsureOwnedStepAttemptDeadLetter(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, errorText string, payload json.RawMessage) (bool, error) {
+	if owner == "" {
+		return false, errors.New("journal: repair owned step dead letter: empty lease owner")
+	}
+	return j.ensureStepAttemptDeadLetter(ctx, runID, owner, stepName, seq, attempt, errorText, payload)
+}
+
+func (j *Journal) ensureStepAttemptDeadLetter(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, errorText string, payload json.RawMessage) (bool, error) {
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("journal: begin exact dead-letter repair: %w", err)
 	}
 	defer tx.Rollback()
 
-	if err := lockRunForStepRepair(ctx, tx, j, runID); err != nil {
+	leaseDeadline, err := j.lockStepMutation(ctx, tx, runID, owner)
+	if err != nil {
 		return false, err
 	}
 
@@ -458,6 +712,9 @@ func (j *Journal) EnsureStepAttemptDeadLetter(ctx context.Context, runID, stepNa
 				return false, fmt.Errorf("journal: exact dead-letter repair marker changed concurrently")
 			}
 		}
+		if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+			return false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("journal: commit exact dead-letter observation: %w", err)
 		}
@@ -478,20 +735,24 @@ func (j *Journal) EnsureStepAttemptDeadLetter(ctx context.Context, runID, stepNa
 			return false, fmt.Errorf("journal: exact dead-letter repair state changed concurrently")
 		}
 	}
+	if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+		return false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("journal: commit exact dead-letter repair marker: %w", err)
 	}
 
-	return j.completeStepAttemptDeadLetterRepair(ctx, runID, stepName, seq, attempt, errorText, payload)
+	return j.completeStepAttemptDeadLetterRepair(ctx, runID, owner, stepName, seq, attempt, errorText, payload)
 }
 
-func (j *Journal) completeStepAttemptDeadLetterRepair(ctx context.Context, runID, stepName string, seq int64, attempt int, errorText string, payload json.RawMessage) (bool, error) {
+func (j *Journal) completeStepAttemptDeadLetterRepair(ctx context.Context, runID, owner, stepName string, seq int64, attempt int, errorText string, payload json.RawMessage) (bool, error) {
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("journal: begin pending dead-letter repair: %w", err)
 	}
 	defer tx.Rollback()
-	if err := lockRunForStepRepair(ctx, tx, j, runID); err != nil {
+	leaseDeadline, err := j.lockStepMutation(ctx, tx, runID, owner)
+	if err != nil {
 		return false, err
 	}
 
@@ -521,15 +782,17 @@ func (j *Journal) completeStepAttemptDeadLetterRepair(ctx context.Context, runID
 		if err != nil {
 			return false, err
 		}
-		if len(payload) == 0 || string(payload) == "null" {
-			payload = json.RawMessage("{}")
+		order, orderErr := j.nextDeadLetterFailureOrder(ctx, tx, runID)
+		if orderErr != nil {
+			return false, orderErr
 		}
-		const insert = `INSERT INTO dead_letter
-			(id, run_id, step_name, step_seq, step_attempt, failure_order, error_text, payload)
-			SELECT $1, $2, $3, $4, $5, COALESCE(MAX(failure_order), 0) + 1, $6, $7
-			FROM dead_letter WHERE run_id = $8`
-		if _, err := tx.ExecContext(ctx, j.bind(insert),
-			id, runID, stepName, seq, attempt, errorText, outputArg(payload, j.engine), runID,
+		sealed, sealErr := j.prepareDeadLetterPayload(ctx, tx, id, runID, stepName, &seq, &attempt, order, errorText, payload)
+		if sealErr != nil {
+			return false, sealErr
+		}
+		if _, err := tx.ExecContext(ctx, j.bind(insertDeadLetterSQL),
+			id, runID, stepName, seq, attempt, order, sealed.errorText, sealed.payload,
+			sealed.version, sealed.errorBytes, sealed.payloadBytes,
 		); err != nil {
 			return false, fmt.Errorf("journal: insert pending exact dead-letter repair: %w", err)
 		}
@@ -544,6 +807,9 @@ func (j *Journal) completeStepAttemptDeadLetterRepair(ctx context.Context, runID
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, fmt.Errorf("journal: pending exact dead-letter repair changed concurrently")
+	}
+	if err := checkStepMutationDeadline(runID, leaseDeadline); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("journal: commit pending exact dead-letter repair: %w", err)

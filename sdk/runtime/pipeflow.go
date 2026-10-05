@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/reactor/sdk"
+	"github.com/bright-interaction/reactor/sdk/blocks"
 	"github.com/bright-interaction/reactor/sdk/vault"
 	"github.com/bright-interaction/reactor/sdk/wire"
 )
@@ -44,8 +45,11 @@ type PipeFlow struct {
 	mu      sync.Mutex
 	pending map[int64]chan wire.Frame // request ID -> reply channel
 
-	runID     atomic.Pointer[string] // set on Hello receipt; read by SignalToken
-	signalKey atomic.Pointer[string] // per-run signing key from Hello; "" = legacy
+	runID           atomic.Pointer[string] // set on Hello receipt; read by SignalToken
+	signalKey       atomic.Pointer[string] // per-run signing key from Hello; "" = legacy
+	observedBlocks  atomic.Bool
+	connectorBroker atomic.Bool
+	mailBroker      atomic.Bool
 
 	helloOnce sync.Once
 	helloCh   chan struct{} // closed once readLoop has processed host's Hello
@@ -136,43 +140,57 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 	maxAttempts := durableRetryMax(opts.RetryPolicy)
 
 	for localAttempt := 1; ; localAttempt++ {
-		startID := p.id()
-		startBody := wire.StepStart{
-			StepName:        name,
-			IdempotencyKey:  opts.IdempotencyKey,
-			InputHash:       hashOpts(opts),
-			Attempt:         localAttempt,
-			Seq:             seq,
-			DurableAttempts: true,
-			MaxAttempts:     maxAttempts,
-		}
-		startFrame, err := wire.Wrap(startID, 0, wire.KindStepStart, startBody)
-		if err != nil {
-			return nil, err
-		}
-
-		replyCh := p.expect(startID)
-		if err := p.write(startFrame); err != nil {
-			p.unexpect(startID)
-			return nil, err
-		}
-
-		var (
-			reply wire.Frame
-			ok    bool
-		)
-		select {
-		case <-ctx.Done():
-			p.unexpect(startID)
-			return nil, ctx.Err()
-		case reply, ok = <-replyCh:
-			if !ok {
-				return nil, ErrPipeClosed
-			}
-		}
 		var sr wire.StepReply
-		if err := wire.Unwrap(reply, &sr); err != nil {
-			return nil, fmt.Errorf("step reply: %w", err)
+		for {
+			startID := p.id()
+			startBody := wire.StepStart{
+				StepName:        name,
+				IdempotencyKey:  opts.IdempotencyKey,
+				InputHash:       hashOpts(opts),
+				Attempt:         localAttempt,
+				Seq:             seq,
+				DurableAttempts: true,
+				MaxAttempts:     maxAttempts,
+			}
+			startFrame, err := wire.Wrap(startID, 0, wire.KindStepStart, startBody)
+			if err != nil {
+				return nil, err
+			}
+			replyCh := p.expect(startID)
+			if err := p.write(startFrame); err != nil {
+				p.unexpect(startID)
+				return nil, err
+			}
+			var (
+				reply wire.Frame
+				ok    bool
+			)
+			select {
+			case <-ctx.Done():
+				p.unexpect(startID)
+				return nil, ctx.Err()
+			case reply, ok = <-replyCh:
+				if !ok {
+					return nil, ErrPipeClosed
+				}
+			}
+			sr = wire.StepReply{}
+			if err := wire.Unwrap(reply, &sr); err != nil {
+				return nil, fmt.Errorf("step reply: %w", err)
+			}
+			if sr.RetryWaitMs == 0 {
+				break
+			}
+			if sr.RetryWaitMs < 0 || sr.RetryWaitMs > 31000 {
+				return nil, errors.New("reactor: invalid provider retry wait from host")
+			}
+			timer := time.NewTimer(time.Duration(sr.RetryWaitMs) * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
 		if sr.Replay {
 			return decodeOutput(sr.Output)
@@ -202,11 +220,11 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 			return nil, ErrRetryBudgetExhausted
 		}
 
-		// A freshly spawned process has not performed the delay that normally
-		// follows the prior attempt's step_end. Recompute that delay before the
-		// resumed closure. Stateful observations (for example a provider's
-		// Retry-After value) live only in the crashed process, so a custom
-		// policy should fall back to its deterministic/base schedule here.
+		// A freshly spawned process has not performed the policy delay that
+		// normally follows the prior attempt's step_end. Recompute it before
+		// the resumed closure. Provider Retry-After is independently persisted
+		// by the host: the RetryWaitMs reply above blocks the attempt claim
+		// until that provider deadline, even after a worker crash.
 		if localAttempt == 1 && budgetAttempt > 1 && opts.RetryPolicy != nil {
 			delay, allowed := opts.RetryPolicy.NextDelay(budgetAttempt - 1)
 			if !allowed {
@@ -223,7 +241,13 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 		}
 
 		// Not replay: actually run the user closure.
-		out, fnErr := safeCall(ctx, fn, opts.Timeout)
+		observer := &stepBlockObserver{flow: p, stepName: name, seq: seq, attempt: attempt}
+		observedCtx := blocks.WithAggregateObserver(blocks.WithIterateObserver(
+			blocks.WithSplitObserver(blocks.WithJoinObserver(ctx, observer), observer), observer), observer)
+		observedCtx = context.WithValue(observedCtx, mailStepContextKey{}, mailStepIdentity{
+			name: name, seq: seq, attempt: attempt, idempotencyKey: opts.IdempotencyKey,
+		})
+		out, fnErr := safeCall(observedCtx, fn, opts.Timeout)
 
 		// Decide BEFORE reporting the outcome, because StepEnd.Retryable is how
 		// the host learns whether another attempt is coming. The host treats
@@ -243,6 +267,14 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 		if fnErr != nil {
 			endBody.ErrorText = fnErr.Error()
 			endBody.Retryable = willRetry
+			if willRetry {
+				var hint reactor.RetryAfterHint
+				if errors.As(fnErr, &hint) {
+					if after, allowed := hint.RetryAfterDelay(); allowed && after > 0 && after <= reactor.MaxAutomaticRetryAfter {
+						endBody.RetryAfterMs = int64((after + time.Millisecond - 1) / time.Millisecond)
+					}
+				}
+			}
 		}
 		endID := p.id()
 		endFrame, err := wire.Wrap(endID, 0, wire.KindStepEnd, endBody)
@@ -282,6 +314,84 @@ func (p *PipeFlow) Step(ctx context.Context, name string, opts reactor.StepOpts,
 	}
 }
 
+// One recorder exists per Step attempt. All observed block calls share one
+// ordinal sequence; a retry receives a new attempt.
+type stepBlockObserver struct {
+	flow     *PipeFlow
+	stepName string
+	seq      int64
+	attempt  int
+	next     atomic.Int64
+}
+
+func (o *stepBlockObserver) ObserveJoin(ctx context.Context, value blocks.JoinObservation) error {
+	return o.report(ctx, wire.BlockReceipt{
+		BlockID: value.BlockID, Kind: "merge", Mode: value.Mode,
+		LeftRows: value.LeftRows, RightRows: value.RightRows,
+		OutputRows: value.OutputRows, MaxRows: value.MaxRows, Outcome: value.Outcome,
+	})
+}
+
+func (o *stepBlockObserver) ObserveSplit(ctx context.Context, value blocks.SplitObservation) error {
+	input, yes, no := value.InputRows, value.YesRows, value.NoRows
+	return o.report(ctx, wire.BlockReceipt{
+		BlockID: value.BlockID, Kind: "split", InputRows: &input,
+		YesRows: &yes, NoRows: &no, Outcome: "succeeded",
+	})
+}
+
+func (o *stepBlockObserver) ObserveIterate(ctx context.Context, value blocks.CollectionObservation) error {
+	input := value.InputRows
+	return o.report(ctx, wire.BlockReceipt{
+		BlockID: value.BlockID, Kind: "iterate", InputRows: &input,
+		OutputRows: value.OutputRows, Outcome: "succeeded",
+	})
+}
+
+func (o *stepBlockObserver) ObserveAggregate(ctx context.Context, value blocks.CollectionObservation) error {
+	input := value.InputRows
+	return o.report(ctx, wire.BlockReceipt{
+		BlockID: value.BlockID, Kind: "aggregate", InputRows: &input,
+		OutputRows: value.OutputRows, Outcome: "succeeded",
+	})
+}
+
+func (o *stepBlockObserver) report(ctx context.Context, body wire.BlockReceipt) error {
+	if !o.flow.observedBlocks.Load() {
+		return errors.New("reactor: host does not support observed blocks")
+	}
+	ordinal := o.next.Add(1)
+	if ordinal < 1 || ordinal > 128 {
+		return errors.New("reactor: observed block calls exceed 128 per Step attempt")
+	}
+	id := o.flow.id()
+	body.StepName, body.Seq, body.Attempt, body.CallOrdinal = o.stepName, o.seq, o.attempt, int(ordinal)
+	frame, err := wire.Wrap(id, 0, wire.KindBlockReceipt, body)
+	if err != nil {
+		return err
+	}
+	replyCh := o.flow.expect(id)
+	if err := o.flow.write(frame); err != nil {
+		o.flow.unexpect(id)
+		return err
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		o.flow.unexpect(id)
+		return ctx.Err()
+	case <-timer.C:
+		o.flow.unexpect(id)
+		return errors.New("reactor: observed block receipt timed out")
+	case response, ok := <-replyCh:
+		if !ok || response.Kind != wire.KindAck {
+			return errors.New("reactor: observed block receipt was not accepted")
+		}
+		return nil
+	}
+}
+
 // retryDecision returns the backoff before the next attempt and whether one
 // should happen. No policy means no retry, which keeps the default single-attempt
 // behaviour for steps that never asked for retries.
@@ -296,7 +406,11 @@ func retryDecision(policy reactor.RetryPolicy, err error, attempt int) (time.Dur
 	if reactor.IsPermanent(err) {
 		return 0, false
 	}
-	return policy.NextDelay(attempt)
+	delay, retry := policy.NextDelay(attempt)
+	if !retry {
+		return 0, false
+	}
+	return reactor.RespectRetryAfter(err, delay)
 }
 
 // ErrPipeClosed is returned by Step / Sleep / AwaitSignal / FetchSecret
@@ -485,6 +599,9 @@ func (p *PipeFlow) readLoop() {
 				p.runID.Store(&rid)
 				sk := hello.SignalKey
 				p.signalKey.Store(&sk)
+				p.observedBlocks.Store(hello.ObservedBlocks)
+				p.connectorBroker.Store(hello.ConnectorBroker)
+				p.mailBroker.Store(hello.MailBroker)
 			}
 			p.helloOnce.Do(func() { close(p.helloCh) })
 		}
@@ -559,7 +676,16 @@ func (p *PipeFlow) write(f wire.Frame) error {
 // only here so the journal can spot DAG drift between runs.
 func hashOpts(opts reactor.StepOpts) string {
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%s|%d|%d", opts.IdempotencyKey, int64(opts.Timeout), retryHash(opts.RetryPolicy))
+	// InputHash is caller-supplied and should already be an opaque, bounded
+	// fingerprint. Hash it together with the options so the wire never carries
+	// raw business input while still rejecting a changed closure input on
+	// resume. Keep the old serialization when it is empty so a new SDK remains
+	// replay-compatible with rows written by older workflow binaries.
+	if opts.InputHash == "" {
+		_, _ = fmt.Fprintf(h, "%s|%d|%d", opts.IdempotencyKey, int64(opts.Timeout), retryHash(opts.RetryPolicy))
+	} else {
+		_, _ = fmt.Fprintf(h, "%s|%s|%d|%d", opts.IdempotencyKey, opts.InputHash, int64(opts.Timeout), retryHash(opts.RetryPolicy))
+	}
 	sum := h.Sum(nil)
 	return hex.EncodeToString(sum[:8])
 }
@@ -634,7 +760,10 @@ type remoteSecret struct {
 	fingerprint string
 }
 
-func (r *remoteSecret) Reveal() []byte      { return r.value }
+// Reveal returns a defensive copy. The remote secret is cached in the
+// workflow subprocess for the lifetime of the run; returning its backing
+// slice would let one handler mutate the credential seen by later steps.
+func (r *remoteSecret) Reveal() []byte      { return append([]byte(nil), r.value...) }
 func (r *remoteSecret) Fingerprint() string { return r.fingerprint }
 func (r *remoteSecret) String() string      { return "[REDACTED]" }
 
@@ -652,10 +781,10 @@ func (r *remoteSecret) LogValue() slog.Value         { return slog.StringValue("
 // pipeHandler is a slog.Handler that ships every record over the wire
 // instead of writing locally.
 type pipeHandler struct {
-	pf    *PipeFlow
-	level slog.Level
-	attrs []slog.Attr
-	group string
+	pf     *PipeFlow
+	level  slog.Level
+	attrs  []slog.Attr
+	groups []string
 }
 
 func (h *pipeHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
@@ -663,12 +792,18 @@ func (h *pipeHandler) Enabled(_ context.Context, l slog.Level) bool { return l >
 func (h *pipeHandler) Handle(_ context.Context, r slog.Record) error {
 	attrs := map[string]any{}
 	for _, a := range h.attrs {
-		attrs[a.Key] = a.Value.Any()
+		addLogAttr(attrs, a)
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		attrs[a.Key] = a.Value.Any()
+		addLogAttr(attrs, a)
 		return true
 	})
+	for i := len(h.groups) - 1; i >= 0; i-- {
+		if h.groups[i] == "" {
+			continue
+		}
+		attrs = map[string]any{h.groups[i]: attrs}
+	}
 	body := wire.Log{Level: r.Level.String(), Msg: r.Message, Attrs: attrs}
 	f, err := wire.Wrap(h.pf.id(), 0, wire.KindLog, body)
 	if err != nil {
@@ -677,13 +812,37 @@ func (h *pipeHandler) Handle(_ context.Context, r slog.Record) error {
 	return h.pf.write(f)
 }
 
+func addLogAttr(dst map[string]any, attr slog.Attr) {
+	value := attr.Value.Resolve()
+	if attr.Key == "" && value.Kind() != slog.KindGroup {
+		return
+	}
+	if value.Kind() != slog.KindGroup {
+		dst[attr.Key] = value.Any()
+		return
+	}
+	group := map[string]any{}
+	for _, child := range value.Group() {
+		addLogAttr(group, child)
+	}
+	if attr.Key == "" {
+		for key, child := range group {
+			dst[key] = child
+		}
+		return
+	}
+	dst[attr.Key] = group
+}
+
 func (h *pipeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	merged := make([]slog.Attr, 0, len(h.attrs)+len(attrs))
 	merged = append(merged, h.attrs...)
 	merged = append(merged, attrs...)
-	return &pipeHandler{pf: h.pf, level: h.level, attrs: merged, group: h.group}
+	return &pipeHandler{pf: h.pf, level: h.level, attrs: merged, groups: h.groups}
 }
 
 func (h *pipeHandler) WithGroup(g string) slog.Handler {
-	return &pipeHandler{pf: h.pf, level: h.level, attrs: h.attrs, group: g}
+	groups := append([]string(nil), h.groups...)
+	groups = append(groups, g)
+	return &pipeHandler{pf: h.pf, level: h.level, attrs: h.attrs, groups: groups}
 }

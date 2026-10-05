@@ -5,6 +5,7 @@
 package safehttp
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,10 +25,28 @@ import (
 //
 // allowPrivate lets a self-hosted daemon reach loopback/RFC1918 internal
 // services (credential rotation legitimately targets internal reload
-// endpoints); link-local (incl. the 169.254.169.254 cloud-metadata endpoint),
-// unspecified, and multicast are ALWAYS blocked regardless.
+// endpoints). Link-local (incl. the 169.254.169.254 cloud-metadata endpoint),
+// unspecified, multicast, reserved/test ranges, NAT64, and the Tailscale
+// 100.64.0.0/10 tailnet are ALWAYS blocked regardless.
 func Client(allowPrivate bool) *http.Client {
-	d := &net.Dialer{
+	d := dialer(allowPrivate)
+	return &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{DialContext: d.DialContext},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("ssrf: redirects are not followed")
+		},
+	}
+}
+
+// DialContext applies the same connect-time IP policy as Client to protocols
+// that do not use net/http, such as SMTP notification delivery.
+func DialContext(ctx context.Context, network, address string, allowPrivate bool) (net.Conn, error) {
+	return dialer(allowPrivate).DialContext(ctx, network, address)
+}
+
+func dialer(allowPrivate bool) *net.Dialer {
+	return &net.Dialer{
 		Timeout: 10 * time.Second,
 		Control: func(_, address string, _ syscall.RawConn) error {
 			host, _, err := net.SplitHostPort(address)
@@ -42,13 +61,6 @@ func Client(allowPrivate bool) *http.Client {
 				return fmt.Errorf("ssrf: refusing to connect to non-public address %s", ip)
 			}
 			return nil
-		},
-	}
-	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: &http.Transport{DialContext: d.DialContext},
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return fmt.Errorf("ssrf: redirects are not followed")
 		},
 	}
 }
@@ -66,20 +78,23 @@ func BlockedIP(ip net.IP, allowPrivate bool) bool {
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 		return true
 	}
-	if allowPrivate {
-		return false
-	}
-	// net.IP.IsPrivate covers only RFC1918 + IPv6 ULA. These reserved ranges
-	// are just as much "not the public internet", and the CGNAT block is the
-	// one that actually bit this estate: 100.64.0.0/10 is the Tailscale
-	// tailnet, so without it a tenant-supplied webhook URL resolving into the
-	// tailnet reached internal services with allowPrivate=false, which is the
-	// guard's ENFORCING configuration.
+	// These ranges are never valid external service targets, even when a
+	// caller explicitly opts into RFC1918 access for a self-hosted endpoint.
+	// In particular, 100.64.0.0/10 is the Tailscale/CGNAT tailnet: treating
+	// allowPrivate as a blanket bypass would let an operator-configured OAuth,
+	// webhook, or rotation URL reach any service on the host's tailnet. NAT64
+	// and the reserved/test ranges are likewise not legitimate destinations.
 	for _, cidr := range extraBlockedNets {
 		if cidr.Contains(ip) {
 			return true
 		}
 	}
+	if allowPrivate {
+		return false
+	}
+	// net.IP.IsPrivate covers RFC1918 + IPv6 ULA. Those remain available to an
+	// explicitly self-hosted caller via allowPrivate, while the ranges above
+	// are always denied.
 	return ip.IsLoopback() || ip.IsPrivate()
 }
 

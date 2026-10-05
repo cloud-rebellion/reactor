@@ -12,7 +12,7 @@
 //
 // Future subcommands per the implementation plan:
 //
-//	init, serve, mcp stdio, vault rotate-master, vault export
+//	init, serve, mcp install, vault rotate-master, vault export
 package main
 
 import (
@@ -55,10 +55,14 @@ func run(args []string) error {
 		return cmdSetup(ctx, log, rest)
 	case "migrate":
 		return cmdMigrate(ctx, log, rest)
+	case "payload":
+		return cmdPayload(ctx, rest)
 	case "serve":
 		return cmdServe(ctx, log, rest)
 	case "worker":
 		return cmdWorker(ctx, log, rest)
+	case "artifact-publisher":
+		return cmdArtifactPublisher(ctx, log, rest)
 	case "workflow":
 		return cmdWorkflow(ctx, log, rest)
 	case "replay":
@@ -129,8 +133,11 @@ func usage() {
 Usage:
   reactor init     [--root <dir>]                  bootstrap state dir + master key
   reactor migrate  --db <url>                      run pending schema migrations
-  reactor serve    --db <url> [--addr :7777]       run the daemon (HTTP + scheduler + rotation); --mode distributed enqueues
+  reactor payload  backfill-command-definitions    seal one bounded batch of historical command definitions
+  reactor payload  backfill-run-logs               seal one bounded batch of historical run logs
+  reactor serve    --db <url> [--addr 127.0.0.1:7777] run the daemon (HTTP + scheduler + rotation); --mode distributed enqueues
   reactor worker   --db <pg-url> [--concurrency N] distributed-mode worker: claim + run queued workflows (requires Postgres)
+  reactor artifact-publisher --db <pg-url> --source-root <dir> --destination-root <dir>  publish reviewed artifacts to workers
   reactor workflow list/register/build             manage workflow registrations + binaries
   reactor replay   --db <url> <run-id>             show timeline for a finalised run
   reactor cancel   --db <url> <run-id>             stop a running or suspended run
@@ -140,7 +147,7 @@ Usage:
   reactor knowledge add/list/search/show/...       grow + query the knowledge corpus
   reactor new      <template> <slug>               scaffold a workflow from a template
   reactor test     <slug> --against-run <id>|--latest  replay a journaled run; assert no divergence
-  reactor mcp      stdio | install --client X      stdio JSON-RPC server, or install snippet for an AI client
+  reactor mcp      install --client X --url URL   register the daemon's HTTP MCP endpoint (stdio is legacy)
   reactor version                                   print build version
 
 Database URLs:

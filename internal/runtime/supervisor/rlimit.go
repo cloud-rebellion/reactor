@@ -37,8 +37,17 @@ type ResourceLimits struct {
 	// per-run cgroup at <root>/reactor/<run_id> with memory.max set
 	// to MemoryMaxBytes and pids.max set to MaxProcesses, then
 	// passes the cgroup fd via SysProcAttr.UseCgroupFD so the child
-	// lands in the cgroup atomically at clone3 time.
+	// lands in the cgroup atomically at clone3 time. If the path is
+	// unavailable, the supervisor keeps the prlimit-only fallback unless
+	// RequireCgroup is true.
 	CgroupRoot string
+
+	// RequireCgroup makes a configured cgroup root an admission requirement.
+	// When true, a run is refused unless the supervisor can create a per-run
+	// cgroup and the host exposes cgroup.kill for descendant cleanup. This is
+	// useful when workflows are treated as hostile code; leaving it false
+	// retains the resource-limit-only fallback for development hosts.
+	RequireCgroup bool
 }
 
 // DefaultResourceLimits returns the v0.1 defaults: 512 MiB resident memory

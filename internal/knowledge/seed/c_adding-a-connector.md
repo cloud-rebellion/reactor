@@ -39,9 +39,11 @@ The bridge has three generic pieces that already work for any service:
 
 The generated workflow authenticates with `sdk/http`:
 
-- Bearer: `&ahttp.Client{Bearer: string(vault.MustGet("name").Reveal())}`.
+- Bearer: `&ahttp.Client{Bearer: string(vault.MustGet("name").Reveal()), CredentialOrigin: "https://<reviewed-provider-host>"}`.
 - Anything else (raw token, API-key header, Basic, version pin): the `Headers`
-  map (see [[c_generic-api]]). Query-param keys go on the URL.
+  map (see [[c_generic-api]]). Query-param keys go on the URL. Set
+  `CredentialOrigin` from reviewed provider configuration for every
+  credential-bearing request; the SDK refuses a missing or mismatched pin.
 
 ## The ceiling (where the AI writes code)
 
@@ -49,6 +51,10 @@ A flat catalog entry covers REST + Bearer/Basic/header/query + standard OAuth,
 which is the large majority. The tail still needs the AI to compose a few lines:
 **signed JWT** auth (Ghost), **GraphQL** bodies (monday, Linear), and
 **per-account dynamic hosts** (Shopify, self-hosted WordPress/Strapi/Drupal,
-Salesforce instance_url, Zoho region) where the base URL comes from input or the
-token response. That is by design: the bridge removes the boilerplate, the AI
-handles the specifics, so no service is ever a dead end.
+Salesforce instance_url, Zoho region) where the base URL comes from a reviewed
+account setting or a provider response. Reactor retains a validated Salesforce
+instance origin in its encrypted OAuth connection. The first host broker binds
+Salesforce OAuth tokens to that origin for GET requests under `/services/data/`
+using `sdk/http.ConnectorGet`; raw Salesforce token fetches fail closed. Other
+providers and Salesforce writes still need equivalent reviewed broker paths.
+A catalog entry alone is not a client-ready adapter.

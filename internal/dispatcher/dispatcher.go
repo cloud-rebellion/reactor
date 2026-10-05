@@ -23,11 +23,13 @@ package dispatcher
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +47,13 @@ type BinaryLookup func(slug string) (string, error)
 // BinaryPath compatibility pointer.
 type ArtifactLookup func(slug, artifactSHA256 string) (string, error)
 
+// TenantArtifactLookup is the tenant-aware immutable artifact boundary. The
+// node-local registry has one slug directory while the journal permits the
+// same slug in multiple tenants, so production execution supplies this
+// callback to prevent a legacy same-slug row from executing another tenant's
+// artifact. ArtifactLookup remains for in-memory/legacy fixtures.
+type TenantArtifactLookup func(tenant, slug, artifactSHA256 string) (string, error)
+
 // WorkflowResolver returns a workflow's slug + id given a trigger. The
 // production impl reads the workflows table; tests inject a fake.
 type WorkflowResolver interface {
@@ -54,12 +63,22 @@ type WorkflowResolver interface {
 
 // Dispatcher implements both webhook.Dispatcher and cron.Dispatcher.
 type Dispatcher struct {
-	Journal      *journal.Journal
-	Resolver     WorkflowResolver
-	BinaryPath   BinaryLookup // compatibility/status only; never used for a pinned run
-	ArtifactPath ArtifactLookup
-	Sup          supervisor.Supervisor // template; RunID + BinaryPath set per dispatch
-	Log          *slog.Logger
+	Journal               *journal.Journal
+	Resolver              WorkflowResolver
+	BinaryPath            BinaryLookup // compatibility/status only; never used for a pinned run
+	ArtifactPath          ArtifactLookup
+	ArtifactPathForTenant TenantArtifactLookup
+	// IntegrityCheck proves that the retained source, source manifest, and DAG
+	// still match the immutable workflow version immediately before execution.
+	// Production wiring supplies this callback; keeping it optional preserves
+	// the small in-memory dispatcher fixtures used by package tests.
+	IntegrityCheck func(ctx context.Context, slug string, version journal.WorkflowVersion) error
+	// QueueArtifactCheck is an optional second proof for a distributed worker
+	// artifact tree. It runs only before creating a queued run; local dry runs
+	// keep using the daemon's authoring artifact while it is being published.
+	QueueArtifactCheck func(ctx context.Context, slug string, version journal.WorkflowVersion) error
+	Sup                supervisor.Supervisor // template; RunID + BinaryPath set per dispatch
+	Log                *slog.Logger
 
 	// OnDeadLetter fires after a run durably terminates with
 	// status="failed_dlq". Wired by the daemon to a postmortem.Generator
@@ -81,6 +100,11 @@ type Dispatcher struct {
 	// "spawning", "run finished status=succeeded", etc.) so the
 	// dashboard's /runs/{id}/tail SSE has something to emit.
 	OnLog func(runID, line string)
+
+	// OnStart resets per-run live state before an execution begins. DLQ
+	// retries intentionally reuse their original run id so the durable step
+	// journal can replay successful work.
+	OnStart func(runID string)
 
 	// OnTerminal fires once per run when the supervisor returns. The
 	// daemon uses this to Close the run's log buffer + fire failure
@@ -294,6 +318,12 @@ type TerminalEvent struct {
 	TriggerKind  string
 	ErrorText    string
 	DryRun       bool // a test run: the host suppresses notifications + chains
+	// TerminalEffectClaimedAt is set by the durable recovery loop. Direct
+	// terminal callbacks leave it zero and claim their receipt before running
+	// side effects; carrying the timestamp and token keeps the final
+	// acknowledgement fenced to the exact generation that was handled.
+	TerminalEffectClaimedAt  time.Time
+	TerminalEffectClaimToken string
 }
 
 // terminalErrText converts the supervisor's terminal error to a
@@ -350,7 +380,11 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	// (graceful drain did not wait for it), the cancel registry (the run could
 	// not be stopped), and execute()'s panic recovery (a panic left the run
 	// stuck in "running" because the status had already been flipped).
-	if enabled, eErr := d.Journal.IsWorkflowEnabled(ctx, run.WorkflowID); eErr == nil && !enabled {
+	enabled, eErr := d.Journal.IsWorkflowEnabled(ctx, run.WorkflowID)
+	if eErr != nil {
+		return "", fmt.Errorf("dispatcher: dlq retry workflow enabled-state admission check failed: %w", eErr)
+	}
+	if !enabled {
 		d.Log.Info("dispatcher: refusing dlq retry; workflow disabled",
 			"workflow_id", run.WorkflowID, "run_id", item.RunID)
 		return "", ErrWorkflowDisabled
@@ -360,10 +394,17 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 		if errors.As(qErr, &qe) {
 			return "", qErr
 		}
-		d.Log.Warn("dispatcher: dlq retry quota check failed; allowing", "err", qErr)
+		// A quota lookup error is an admission failure, not evidence that this
+		// retry is unlimited. Continuing here would let a database/schema outage
+		// bypass tenant disabled, queue, or hard monthly-cap controls. Leave the
+		// exact DLQ item untouched so a later retry can re-run the check.
+		return "", fmt.Errorf("dispatcher: dlq retry quota admission check failed: %w", qErr)
 	}
 	if allowed, limit, rErr := d.Journal.CheckWorkflowRateLimit(ctx, run.WorkflowID); rErr != nil {
-		d.Log.Warn("dispatcher: dlq retry rate-limit check failed; allowing", "err", rErr)
+		// The rate-limit read is part of the same admission boundary. A failed
+		// count must not be interpreted as an empty window, especially for a
+		// retry that can repeat an external side effect.
+		return "", fmt.Errorf("dispatcher: dlq retry rate-limit admission check failed: %w", rErr)
 	} else if !allowed {
 		d.Log.Info("dispatcher: refusing dlq retry; rate limit",
 			"workflow_id", run.WorkflowID, "limit_per_min", limit)
@@ -374,17 +415,29 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	if err != nil {
 		return "", fmt.Errorf("dispatcher: resolve workflow: %w", err)
 	}
-	binary, err := d.resolvePinnedBinary(ctx, run, slug)
+	version, binary, err := d.resolvePinnedVersionAndBinary(ctx, run, slug)
 	if err != nil {
 		_ = d.Journal.LogRunArtifactFence(context.WithoutCancel(ctx), run.ID)
 		return "", fmt.Errorf("dispatcher: dlq retry refused by workflow artifact fence: %w", err)
 	}
+	if err := d.checkIntegrity(ctx, slug, version); err != nil {
+		// A retained-source/DAG fence is a durable identity failure for the
+		// pinned retry, while transient validator failures leave the DLQ item
+		// available for a later operator retry.
+		return "", fmt.Errorf("dispatcher: dlq retry refused by workflow integrity check: %w", err)
+	}
 	if d.Enqueue {
+		if err := d.checkQueueArtifact(ctx, slug, version); err != nil {
+			return "", err
+		}
 		if err := admissionSafe(lifetime); err != nil {
 			return "", err
 		}
 		claimed, cErr := d.Journal.StartDeadLetterRetryQueuedItem(ctx, item.RunID, item.ID)
 		if cErr != nil {
+			if errors.Is(cErr, journal.ErrWorkflowDisabled) {
+				return "", ErrWorkflowDisabled
+			}
 			return "", fmt.Errorf("dispatcher: queue run for retry: %w", cErr)
 		}
 		if !claimed {
@@ -411,10 +464,16 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	// The CAS also refuses a cancelled run, matching MarkRunFinished.
 	claimed, cErr := d.Journal.StartDeadLetterRetryItem(ctx, item.RunID, item.ID)
 	if cErr != nil {
+		if errors.Is(cErr, journal.ErrWorkflowDisabled) {
+			return "", ErrWorkflowDisabled
+		}
 		return "", fmt.Errorf("dispatcher: claim run for retry: %w", cErr)
 	}
 	if !claimed {
 		return "", ErrRetryInFlight
+	}
+	if d.OnStart != nil {
+		d.OnStart(item.RunID)
 	}
 
 	sup := d.Sup
@@ -425,7 +484,7 @@ func (d *Dispatcher) RetryDeadLetter(ctx context.Context, dlqID string) (string,
 	// Re-spawn the workflow with its original trigger input. dead_letter.payload
 	// is the failed Step payload and may not even match the workflow's input
 	// schema (the Hash bridge expects the original signed event envelope).
-	sup.Input = run.TriggerMeta
+	sup.Input = run.ExecutionInput()
 	if sup.Log == nil {
 		sup.Log = d.Log
 	}
@@ -462,8 +521,33 @@ func (d *Dispatcher) DispatchTerminalChain(ctx context.Context, t journal.Trigge
 	if t.Kind != journal.TriggerWorkflowComplete {
 		return errors.New("dispatcher: terminal-chain admission requires workflow_complete trigger")
 	}
-	_, err := d.dispatchWithAdmission(ctx, t, payload, "live", true)
-	return err
+	// Terminal-effect recovery may rerun a fan-out after one peer failed or the
+	// daemon crashed after another peer accepted its run. Bind the downstream
+	// receipt to this immutable trigger row and exact source payload so those
+	// retries converge on the original run instead of duplicating side effects.
+	key := terminalChainIdempotencyKey(t, payload)
+	runID, err := d.dispatchWithIdempotency(ctx, t, payload, "live", true, key)
+	if err != nil {
+		return err
+	}
+	if runID == "" {
+		// A disabled downstream must remain retryable: returning nil here would
+		// acknowledge the upstream terminal effect while creating no run.
+		return ErrWorkflowDisabled
+	}
+	return nil
+}
+
+func terminalChainIdempotencyKey(t journal.Trigger, payload []byte) string {
+	h := sha256.New()
+	h.Write([]byte(string(t.Kind)))
+	h.Write([]byte{0})
+	h.Write([]byte(t.ID))
+	h.Write([]byte{0})
+	h.Write([]byte(t.WorkflowID))
+	h.Write([]byte{0})
+	h.Write(payload)
+	return "chain-" + hex.EncodeToString(h.Sum(nil))
 }
 
 // DispatchWebhook is the webhook-specific async surface. It has the same
@@ -501,6 +585,14 @@ func (d *Dispatcher) DispatchManual(ctx context.Context, t journal.Trigger, payl
 	return d.dispatch(ctx, t, payload, "live")
 }
 
+// DispatchManualIdempotent is the MCP/manual control-plane variant. A
+// non-empty key is bound to the exact payload digest in the runs journal, so a
+// client retry after a lost HTTP response returns the original run instead of
+// starting a second automation. Empty keys retain ordinary manual semantics.
+func (d *Dispatcher) DispatchManualIdempotent(ctx context.Context, t journal.Trigger, payload []byte, key string) (string, error) {
+	return d.dispatchWithIdempotency(ctx, t, payload, "live", false, key)
+}
+
 // dispatch runs the gates + starts the run, returning the run id it created
 // ("" when the dispatch was skipped or refused). mode is the supervisor run
 // mode ("live" or "dry_run"); a dry run always executes in-process.
@@ -509,8 +601,42 @@ func (d *Dispatcher) dispatch(ctx context.Context, t journal.Trigger, payload []
 }
 
 func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigger, payload []byte, mode string, trustedTerminalChain bool) (string, error) {
+	return d.dispatchWithIdempotency(ctx, t, payload, mode, trustedTerminalChain, "")
+}
+
+func (d *Dispatcher) dispatchWithIdempotency(ctx context.Context, t journal.Trigger, payload []byte, mode string, trustedTerminalChain bool, idempotencyKey string) (string, error) {
 	if d.Log == nil {
 		d.Log = slog.Default()
+	}
+	// The runs table's trigger metadata is JSONB on Postgres and cannot store
+	// an empty value. Normalize the one empty-input case before hashing,
+	// journaling, and spawning so the receipt and the workflow always describe
+	// the same bytes. Non-empty payloads remain byte-for-byte unchanged.
+	if len(payload) == 0 {
+		payload = []byte(`{}`)
+	}
+	if idempotencyKey != "" && strings.TrimSpace(idempotencyKey) == "" {
+		return "", errors.New("dispatcher: invalid MCP dispatch idempotency key")
+	}
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if len(idempotencyKey) > 200 || strings.IndexFunc(idempotencyKey, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return "", errors.New("dispatcher: invalid MCP dispatch idempotency key")
+	}
+	payloadHash := ""
+	if idempotencyKey != "" {
+		digest := sha256.Sum256(payload)
+		payloadHash = hex.EncodeToString(digest[:])
+		// Idempotency is a receipt contract, so resolve an existing request
+		// before consulting mutable admission state. A client retry after a
+		// lost HTTP response must still return the original run if an operator
+		// paused the workflow or the current artifact is temporarily unavailable.
+		// The durable insert below remains the race-safe authority for two first
+		// requests arriving concurrently.
+		if existing, findErr := d.Journal.FindMCPDispatchRun(ctx, t.WorkflowID, idempotencyKey, payloadHash); findErr == nil {
+			return existing, nil
+		} else if !errors.Is(findErr, journal.ErrNotFound) {
+			return "", findErr
+		}
 	}
 	lifetime, releaseAdmission, err := d.beginAdmission(trustedTerminalChain)
 	if err != nil {
@@ -524,21 +650,35 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 			releaseAdmission()
 		}
 	}()
-	// Respect the enabled flag on every dispatch path (webhook, cron,
-	// chain, manual). A disabled workflow stays in the table for history
-	// but accepts no new runs; skip silently so a paused workflow doesn't
-	// error its trigger source. ErrWorkflowDisabled lets the manual-run
-	// handler surface a message while webhook/cron just no-op.
-	if enabled, eErr := d.Journal.IsWorkflowEnabled(ctx, t.WorkflowID); eErr == nil && !enabled {
+	// Respect the enabled flag on every LIVE dispatch path (webhook, cron,
+	// chain, manual). A disabled workflow stays inert for real events, while
+	// an explicit dry run is allowed so a newly authored workflow can be
+	// inspected before activation. Dry-run side effects are suppressed by the
+	// supervisor/notifier path; workflow code still receives REACTOR_MODE=dry_run.
+	enabled, eErr := d.Journal.IsWorkflowEnabled(ctx, t.WorkflowID)
+	if eErr != nil {
+		if errors.Is(eErr, journal.ErrNotFound) {
+			// Preserve the resolver's public unknown-workflow error for callers
+			// that supplied a stale trigger id. Existing workflows still fail
+			// closed below when the enabled-state read itself is unavailable.
+			if _, resolveErr := d.Resolver.WorkflowSlugByID(ctx, t.WorkflowID); resolveErr != nil {
+				return "", fmt.Errorf("dispatcher: resolve workflow: %w", resolveErr)
+			}
+		}
+		// Enabled state is the workflow kill switch. A failed read cannot be
+		// treated as enabled because that would turn a control-plane outage
+		// into an execution bypass.
+		return "", fmt.Errorf("dispatcher: workflow enabled-state admission check failed: %w", eErr)
+	}
+	if !enabled && mode != "dry_run" {
 		d.Log.Info("dispatcher: skipping dispatch; workflow disabled",
 			"workflow_id", t.WorkflowID, "trigger_kind", t.Kind)
-		// Manual runs surface the reason to the operator; automatic
-		// sources (webhook, cron, chain) just no-op so a paused workflow
-		// doesn't spam error logs or fail its trigger's caller.
-		if t.Kind == journal.TriggerManual {
-			return "", ErrWorkflowDisabled
+		return dispatchWorkflowDisabled(t)
+	}
+	if mode == "dry_run" {
+		if !enabled {
+			d.Log.Info("dispatcher: allowing review dry run for disabled workflow", "workflow_id", t.WorkflowID)
 		}
-		return "", nil
 	}
 
 	// Per-tenant quota gate (SaaS control plane). Refuse new runs when the
@@ -546,8 +686,8 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 	// Unknown tenants / zero quotas pass, so single-tenant installs are never
 	// gated. The QuotaError is returned to all trigger kinds so the caller can
 	// back off (a webhook sender retries on error). A failure to CHECK the
-	// quota (infra error) fails open: allow the run rather than halt all
-	// automation on a transient DB hiccup.
+	// quota (infra error) fails closed: do not let a transient DB/schema hiccup
+	// bypass tenant policy. The caller can retry once admission is readable.
 	if qErr := d.Journal.CheckWorkflowEnqueueAllowed(ctx, t.WorkflowID); qErr != nil {
 		var qe *journal.QuotaError
 		if errors.As(qErr, &qe) {
@@ -555,16 +695,20 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 				"workflow_id", t.WorkflowID, "tenant", qe.TenantID, "reason", qe.Reason)
 			return "", qErr
 		}
-		d.Log.Warn("dispatcher: quota check failed; allowing run",
-			"workflow_id", t.WorkflowID, "err", qErr)
+		// An admission read error is fail-closed. Treating a missing tenant row,
+		// disabled-state read, or quota-count failure as unlimited would allow a
+		// control-plane outage to bypass tenant policy. The next provider retry or
+		// operator attempt can safely re-evaluate the same request.
+		return "", fmt.Errorf("dispatcher: quota admission check failed: %w", qErr)
 	}
 
 	// Per-workflow rate limit (runs/min). Refuse when over; like the quota
-	// gate, returned to all trigger kinds so the caller backs off. A check
-	// failure fails open (allowed) so a transient DB hiccup can't wedge a
-	// workflow.
+	// gate, returned to all trigger kinds so the caller backs off. A failed
+	// counter read is also an admission error rather than an empty window.
 	if allowed, limit, rErr := d.Journal.CheckWorkflowRateLimit(ctx, t.WorkflowID); rErr != nil {
-		d.Log.Warn("dispatcher: rate-limit check failed; allowing run", "workflow_id", t.WorkflowID, "err", rErr)
+		// A failed rate-window read is not an empty window. Refuse admission until
+		// the journal can prove the configured limit and current usage.
+		return "", fmt.Errorf("dispatcher: rate-limit admission check failed: %w", rErr)
 	} else if !allowed {
 		d.Log.Info("dispatcher: refusing dispatch; rate limit",
 			"workflow_id", t.WorkflowID, "trigger_kind", t.Kind, "limit_per_min", limit)
@@ -582,13 +726,18 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 	if err != nil {
 		return "", fmt.Errorf("dispatcher: workflow artifact unavailable: %w", err)
 	}
-
+	if err := d.checkIntegrity(ctx, slug, version); err != nil {
+		return "", fmt.Errorf("dispatcher: workflow integrity check failed: %w", err)
+	}
 	// Distributed mode: persist the run as "queued" and return. A worker
 	// claims + executes it (ExecuteRun). No slot is taken and no subprocess
 	// is spawned here -- the queue absorbs the burst, so this never sheds
 	// load the way the in-process path does. A dry run skips the queue and
 	// runs in-process so its mode + effect-suppression apply on this node.
 	if d.Enqueue && mode != "dry_run" {
+		if err := d.checkQueueArtifact(ctx, slug, version); err != nil {
+			return "", err
+		}
 		if err := admissionSafe(lifetime); err != nil {
 			return "", err
 		}
@@ -597,10 +746,32 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 			return "", err
 		}
 		meta := payload
-		if len(meta) == 0 {
-			meta = json.RawMessage(`{}`)
+		var created bool
+		if idempotencyKey != "" {
+			var id string
+			id, created, err = d.Journal.CreateQueuedRunPinnedIdempotentIfEnabled(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256, idempotencyKey, payloadHash)
+			if isWorkflowRateLimited(err) {
+				return "", ErrRateLimited
+			}
+			if errors.Is(err, journal.ErrWorkflowDisabled) {
+				return dispatchWorkflowDisabled(t)
+			}
+			if !created {
+				if err != nil {
+					return "", err
+				}
+				return id, nil
+			}
+		} else {
+			err = d.Journal.CreateQueuedRunPinnedIfEnabled(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256)
+			if isWorkflowRateLimited(err) {
+				return "", ErrRateLimited
+			}
+			if errors.Is(err, journal.ErrWorkflowDisabled) {
+				return dispatchWorkflowDisabled(t)
+			}
 		}
-		if err := d.Journal.CreateQueuedRunPinned(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256); err != nil {
+		if err != nil {
 			return "", fmt.Errorf("dispatcher: enqueue run: %w", err)
 		}
 		if d.Counters != nil {
@@ -629,10 +800,37 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 		return "", err
 	}
 	meta := payload
-	if len(meta) == 0 {
-		meta = json.RawMessage(`{}`)
+	var created bool
+	if idempotencyKey != "" {
+		var id string
+		id, created, err = d.Journal.CreateRunPinnedIdempotentIfEnabled(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256, idempotencyKey, payloadHash)
+		if isWorkflowRateLimited(err) {
+			d.release()
+			return "", ErrRateLimited
+		}
+		if !created {
+			if errors.Is(err, journal.ErrWorkflowDisabled) {
+				d.release()
+				return dispatchWorkflowDisabled(t)
+			}
+			d.release()
+			if err != nil {
+				return "", err
+			}
+			return id, nil
+		}
+	} else {
+		err = d.Journal.CreateRunPinnedIfEnabled(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256)
+		if isWorkflowRateLimited(err) {
+			d.release()
+			return "", ErrRateLimited
+		}
+		if errors.Is(err, journal.ErrWorkflowDisabled) {
+			d.release()
+			return dispatchWorkflowDisabled(t)
+		}
 	}
-	if err := d.Journal.CreateRunPinned(ctx, runID, t.WorkflowID, string(t.Kind), meta, version.Version, version.ArtifactSHA256); err != nil {
+	if err != nil {
 		d.release()
 		return "", fmt.Errorf("dispatcher: create run: %w", err)
 	}
@@ -663,6 +861,9 @@ func (d *Dispatcher) dispatchWithAdmission(ctx context.Context, t journal.Trigge
 	// /runs/{id}/tail SSE shows BOTH layers.
 	if d.OnLog != nil {
 		sup.LogSink = d.OnLog
+	}
+	if d.OnStart != nil {
+		d.OnStart(runID)
 	}
 
 	transferred = true
@@ -719,19 +920,17 @@ func isTerminalStatus(s string) bool {
 // lastStepOutput returns the output_jsonb of the run's most recently finished
 // step -- the closest thing to "the workflow's return value".
 func (d *Dispatcher) lastStepOutput(ctx context.Context, runID string) json.RawMessage {
-	steps, err := d.Journal.ListSteps(ctx, runID)
-	if err != nil {
+	// Synchronous webhook responses need only the latest successful output.
+	// Query that one bounded row instead of materializing every step attempt and
+	// output in a run; a workflow can legitimately have thousands of retries or
+	// large historical results. Oversized output remains available through the
+	// bounded MCP step-output reader, while the request/response surface returns
+	// no unbounded blob.
+	step, err := d.Journal.LatestSuccessfulStepOutputBounded(ctx, runID, "", 1<<20)
+	if err != nil || step.OutputTruncated || len(step.OutputJSONB) == 0 {
 		return nil
 	}
-	var out json.RawMessage
-	var latest time.Time
-	for _, s := range steps {
-		if s.Status == "succeeded" && len(s.OutputJSONB) > 0 && !s.FinishedAt.Before(latest) {
-			out = s.OutputJSONB
-			latest = s.FinishedAt
-		}
-	}
-	return out
+	return step.OutputJSONB
 }
 
 // execute runs one supervisor to terminal and fires the lifecycle hooks
@@ -853,7 +1052,7 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID, leaseOwner string) e
 		// running row recoverable for expiry/reap.
 		return fmt.Errorf("dispatcher: resolve claimed workflow: %w", err)
 	}
-	binary, err := d.resolvePinnedBinary(ctx, run, slug)
+	version, binary, err := d.resolvePinnedVersionAndBinary(ctx, run, slug)
 	if err != nil {
 		if cause := context.Cause(ctx); cause != nil {
 			return cause
@@ -867,13 +1066,26 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID, leaseOwner string) e
 		// identity fence authorizes terminal failure and owned lease release.
 		return fmt.Errorf("dispatcher: validate claimed workflow artifact: %w", err)
 	}
+	if err := d.checkIntegrity(ctx, slug, version); err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		var fence *journal.WorkflowArtifactFenceError
+		if errors.As(err, &fence) {
+			return d.failArtifactFencedRun(ctx, run, slug, leaseOwner, err)
+		}
+		// Source retention, manifest, and DAG checks may also fail for a
+		// node-local availability reason. Preserve the lease/run for retry when
+		// the validator did not establish a durable identity fence.
+		return fmt.Errorf("dispatcher: validate claimed workflow source: %w", err)
+	}
 
 	sup := d.Sup
 	sup.BinaryPath = binary
 	sup.RunID = runID
 	sup.WorkflowSlug = slug
 	sup.Journal = d.Journal
-	sup.Input = run.TriggerMeta
+	sup.Input = run.ExecutionInput()
 	sup.LeaseOwner = leaseOwner
 	if sup.Log == nil {
 		sup.Log = d.Log
@@ -886,6 +1098,9 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID, leaseOwner string) e
 	}
 	if err := admissionSafe(lifetime); err != nil {
 		return err
+	}
+	if d.OnStart != nil {
+		d.OnStart(runID)
 	}
 
 	_, err = d.execute(ctx, runID, slug, run.WorkflowID, run.TriggerKind, sup)
@@ -903,24 +1118,55 @@ func (d *Dispatcher) resolveCurrentBinary(ctx context.Context, workflowID, slug 
 	if _, err := d.Journal.ValidateRunWorkflowArtifact(ctx, run); err != nil {
 		return journal.WorkflowVersion{}, "", err
 	}
-	if d.ArtifactPath == nil {
+	if d.ArtifactPath == nil && d.ArtifactPathForTenant == nil {
 		return journal.WorkflowVersion{}, "", fmt.Errorf("%w: immutable artifact lookup is not configured", journal.ErrWorkflowArtifactFence)
 	}
-	binary, err := d.ArtifactPath(slug, v.ArtifactSHA256)
+	var binary string
+	if d.ArtifactPathForTenant != nil {
+		tenant, tenantErr := d.Journal.WorkflowTenant(ctx, workflowID)
+		if tenantErr != nil {
+			return journal.WorkflowVersion{}, "", fmt.Errorf("%w: resolve workflow tenant: %v", journal.ErrWorkflowArtifactFence, tenantErr)
+		}
+		binary, err = d.ArtifactPathForTenant(tenant, slug, v.ArtifactSHA256)
+	} else {
+		binary, err = d.ArtifactPath(slug, v.ArtifactSHA256)
+	}
 	if err != nil {
 		return journal.WorkflowVersion{}, "", fmt.Errorf("%w: immutable artifact failed verification", journal.ErrWorkflowArtifactFence)
 	}
 	return v, binary, nil
 }
 
+// resolvePinnedBinary retains the narrow compatibility helper used by older
+// in-package callers. New execution paths use resolvePinnedVersionAndBinary
+// so the exact journal version validated against the run is available for the
+// retained-source integrity callback without a second database read.
 func (d *Dispatcher) resolvePinnedBinary(ctx context.Context, run journal.RunInfo, slug string) (string, error) {
-	if _, err := d.Journal.ValidateRunWorkflowArtifact(ctx, run); err != nil {
-		return "", err
+	_, binary, err := d.resolvePinnedVersionAndBinary(ctx, run, slug)
+	return binary, err
+}
+
+func (d *Dispatcher) resolvePinnedVersionAndBinary(ctx context.Context, run journal.RunInfo, slug string) (journal.WorkflowVersion, string, error) {
+	version, err := d.Journal.ValidateRunWorkflowArtifact(ctx, run)
+	if err != nil {
+		return journal.WorkflowVersion{}, "", err
 	}
-	if d.ArtifactPath == nil {
-		return "", errors.New("dispatcher: immutable artifact lookup is not configured")
+	if d.ArtifactPath == nil && d.ArtifactPathForTenant == nil {
+		return journal.WorkflowVersion{}, "", errors.New("dispatcher: immutable artifact lookup is not configured")
 	}
-	binary, err := d.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	var binary string
+	if d.ArtifactPathForTenant != nil {
+		tenant := strings.TrimSpace(run.TenantID)
+		if tenant == "" {
+			tenant, err = d.Journal.WorkflowTenant(ctx, run.WorkflowID)
+			if err != nil {
+				return journal.WorkflowVersion{}, "", fmt.Errorf("dispatcher: resolve workflow tenant: %w", err)
+			}
+		}
+		binary, err = d.ArtifactPathForTenant(tenant, slug, run.WorkflowArtifactSHA256)
+	} else {
+		binary, err = d.ArtifactPath(slug, run.WorkflowArtifactSHA256)
+	}
 	if err != nil {
 		// The journal validation above is the authority for the durable
 		// workflow/version/digest identity. Failure to read or verify the
@@ -928,9 +1174,30 @@ func (d *Dispatcher) resolvePinnedBinary(ctx context.Context, run journal.RunInf
 		// problem, not proof that the durable run is invalid. The caller keeps
 		// the exact run and lease recoverable so another healthy worker (or the
 		// same worker after restoration) can execute it.
-		return "", fmt.Errorf("dispatcher: immutable artifact is unavailable: %w", err)
+		return journal.WorkflowVersion{}, "", fmt.Errorf("dispatcher: immutable artifact is unavailable: %w", err)
 	}
-	return binary, nil
+	return version, binary, nil
+}
+
+// checkIntegrity keeps the callback at the last common point after immutable
+// artifact resolution and before any supervisor/queue admission. An unset
+// callback preserves the package's test-only/in-memory dispatcher behavior;
+// every production constructor wires the retained-source proof.
+func (d *Dispatcher) checkIntegrity(ctx context.Context, slug string, version journal.WorkflowVersion) error {
+	if d.IntegrityCheck == nil {
+		return nil
+	}
+	return d.IntegrityCheck(ctx, slug, version)
+}
+
+func (d *Dispatcher) checkQueueArtifact(ctx context.Context, slug string, version journal.WorkflowVersion) error {
+	if d.QueueArtifactCheck == nil {
+		return nil
+	}
+	if err := d.QueueArtifactCheck(ctx, slug, version); err != nil {
+		return fmt.Errorf("dispatcher: worker artifact is unavailable for queue admission: %w", err)
+	}
+	return nil
 }
 
 func (d *Dispatcher) failArtifactFencedRun(ctx context.Context, run journal.RunInfo, slug, leaseOwner string, cause error) error {
@@ -1045,6 +1312,11 @@ var ErrNotFound = errors.New("dispatcher: workflow not found")
 // per-minute rate limit. Callers (webhook senders) should back off + retry.
 var ErrRateLimited = errors.New("dispatcher: workflow rate limit exceeded")
 
+func isWorkflowRateLimited(err error) bool {
+	var rateErr *journal.WorkflowRateLimitError
+	return errors.As(err, &rateErr)
+}
+
 // ErrSyncTimeout is returned by DispatchSync when the run didn't reach a
 // terminal status within the timeout (the run keeps executing in the
 // background).
@@ -1054,6 +1326,17 @@ var ErrSyncTimeout = errors.New("dispatcher: synchronous run timed out")
 // disabled workflow so the dashboard can show "this workflow is disabled"
 // instead of creating a run. Automatic dispatch paths no-op instead.
 var ErrWorkflowDisabled = errors.New("dispatcher: workflow is disabled")
+
+// dispatchWorkflowDisabled preserves the historical trigger semantics: a
+// manual request reports the kill-switch to its operator, while automatic
+// sources quietly leave the event pending for their normal retry/reconcile
+// behavior.
+func dispatchWorkflowDisabled(t journal.Trigger) (string, error) {
+	if t.Kind == journal.TriggerManual {
+		return "", ErrWorkflowDisabled
+	}
+	return "", nil
+}
 
 // WorkflowBySlug returns the workflow id for a slug, or ErrNotFound.
 func (r *SQLResolver) WorkflowBySlug(ctx context.Context, slug string) (string, error) {

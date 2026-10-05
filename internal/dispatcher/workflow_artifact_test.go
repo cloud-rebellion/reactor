@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,87 +15,16 @@ import (
 	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/supervisor"
-	"github.com/bright-interaction/reactor/internal/runtime/wire"
 )
 
 func artifactScript(t *testing.T, marker, value string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "workflow")
-	hello, err := wire.Wrap(1, 0, wire.KindHello, wire.Hello{Version: wire.Version})
-	if err != nil {
-		t.Fatal(err)
-	}
-	helloJSON, err := json.Marshal(hello)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := "#!/bin/sh\n" +
-		"IFS= read -r _ || exit 1\n" +
-		"printf '%s\\n' '" + string(helloJSON) + "'\n" +
-		"printf '%s' '" + value + "' > '" + marker + "'\n"
+	body := "#!/bin/sh\nprintf '%s' '" + value + "' > '" + marker + "'\n"
 	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path
-}
-
-func TestArtifactScriptCompletesWireHelloBeforeExecuting(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "executed")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, artifactScript(t, marker, "v1"))
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if cmd.ProcessState == nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
-	})
-
-	hostHello, err := wire.Wrap(1, 0, wire.KindHello, wire.Hello{Version: wire.Version})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := wire.NewEncoder(stdin).Encode(hostHello); err != nil {
-		t.Fatal(err)
-	}
-	if err := stdin.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reply, err := wire.NewDecoder(stdout).Decode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reply.Kind != wire.KindHello {
-		t.Fatalf("artifact reply kind = %q, want %q", reply.Kind, wire.KindHello)
-	}
-	var childHello wire.Hello
-	if err := wire.Unwrap(reply, &childHello); err != nil {
-		t.Fatal(err)
-	}
-	if childHello.Version != wire.Version {
-		t.Fatalf("artifact wire version = %q, want %q", childHello.Version, wire.Version)
-	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(marker)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "v1" {
-		t.Fatalf("artifact wrote %q, want v1", got)
-	}
 }
 
 func TestQueuedRunExecutesPinnedV1AfterV2Activation(t *testing.T) {
@@ -217,6 +145,39 @@ func TestUnavailablePinnedArtifactRetainsOwnedRunWithoutSpawn(t *testing.T) {
 	}
 	if run, err := j.GetRun(ctx, runID); err != nil || run.Status != "queued" || !run.FinishedAt.IsZero() {
 		t.Fatalf("requeued artifact availability run = %+v, %v", run, err)
+	}
+}
+
+func TestTenantAwareArtifactLookupRefusesCrossTenantLegacySlug(t *testing.T) {
+	ctx := context.Background()
+	j := newJournal(t)
+	reg := registry.New(filepath.Join(t.TempDir(), "workflows"))
+	source := artifactScript(t, filepath.Join(t.TempDir(), "must-not-execute"), "cross-tenant")
+	artifact, err := reg.PublishArtifact("shared", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The node-local namespace belongs to acme, while the durable legacy row
+	// deliberately belongs to globex. A slug-only lookup would execute acme's
+	// bytes for globex; the tenant-aware callback must fence before run creation.
+	if err := reg.ClaimTenant("shared", "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateWorkflowInTenantWithArtifact(ctx, "wf_globex_shared", "shared", "h", "0.1.0", artifact.Digest, json.RawMessage(`{}`), "globex"); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Journal:               j,
+		Resolver:              &SQLResolver{Journal: j},
+		ArtifactPathForTenant: reg.TenantArtifactPath,
+		Sup:                   supervisor.Supervisor{Vault: noopVault{}},
+		Log:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if _, err := d.DispatchWebhook(ctx, journal.Trigger{WorkflowID: "wf_globex_shared", Kind: journal.TriggerWebhook}, []byte(`{}`)); err == nil || !errors.Is(err, journal.ErrWorkflowArtifactFence) {
+		t.Fatalf("cross-tenant dispatch error = %v, want artifact fence", err)
+	}
+	if _, err := j.ListRuns(ctx, journal.RunFilter{WorkflowID: "wf_globex_shared"}); err != nil {
+		t.Fatal(err)
 	}
 }
 

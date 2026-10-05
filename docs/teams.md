@@ -1,6 +1,9 @@
 # Teams, users, sessions, API tokens
 
-The dashboard supports per-operator login + admin/member roles + personal API tokens for programmatic clients. This is **phase 1** of the teams roadmap: per-team workflow ownership comes in phase 2.
+The dashboard supports per-operator login, tenant-scoped workflow data, admin/member
+roles, and personal API tokens for programmatic clients. Tenant routing and the
+tenant registry are live; richer team membership and invitations remain future
+extensions.
 
 ## Quick start
 
@@ -14,7 +17,9 @@ The legacy env-var BasicAuth fallback (`REACTOR_BASIC_AUTH_USER` + `REACTOR_BASI
 
 ## Schema
 
-Migration 0012 adds three tables.
+Migration 0012 adds the users, sessions, and API-token tables. Migration 0016
+adds the tenant registry and usage ledger, and migration 0019 associates each
+dashboard user with a tenant.
 
 ### `users`
 
@@ -24,6 +29,7 @@ Migration 0012 adds three tables.
 | username | text UNIQUE | operator-chosen |
 | password_phc | text | argon2id PHC string (or legacy lowercase hex SHA-256) |
 | role | text CHECK | `admin` \| `member` |
+| tenant_id | text | owning tenant; defaults to `default` and scopes members |
 | disabled | bool | session middleware refuses disabled users |
 | created_at / updated_at | timestamp | |
 | last_login_at | timestamp | bumped on every successful login |
@@ -52,7 +58,7 @@ Storing the **hash** of the cookie value (not the raw value) means a database sn
 | token_hash | text UNIQUE | sha256 hex of the raw token |
 | created_at | timestamp | |
 | last_used_at | timestamp | bumped on every successful resolve |
-| expires_at | timestamp NULL | optional |
+| expires_at | timestamp | hard deadline; dashboard-created tokens default to 90 days |
 | revoked | bool | row stays so audit trail of "this token did X" survives |
 
 The raw token is shown to the user **exactly once** at mint time via the flash
@@ -84,24 +90,25 @@ Stored as a PHC string: `$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>`.
 
 `SessionAuth` runs BEFORE the legacy `BasicAuth` middleware. Resolution order:
 
-1. **Cookie** `reactor_sess` → `Store.ResolveSession`. On success, stash the user on the request context.
-2. **`Authorization: Bearer <token>`** → `Store.ResolveAPIToken`.
-3. **`Authorization: Basic <user>:<pw>`** → `Store.Authenticate` against the users table.
-4. **No identity resolved** + no users in DB → pass through so the legacy env-var BasicAuth still handles fresh boots.
-5. **Users exist** + no identity → `303 See Other` to `/login?next=<path>` for HTML clients; `401 Unauthorized` for JSON clients.
+1. On `/mcp`, **`Authorization: Bearer <token>`** is resolved first. A configured dedicated MCP bearer is bound to `REACTOR_MCP_TENANT`; a Reactor API token retains its own user and tenant. An invalid bearer is rejected rather than falling back to a browser cookie.
+2. **Cookie** `reactor_sess` → `Store.ResolveSession`. On success, stash the user on the request context.
+3. **`Authorization: Bearer <token>`** on other routes → `Store.ResolveAPIToken`.
+4. **`Authorization: Basic <user>:<pw>`** → `Store.Authenticate` against the users table.
+5. **No identity resolved** + no users in DB → pass through so the legacy env-var BasicAuth still handles fresh boots.
+6. **Users exist** + no identity → `303 See Other` to `/login?next=<path>` for HTML clients; `401 Unauthorized` for JSON clients.
 
 The legacy `BasicAuth` middleware short-circuits when a session-resolved user is already on the request context. The two middlewares compose cleanly.
 
-Exempt paths (always pass through): `/healthz`, `/login`, `/webhook/*`, `/signal/*`, `/assets/*`, `/mcp*`.
+Session-auth exempt paths (always pass through): `/healthz`, `/readyz`, `/login`, `/webhook/*`, `/signal/*`, `/assets/*`, and `/docs/*`. `/mcp` remains authenticated and admin-gated; it is exempt only from the browser-oriented CSRF Origin check.
 
 ## Roles
 
-Two roles ship in phase 1:
+The current roles are:
 
 | Role | What |
 |---|---|
 | `admin` | Manages `/users`, deletes workflows, deletes credentials, all member capabilities. |
-| `member` | Reads + edits workflows, credentials, knowledge, notifications, triggers. Cannot delete workflows or manage users. |
+| `member` | Reads workflows, credentials, knowledge, and the trigger/notification metadata shown on tenant workflow pages; can run and cancel runs within their own tenant and manage their own API tokens. Workflow, credential, knowledge, notification, trigger, DLQ, and MCP mutations are admin-only. |
 
 The `requireAdmin` helper writes a `403 Forbidden` when a non-admin hits an admin-only endpoint.
 
@@ -122,6 +129,7 @@ Mint at `/tokens`:
 ```text
 POST /tokens
 form: name=ci-deploy
+form: ttl_days=90 (1-3650; dashboard default 90)
 ```
 
 Returns `303 See Other` + a one-time flash capability cookie. The cookie never
@@ -134,7 +142,10 @@ Token minted. Copy it now; it will not be shown again. Use it as:
 Authorization: Bearer rtr_YOUR_TOKEN_HERE
 ```
 
-Tokens have the same role/permissions as the issuing user. `POST /tokens/{id}/revoke` marks the row revoked; the audit trail survives.
+Tokens have the same role/permissions as the issuing user. Minting a token
+requires a fresh MFA step-up when the account has a factor enrolled. Tokens
+expire at the selected deadline; `POST /tokens/{id}/revoke` marks the row
+revoked and the audit trail survives.
 
 For Bearer use, see the [REST API reference](/docs/api).
 
@@ -148,16 +159,23 @@ For Bearer use, see the [REST API reference](/docs/api).
 
 Re-running setup recovers a forgotten admin password without disturbing other users.
 
-## Future (phase 2)
+## Future extensions
 
-- Per-team workflow + credential ownership (every row gains an effective `team_id`, currently hardcoded to `'default'`).
-- Team management UI (create/delete teams, invite users to teams, per-team admin role).
+- Team membership and invitation flows layered on the existing tenant registry.
+- A per-tenant admin role, instead of the current global `admin` role.
 - SSO/OIDC integration (mapped to user rows on first sign-in).
 - Refresh tokens for browser clients (today's 7-day session is hard expiry).
 
-Phase 1 ships identity + auth + RBAC against the existing single-tenant data model; phase 2 is the data-model rewrite.
+Workflows, credentials, runs, triggers, connections, notification channels,
+command automations, and tenant-scoped knowledge entries already carry tenant
+ownership. Members are pinned to their user's tenant; global admins may select
+the tenant they are operating on. This page's team roadmap refers to membership
+and invitation UX, not a pending tenant data-model rewrite.
 
 ## Tests
 
-- 10 auth-package tests: CreateUser + Authenticate happy path, short-password rejection, UNIQUE rejection, session lifecycle + expiry sweep, disabled-user rejection, role + admin count, API token mint + list + resolve + revoke, legacy sha256 + argon2id round-trips.
-- 6 server tests: unauth redirects to /login, login mints a session cookie with HttpOnly+SameSite=Strict, Bearer auth succeeds, RBAC member 403 vs admin 303 for workflow delete, logout clears the cookie.
+- Auth-package tests cover user creation and authentication, password migration,
+  session expiry and revocation, disabled-user rejection, last-admin guards,
+  API-token expiry/revocation, and role/tenant persistence.
+- Server tests cover unauthenticated redirects, hardened session cookies, Bearer
+  authentication, tenant-scoped member access, admin RBAC, and logout.

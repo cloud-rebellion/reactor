@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,12 +65,100 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestCreatePersistsLocalMintAcknowledgement(t *testing.T) {
+	t.Parallel()
+	repo, cleanup := newRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := repo.Create(ctx, CreateParams{
+		ID: "cred-local", Name: "local", Service: "internal", Provider: "shared-secret",
+		AllowLocalMint: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := repo.Get(ctx, "cred-local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !LocalMintAcknowledged(c.ProviderMeta) {
+		t.Fatalf("local-mint acknowledgement was not persisted: %#v", c.ProviderMeta)
+	}
+	if LocalMintAcknowledged(map[string]string{LocalMintAcknowledgementKey: "false"}) {
+		t.Fatal("false acknowledgement must not pass")
+	}
+}
+
 func TestGetMissing(t *testing.T) {
 	t.Parallel()
 	repo, cleanup := newRepo(t)
 	defer cleanup()
 	if _, err := repo.Get(context.Background(), "cred_missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetMetadataByTenantOmitsLargeProviderFieldsAndFencesTenant(t *testing.T) {
+	t.Parallel()
+	repo, cleanup := newRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+	providerMeta := map[string]string{"endpoint": string(make([]byte, 2<<20))}
+	if err := repo.Create(ctx, CreateParams{
+		ID: "cred-metadata", Name: "metadata", TenantID: "acme",
+		Service: "reactor-webhook", Provider: "shared-secret",
+		ProviderMeta:    providerMeta,
+		RotationTargets: []Target{{Kind: "webhook", URL: "https://example.invalid/hook", KeyName: "KEY", SecretID: "cred-auth"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.GetMetadataByTenant(ctx, "cred-metadata", "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "cred-metadata" || got.TenantID != "acme" || got.Service != "reactor-webhook" || got.Provider != "shared-secret" {
+		t.Fatalf("metadata identity mismatch: %+v", got)
+	}
+	if got.ProviderMeta != nil || got.RotationTargets != nil || got.LastRotationError != "" {
+		t.Fatalf("metadata lookup materialized oversized/provider fields: %+v", got)
+	}
+	if _, err := repo.GetMetadataByTenant(ctx, "cred-metadata", "other"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-tenant metadata lookup = %v, want ErrNotFound", err)
+	}
+}
+
+func TestListMetadataPageIsBoundedAndOmitsSecretAdjacentColumns(t *testing.T) {
+	t.Parallel()
+	repo, cleanup := newRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+	for _, p := range []CreateParams{
+		{ID: "cred-a", TenantID: "acme", Name: "a", Service: "host", Provider: "shared-secret", ProviderMeta: map[string]string{"endpoint": strings.Repeat("x", 2<<20)}, RotationTargets: []Target{{Kind: "webhook", URL: "https://example.invalid", KeyName: "KEY", SecretID: "cred-auth"}}},
+		{ID: "cred-b", TenantID: "globex", Name: "b", Service: "host", Provider: "shared-secret"},
+	} {
+		if err := repo.Create(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.RecordError(ctx, "cred-a", strings.Repeat("diagnostic ", 200)); err != nil {
+		t.Fatal(err)
+	}
+	page, more, err := repo.ListMetadataPage(ctx, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !more || len(page) != 1 || page[0].ID != "cred-a" {
+		t.Fatalf("first metadata page = %#v, more=%v", page, more)
+	}
+	if page[0].ProviderMeta != nil || page[0].RotationTargets != nil || len(page[0].LastRotationError) > 512 {
+		t.Fatalf("metadata page loaded unbounded/provider fields: %#v", page[0])
+	}
+	page, more, err = repo.ListMetadataPage(ctx, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if more || len(page) != 1 || page[0].ID != "cred-b" {
+		t.Fatalf("second metadata page = %#v, more=%v", page, more)
 	}
 }
 
@@ -181,5 +270,26 @@ func TestAuditAppendAndList(t *testing.T) {
 	// Newest-first ordering.
 	if rows[0].Action != "rotate.delivery_success" {
 		t.Fatalf("expected newest first, got %s", rows[0].Action)
+	}
+}
+
+func TestListAuditPageBoundedDoesNotMaterializeLargeDetail(t *testing.T) {
+	t.Parallel()
+	repo, cleanup := newRepo(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := repo.Create(ctx, CreateParams{ID: "cred-bounded-audit", Name: "bounded", Service: "s", Provider: "shared-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	large := json.RawMessage(`{"error":"` + strings.Repeat("x", 4<<20) + `"}`)
+	if err := repo.AppendAudit(ctx, AuditEntry{CredentialID: "cred-bounded-audit", Action: "rotate.failed", ActorKind: "scheduler", Detail: large}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := repo.ListAuditPageBounded(ctx, "cred-bounded-audit", 10, 0, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].DetailBytes <= 4096 || !rows[0].DetailTruncated || len(rows[0].Detail) > 4096 {
+		t.Fatalf("bounded audit row = len=%d bytes=%d truncated=%v", len(rows[0].Detail), rows[0].DetailBytes, rows[0].DetailTruncated)
 	}
 }

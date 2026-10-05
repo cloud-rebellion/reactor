@@ -123,6 +123,29 @@ func TestTenantStoreCRUD(t *testing.T) {
 	}
 }
 
+func TestDeleteTenantRefusesDurableReferences(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.UpsertTenant(ctx, Tenant{TenantID: "retained", Disabled: true, MaxQueuedRuns: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateWorkflowInTenant(ctx, "wf_retained", "retained-flow", "h", "0.1.0", json.RawMessage(`{}`), "retained"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.DeleteTenant(ctx, "retained"); !errors.Is(err, ErrTenantHasReferences) {
+		t.Fatalf("delete with workflow = %v, want ErrTenantHasReferences", err)
+	}
+	got, err := j.GetTenant(ctx, "retained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Disabled || got.MaxQueuedRuns != 3 {
+		t.Fatalf("tenant policy changed after refused delete: %+v", got)
+	}
+}
+
 func TestRunTenantDenormalized(t *testing.T) {
 	t.Parallel()
 	j, cleanup := newTestJournal(t)

@@ -43,9 +43,6 @@ func alertMarkdown(ev Event) string {
 			fmt.Fprintf(&b, "*Duration:* %s\n", dur.Round(time.Millisecond))
 		}
 	}
-	if ev.ErrorText != "" {
-		fmt.Fprintf(&b, "*Error:* ```%s```", truncate(ev.ErrorText, 1500))
-	}
 	return b.String()
 }
 
@@ -65,9 +62,6 @@ func alertPlainText(ev Event) string {
 			fmt.Fprintf(&b, "Duration: %s\n", dur.Round(time.Millisecond))
 		}
 	}
-	if ev.ErrorText != "" {
-		fmt.Fprintf(&b, "\nError:\n%s\n", truncate(ev.ErrorText, 4000))
-	}
 	if ev.DashboardURL != "" {
 		fmt.Fprintf(&b, "\nOpen run: %s\n", ev.DashboardURL)
 	}
@@ -77,11 +71,4 @@ func alertPlainText(ev Event) string {
 func escapeSlackMrkdwn(s string) string {
 	r := strings.NewReplacer("`", "'", "<", "&lt;", ">", "&gt;", "&", "&amp;")
 	return r.Replace(s)
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/reactor/sdk/esign"
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
 
 func validLifecycleEvent() esign.LifecycleEvent {
@@ -65,6 +66,23 @@ func TestDeliverLifecycleEventContract(t *testing.T) {
 	}
 	if !receipt.Accepted || receipt.Deduped {
 		t.Fatalf("receipt = %+v", receipt)
+	}
+}
+
+func TestDeliverLifecycleEventBlocksDryRunBeforeNetwork(t *testing.T) {
+	t.Setenv("REACTOR_MODE", "dry_run")
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("dry-run BrightCRM request reached the server")
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "crm-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.DeliverLifecycleEvent(context.Background(), validLifecycleEvent())
+	if !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("dry-run error = %v, want ErrDryRun", err)
 	}
 }
 
@@ -256,6 +274,22 @@ func TestLifecycleClientRejectsInvalidConfigurationAndEvent(t *testing.T) {
 	event.DocumentID = ""
 	if _, err := client.DeliverLifecycleEvent(context.Background(), event); err == nil {
 		t.Fatal("invalid event accepted")
+	}
+}
+
+func TestDefaultClientUsesConnectTimeSSRFGuard(t *testing.T) {
+	t.Parallel()
+	client, err := NewClient("https://crm.example.com", "key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.httpClient.Transport.(*http.Transport)
+	if !ok || transport.DialContext == nil {
+		t.Fatalf("default client transport = %T, want SSRF-safe http.Transport", client.httpClient.Transport)
+	}
+	_, err = transport.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	if err == nil || !strings.Contains(err.Error(), "ssrf: refusing") {
+		t.Fatalf("default client dial error = %v, want connect-time SSRF refusal", err)
 	}
 }
 

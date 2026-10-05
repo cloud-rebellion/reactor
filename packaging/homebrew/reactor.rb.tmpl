@@ -1,21 +1,12 @@
 # Reactor Homebrew formula template.
 #
-# Two paths to a usable formula:
+# The release workflow renders this template with exact archive hashes and
+# attaches reactor.rb to the GitHub release. Publish that rendered file as
+# Formula/reactor.rb in a private tap to get Homebrew-managed upgrades. Tap
+# publication is not automated by this repository yet.
 #
-#   1. Self-host a tap. After cutting a release, copy this file into
-#      Formula/reactor.rb in your homebrew-* tap repo, replace VERSION
-#      + the four sha256 placeholders with values from the GitHub
-#      release's sha256 files, and `brew tap <org>/<tap> && brew install
-#      reactor`.
-#
-#   2. Generate it programmatically from the release CI. See the
-#      `homebrew-bump` action commented at the bottom of
-#      .github/workflows/release.yml for the auto-bump path.
-#
-# The formula installs the prebuilt binary from the GitHub release
-# (no source build) so users without Go on PATH still get a one-line
-# install. Source builds are available via `brew install --HEAD` once
-# the repo is mirrored to GitHub.
+# The formula installs a release binary, its matching workflow SDK module,
+# and the Go toolchain needed when Reactor compiles MCP-authored workflows.
 
 class Reactor < Formula
   desc "AI-built workflow automation. Self-hosted. Single Go binary."
@@ -23,52 +14,95 @@ class Reactor < Formula
   version "VERSION_PLACEHOLDER"
   # Fair-code (Reactor Sustainable Use License); not an SPDX/OSI license.
   license :cannot_represent
+  depends_on "go"
 
   on_macos do
     on_arm do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-arm64"
+      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-arm64.tar.gz"
       sha256 "DARWIN_ARM64_SHA256_PLACEHOLDER"
     end
     on_intel do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-amd64"
+      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-amd64.tar.gz"
       sha256 "DARWIN_AMD64_SHA256_PLACEHOLDER"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-linux-arm64"
+      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-linux-arm64.tar.gz"
       sha256 "LINUX_ARM64_SHA256_PLACEHOLDER"
     end
     on_intel do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-linux-amd64"
+      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-linux-amd64.tar.gz"
       sha256 "LINUX_AMD64_SHA256_PLACEHOLDER"
     end
+  end
+
+  resource "sdk" do
+    url "https://github.com/bright-interaction/reactor/releases/download/vVERSION_PLACEHOLDER/reactor-sdk-vVERSION_PLACEHOLDER.tar.gz"
+    sha256 "SDK_SHA256_PLACEHOLDER"
   end
 
   def install
     case Hardware::CPU.arch
     when :arm64
-      bin.install Dir["reactor-v#{version}-*-arm64"].first => "reactor"
+      libexec.install Dir["reactor-v#{version}-*-arm64"].first => "reactor"
     when :x86_64
-      bin.install Dir["reactor-v#{version}-*-amd64"].first => "reactor"
+      libexec.install Dir["reactor-v#{version}-*-amd64"].first => "reactor"
     end
+    resource("sdk").stage do
+      (libexec/"reactor-sdk").install "go.mod", "LICENSE", "sdk", "internal"
+    end
+    (bin/"reactor").write <<~SH
+      #!/bin/sh
+      export REACTOR_SDK_REPLACE="#{opt_libexec}/reactor-sdk"
+      export PATH="#{Formula["go"].opt_bin}:$PATH"
+      exec "#{opt_libexec}/reactor" "$@"
+    SH
+    (bin/"reactor").chmod 0755
   end
 
   def caveats
     <<~EOS
       Quickstart:
-        reactor init --root #{var}/reactor
-        reactor migrate --db sqlite://#{var}/reactor/reactor.db
-        reactor serve --root #{var}/reactor --db sqlite://#{var}/reactor/reactor.db
+        reactor setup --root "#{var}/reactor"
+        set -a; . "#{var}/reactor/reactor.env"; set +a
+        reactor serve --root "#{var}/reactor"
 
       The dashboard is at http://127.0.0.1:7777/ once the daemon is up.
-      Set REACTOR_BASIC_AUTH_USER + REACTOR_BASIC_AUTH_PASSWORD_SHA256 in your
-      environment before exposing the port beyond localhost.
+      Sign in with the admin credentials entered during setup.
+      The formula supplies Go and the matching SDK for offline MCP workflow builds.
+      Keep the listener on loopback or protect it with TLS and access controls.
     EOS
   end
 
   test do
-    assert_match "dev", shell_output("#{bin}/reactor version 2>&1 || true")
+    assert_match "v#{version}", shell_output("#{bin}/reactor version")
+    assert_path_exists libexec/"reactor-sdk/go.mod"
+    source = testpath/"source"
+    source.mkpath
+    (source/"main.go").write <<~GO
+      package main
+
+      import (
+        "context"
+        reactor "github.com/bright-interaction/reactor/sdk"
+        "github.com/bright-interaction/reactor/sdk/runtime"
+      )
+
+      var workflow = reactor.Workflow{Slug: "homebrew-smoke", Version: "0.1.0"}
+      var trigger = reactor.WebhookTrigger{Path: "/webhook/homebrew-smoke", Provider: "generic"}
+
+      func run(ctx context.Context, flow reactor.Flow, _ struct{}) error {
+        _, err := reactor.Step(flow, ctx, "record", reactor.StepOpts{}, func(context.Context) (string, error) {
+          return "ok", nil
+        })
+        return err
+      }
+
+      func main() { runtime.Serve(workflow, trigger, run) }
+    GO
+    system bin/"reactor", "workflow", "build", "--src", source,
+           "--slug", "homebrew-smoke", "--root", testpath/"state"
   end
 end

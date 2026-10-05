@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -89,7 +90,11 @@ func TestCmdVaultRotateSharedSecretE2E(t *testing.T) {
 	// Webhook target captures + validates the signed payload.
 	var hits atomic.Int32
 	var sigOK atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback tcp4 bind unavailable in this sandbox: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		body, _ := io.ReadAll(r.Body)
 		got := strings.TrimPrefix(r.Header.Get("X-Reactor-Signature"), "sha256=")
@@ -100,12 +105,15 @@ func TestCmdVaultRotateSharedSecretE2E(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}))
+	srv.Listener = listener
+	srv.Start()
 	defer srv.Close()
 
 	// The rotating credential.
 	if err := repo.Create(ctx, credentials.CreateParams{
 		ID: "cred_app", Name: "app", Service: "internal", Provider: "shared-secret",
-		AutoRotate: true, RotationIntervalDays: 1,
+		AllowLocalMint: true,
+		AutoRotate:     true, RotationIntervalDays: 1,
 		RotationTargets: []credentials.Target{
 			{Kind: "webhook", URL: srv.URL, SecretID: "cred_hmac", KeyName: "APP_SECRET"},
 		},
@@ -183,6 +191,7 @@ func TestCmdVaultAddSeedsRotatableCredential(t *testing.T) {
 		"--name", "crm-api-key",
 		"--service", "crm",
 		"--provider", "shared-secret",
+		"--allow-local-mint",
 		"--auto-rotate",
 		"--interval-days", "30",
 		"--value", "demo-secret",
@@ -200,6 +209,22 @@ func TestCmdVaultAddSeedsRotatableCredential(t *testing.T) {
 	}
 	if string(sec.Reveal()) != "demo-secret" {
 		t.Fatalf("plaintext mismatch: %q", sec.Reveal())
+	}
+}
+
+func TestCmdVaultAddRejectsUnacknowledgedLocalAutoRotation(t *testing.T) {
+	t.Parallel()
+	dbURL, repo, _, masterHex := newCmdEnv(t)
+	err := cmdVault(context.Background(), discardLogger(), []string{
+		"add", "--db", dbURL, "--master-key", masterHex,
+		"--name", "unsafe-auto", "--provider", "shared-secret",
+		"--auto-rotate", "--interval-days", "1", "--value", "v0",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--allow-local-mint") {
+		t.Fatalf("unacknowledged local auto-rotation error = %v, want acknowledgement refusal", err)
+	}
+	if _, getErr := repo.Get(context.Background(), "unsafe-auto"); !errors.Is(getErr, credentials.ErrNotFound) {
+		t.Fatalf("refused create left a credential row: %v", getErr)
 	}
 }
 
@@ -277,6 +302,22 @@ func TestCmdVaultGrantScopesDuplicateSlugByTenant(t *testing.T) {
 	}
 	if ok, err := j.HasGrant(ctx, "wf_globex", "cred_acme"); err != nil || ok {
 		t.Fatalf("globex unexpectedly received acme grant = %t, %v", ok, err)
+	}
+	if err := cmdVaultGrant(ctx, discardLogger(), []string{
+		"--db", dbURL, "--tenant", "globex", "shared", "cred_globex",
+	}); err != nil {
+		t.Fatalf("globex grant: %v", err)
+	}
+	if err := cmdVaultRevoke(ctx, discardLogger(), []string{
+		"--db", dbURL, "--tenant", "globex", "shared", "cred_globex",
+	}); err != nil {
+		t.Fatalf("tenant-scoped revoke: %v", err)
+	}
+	if ok, err := j.HasGrant(ctx, "wf_globex", "cred_globex"); err == nil && ok {
+		t.Fatal("globex grant remained after tenant-scoped revoke")
+	}
+	if ok, err := j.HasGrant(ctx, "wf_acme", "cred_acme"); err != nil || !ok {
+		t.Fatalf("tenant-scoped revoke touched acme grant = %t, %v", ok, err)
 	}
 
 	err = cmdVaultGrant(ctx, discardLogger(), []string{

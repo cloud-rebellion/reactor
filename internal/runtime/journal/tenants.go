@@ -29,6 +29,11 @@ type Tenant struct {
 // ErrTenantNotFound is returned by GetTenant for an unknown tenant.
 var ErrTenantNotFound = errors.New("journal: tenant not found")
 
+// ErrTenantHasReferences means a tenant still owns durable configuration,
+// identity, audit, or run history. Removing the registry row in that state
+// would make the remaining rows look like an unlimited, enabled tenant.
+var ErrTenantHasReferences = errors.New("journal: tenant still has durable references")
+
 const tenantCols = `tenant_id, name, plan, max_concurrent_runs, max_queued_runs, monthly_run_quota, disabled, created_at, plan_id, hard_cap`
 
 type scanner interface{ Scan(...any) error }
@@ -127,14 +132,77 @@ func (j *Journal) UpsertTenant(ctx context.Context, t Tenant) error {
 	return nil
 }
 
-// DeleteTenant removes a tenant row. Its runs/usage are untouched (they keep
-// their tenant_id string); deleting just reverts it to unlimited defaults.
+// DeleteTenant removes an empty tenant row. A tenant with durable references
+// cannot be deleted: leaving those rows behind would make the quota gate treat
+// the tenant as unlimited and enabled. Operators should erase run history and
+// remove tenant-owned configuration first, then retry the deletion.
 func (j *Journal) DeleteTenant(ctx context.Context, tenantID string) error {
 	if tenantID == "default" {
 		return fmt.Errorf("journal: cannot delete the default tenant")
 	}
-	if _, err := j.db.ExecContext(ctx, j.bind(`DELETE FROM tenants WHERE tenant_id = $1`), tenantID); err != nil {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("journal: delete tenant: begin: %w", err)
+	}
+	defer tx.Rollback()
+	// Serialize the reference check with other tenant administration writes.
+	// Resource tables intentionally do not have foreign keys to tenants because
+	// older installations predate the registry, so this explicit guard is the
+	// fail-closed boundary.
+	lockQ := `SELECT tenant_id FROM tenants WHERE tenant_id = $1`
+	if j.engine == EnginePostgres {
+		lockQ += ` FOR UPDATE`
+	}
+	var lockedID string
+	if err := tx.QueryRowContext(ctx, j.bind(lockQ), tenantID).Scan(&lockedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrTenantNotFound
+		}
+		return fmt.Errorf("journal: delete tenant: lock: %w", err)
+	}
+	if j.engine == EngineSQLite {
+		// A read-only deferred transaction does not acquire SQLite's writer
+		// lock. Touch the locked row before checking references so another
+		// writer cannot interleave a delete with this inspection.
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE tenants SET updated_at = updated_at WHERE tenant_id = $1`), tenantID); err != nil {
+			return fmt.Errorf("journal: delete tenant: lock: %w", err)
+		}
+	}
+	checks := []struct {
+		name  string
+		query string
+	}{
+		{name: "users", query: `SELECT COUNT(*) FROM users WHERE tenant_id = $1`},
+		{name: "workflows", query: `SELECT COUNT(*) FROM workflows WHERE tenant_id = $1`},
+		{name: "credentials", query: `SELECT COUNT(*) FROM credentials WHERE tenant_id = $1`},
+		{name: "runs", query: `SELECT COUNT(*) FROM runs WHERE tenant_id = $1`},
+		{name: "run_usage", query: `SELECT COUNT(*) FROM run_usage WHERE tenant_id = $1`},
+		{name: "triggers", query: `SELECT COUNT(*) FROM triggers WHERE tenant_id = $1`},
+		{name: "notification_channels", query: `SELECT COUNT(*) FROM notification_channels WHERE tenant_id = $1`},
+		{name: "oauth_connections", query: `SELECT COUNT(*) FROM oauth_connections WHERE tenant_id = $1`},
+		{name: "oauth_states", query: `SELECT COUNT(*) FROM oauth_states WHERE tenant_id = $1`},
+		{name: "mcp_audit", query: `SELECT COUNT(*) FROM mcp_audit WHERE tenant_id = $1`},
+		{name: "runtime_secret_access_audit", query: `SELECT COUNT(*) FROM runtime_secret_access_audit WHERE tenant_id = $1`},
+		{name: "command_automations", query: `SELECT COUNT(*) FROM command_automations WHERE tenant_id = $1`},
+	}
+	for _, check := range checks {
+		var count int
+		if err := tx.QueryRowContext(ctx, j.bind(check.query), tenantID).Scan(&count); err != nil {
+			return fmt.Errorf("journal: delete tenant: inspect %s: %w", check.name, err)
+		}
+		if count > 0 {
+			return fmt.Errorf("%w: %s=%d", ErrTenantHasReferences, check.name, count)
+		}
+	}
+	res, err := tx.ExecContext(ctx, j.bind(`DELETE FROM tenants WHERE tenant_id = $1`), tenantID)
+	if err != nil {
 		return fmt.Errorf("journal: delete tenant: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrTenantNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("journal: delete tenant: commit: %w", err)
 	}
 	return nil
 }
@@ -147,7 +215,11 @@ func (j *Journal) CountRunningForTenant(ctx context.Context, tenantID string) (i
 
 // CountQueuedForTenant counts a tenant's waiting runs (for the queue quota).
 func (j *Journal) CountQueuedForTenant(ctx context.Context, tenantID string) (int, error) {
-	return j.countRuns(ctx, `SELECT COUNT(*) FROM runs WHERE tenant_id = $1 AND status = 'queued'`, tenantID)
+	falseLit := "false"
+	if j.engine == EngineSQLite {
+		falseLit = "0"
+	}
+	return j.countRuns(ctx, `SELECT COUNT(*) FROM runs WHERE tenant_id = $1 AND status = 'queued' AND cancel_requested = `+falseLit, tenantID)
 }
 
 // CountRunsSince counts a tenant's runs created at or after t (for the monthly
@@ -188,10 +260,12 @@ func (j *Journal) WorkflowTenant(ctx context.Context, workflowID string) (string
 	return tid, nil
 }
 
-// CheckWorkflowEnqueueAllowed verifies the workflow's tenant may accept a new
-// run right now. It returns a *QuotaError if the tenant is disabled, at its
-// max_queued_runs, or at its monthly_run_quota. Unknown tenants and 0 quotas
-// always pass, so single-tenant installs are never gated.
+// CheckWorkflowEnqueueAllowed is the fast, read-only admission projection used
+// before artifact resolution. It returns a *QuotaError if the tenant is
+// disabled, at its max_queued_runs, or at its monthly_run_quota. The enabled
+// run INSERT methods repeat the policy inside a workflow+tenant transaction;
+// callers must not treat this read as the concurrency authority. Unknown
+// tenants and 0 quotas always pass, so single-tenant installs are never gated.
 func (j *Journal) CheckWorkflowEnqueueAllowed(ctx context.Context, workflowID string) error {
 	tenantID, err := j.WorkflowTenant(ctx, workflowID)
 	if err != nil {

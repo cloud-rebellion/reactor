@@ -125,6 +125,30 @@ func TestRetryDeadLetterArtifactAvailabilityFailsBeforeClaimOrSpawn(t *testing.T
 	}
 }
 
+func TestDistributedDeadLetterRetryRequiresWorkerArtifactBeforeQueue(t *testing.T) {
+	ctx := context.Background()
+	d, j, dlqID := dlqFixture(t)
+	d.Enqueue = true
+	checks := 0
+	d.QueueArtifactCheck = func(_ context.Context, slug string, version journal.WorkflowVersion) error {
+		checks++
+		if slug != "billing" || version.Version != 1 || version.ArtifactSHA256 != testArtifactSHA256 {
+			t.Fatalf("worker artifact check received %q %+v", slug, version)
+		}
+		return errors.New("worker artifact missing")
+	}
+	status, err := d.RetryDeadLetter(ctx, dlqID)
+	if status != "" || err == nil || checks != 1 {
+		t.Fatalf("worker artifact refusal = status %q err %v checks %d", status, err, checks)
+	}
+	if run, getErr := j.GetRun(ctx, "run_1"); getErr != nil || run.Status != "failed_dlq" {
+		t.Fatalf("worker artifact refusal consumed DLQ run: %+v, %v", run, getErr)
+	}
+	if _, findErr := j.GetDeadLetterItem(ctx, dlqID); findErr != nil {
+		t.Fatalf("worker artifact refusal removed DLQ item: %v", findErr)
+	}
+}
+
 // TestStartDeadLetterRetryIsSingleFlight pins the double-execution bug: the
 // retry used the unguarded SetRunStatus, so two concurrent clicks both flipped
 // the run to running and both spawned a supervisor against the SAME run id.

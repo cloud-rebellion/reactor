@@ -1,12 +1,14 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -26,19 +28,27 @@ const (
 // Trigger is a row from the triggers table. The webhook fields (TokenID,
 // SecretID, Provider) are populated only for webhook triggers.
 type Trigger struct {
-	ID          string
-	TenantID    string
-	WorkflowID  string
-	Kind        TriggerKind
-	Config      []byte // JSON
-	State       string
-	TokenID     string
-	SecretID    string
-	Provider    string
-	LastFiredAt *time.Time
-	LastError   string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID         string
+	TenantID   string
+	WorkflowID string
+	Kind       TriggerKind
+	Revision   int64
+	Config     []byte // JSON
+	// ConfigBytes is the durable byte length captured by bounded control-plane
+	// reads. It lets callers report a truncated legacy configuration without
+	// materialising the value. Runtime reads leave it equal to len(Config).
+	ConfigBytes int
+	// ConfigTruncated is set when a bounded control-plane read intentionally
+	// omitted config_json because it exceeded the caller's limit.
+	ConfigTruncated bool
+	State           string
+	TokenID         string
+	SecretID        string
+	Provider        string
+	LastFiredAt     *time.Time
+	LastError       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // CreateWebhookTrigger registers a webhook binding. tokenID is the public
@@ -46,13 +56,38 @@ type Trigger struct {
 // generating one via NewTokenID. secretID points at a vault credential
 // holding the HMAC shared secret.
 func (j *Journal) CreateWebhookTrigger(ctx context.Context, workflowID, tokenID, secretID, provider string, config []byte) (string, error) {
-	id, err := newID("trg_")
+	id, _, _, err := j.createWebhookTrigger(ctx, workflowID, tokenID, secretID, provider, config, "")
+	return id, err
+}
+
+// CreateWebhookTriggerWithIdempotency creates or replays a webhook trigger
+// under a tenant/workflow/kind-scoped caller key. A replay returns the
+// original public token so a client that lost its first response can recover
+// the delivery capability it deliberately supplied during creation.
+func (j *Journal) CreateWebhookTriggerWithIdempotency(ctx context.Context, workflowID, tokenID, secretID, provider string, config []byte, key string) (id, token string, replay bool, err error) {
+	return j.createWebhookTrigger(ctx, workflowID, tokenID, secretID, provider, config, key)
+}
+
+func (j *Journal) createWebhookTrigger(ctx context.Context, workflowID, tokenID, secretID, provider string, config []byte, key string) (id, token string, replay bool, err error) {
+	// A webhook trigger is a relation between an owned workflow and an HMAC
+	// secret.  Older rows can predate the tenant guard, so the receiver also
+	// checks this relation immediately before reading the vault.  Reject a
+	// known cross-tenant secret here to keep new control-plane writes from
+	// creating that stale state.  A secret id with no metadata row is retained
+	// for legacy vault-only installations; the runtime fence below still
+	// refuses to serve it until ownership can be established.
+	if err := j.validateWebhookSecretTenant(ctx, workflowID, secretID); err != nil {
+		return "", "", false, err
+	}
+	id, err = newID("trg_")
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	cfg := outputArg(config, j.engine)
+	compareCfg := append([]byte(nil), config...)
 	if cfg == nil {
 		cfg = "{}"
+		compareCfg = []byte("{}")
 		if j.engine != EngineSQLite {
 			cfg = []byte("{}")
 		}
@@ -62,39 +97,98 @@ func (j *Journal) CreateWebhookTrigger(ctx context.Context, workflowID, tokenID,
 	// string, and omitting the column would silently use the schema's "default"
 	// tenant for every non-default workflow.
 	const q = `INSERT INTO triggers
-		(id, tenant_id, workflow_id, kind, config_json, state, token_id, secret_id, provider)
-		SELECT $1, tenant_id, id, 'webhook', $2, 'active', $3, $4, $5
-		FROM workflows WHERE id = $6`
+		(id, tenant_id, workflow_id, kind, config_json, state, token_id, secret_id, provider, idempotency_key)
+		SELECT $1, tenant_id, id, 'webhook', $2, 'active', $3, $4, $5, $6
+		FROM workflows WHERE id = $7
+		ON CONFLICT DO NOTHING`
 	res, err := j.db.ExecContext(ctx, j.bind(q),
-		id, cfg, tokenID, secretID, nullable(provider), workflowID,
+		id, cfg, tokenID, secretID, nullable(provider), nullable(key), workflowID,
 	)
 	if err != nil {
-		return "", fmt.Errorf("journal: create webhook trigger: %w", err)
+		return "", "", false, fmt.Errorf("journal: create webhook trigger: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return "", fmt.Errorf("journal: create webhook trigger rows affected: %w", err)
+		return "", "", false, fmt.Errorf("journal: create webhook trigger rows affected: %w", err)
 	}
-	if n != 1 {
-		return "", ErrNotFound
+	if n == 1 {
+		return id, tokenID, false, nil
 	}
-	return id, nil
+	if key == "" {
+		return "", "", false, ErrNotFound
+	}
+	var existingID, existingToken, existingSecret, existingProvider string
+	var existingCfg []byte
+	row := j.db.QueryRowContext(ctx, j.bind(`SELECT id, token_id, secret_id, provider, config_json FROM triggers WHERE workflow_id = $1 AND kind = 'webhook' AND idempotency_key = $2`), workflowID, key)
+	if err := row.Scan(&existingID, &existingToken, &existingSecret, &existingProvider, &existingCfg); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, ErrNotFound
+		}
+		return "", "", false, fmt.Errorf("journal: read webhook idempotency record: %w", err)
+	}
+	if existingSecret != secretID || existingProvider != provider || !bytes.Equal(bytes.TrimSpace(existingCfg), bytes.TrimSpace(compareCfg)) {
+		return "", "", false, ErrTriggerIdempotencyConflict
+	}
+	return existingID, existingToken, true, nil
+}
+
+// validateWebhookSecretTenant checks the ownership relation for a webhook
+// secret before inserting a trigger. It deliberately maps a known
+// cross-tenant relation to ErrNotFound so a caller cannot turn trigger
+// creation into a credential-tenant oracle. Unknown secret metadata is left
+// to the runtime fence for backwards compatibility with vault-only rows.
+func (j *Journal) validateWebhookSecretTenant(ctx context.Context, workflowID, secretID string) error {
+	var workflowTenant string
+	err := j.db.QueryRowContext(ctx, j.bind(`SELECT tenant_id FROM workflows WHERE id = $1`), workflowID).Scan(&workflowTenant)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("journal: webhook workflow tenant: %w", err)
+	}
+	secretTenant, err := j.SecretTenant(ctx, secretID)
+	if errors.Is(err, ErrNotFound) {
+		// Legacy vault-only credentials have no metadata row. The receiver's
+		// runtime fence fails closed when it cannot resolve ownership.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("journal: webhook secret tenant: %w", err)
+	}
+	if workflowTenant != secretTenant {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // FindWebhookByToken resolves a public token to its trigger row. Returns
 // ErrNotFound if no active webhook trigger exists with that token.
 func (j *Journal) FindWebhookByToken(ctx context.Context, tokenID string) (Trigger, error) {
 	const q = `SELECT id, tenant_id, workflow_id, kind, config_json, state,
-		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at
+		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at, revision
 		FROM triggers WHERE token_id = $1 AND state = 'active' AND kind = 'webhook' LIMIT 1`
 	row := j.db.QueryRowContext(ctx, j.bind(q), tokenID)
 	return j.scanTrigger(row)
 }
 
+// GetActiveWebhookTrigger resolves a webhook by its durable identity and
+// verifies the trigger/workflow tenant relation. Receivers use this at the
+// dispatch boundary after leasing a delivery so a disable or verifier update
+// racing the initial token lookup cannot turn an already-queued request into a
+// run under stale trigger policy.
+func (j *Journal) GetActiveWebhookTrigger(ctx context.Context, id string) (Trigger, error) {
+	const q = `SELECT t.id, t.tenant_id, t.workflow_id, t.kind, t.config_json, t.state,
+		t.token_id, t.secret_id, t.provider, t.last_fired_at, t.last_error,
+		t.created_at, t.updated_at, t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND w.tenant_id = t.tenant_id
+		WHERE t.id = $1 AND t.state = 'active' AND t.kind = 'webhook'`
+	return j.scanTrigger(j.db.QueryRowContext(ctx, j.bind(q), id))
+}
+
 // MarkTriggerFired updates last_fired_at + clears last_error. Called on
 // successful dispatch.
 func (j *Journal) MarkTriggerFired(ctx context.Context, id string) error {
-	const q = `UPDATE triggers SET last_fired_at = $1, last_error = NULL, updated_at = $2 WHERE id = $3`
+	const q = `UPDATE triggers SET last_fired_at = $1, last_error = NULL, updated_at = $2, revision = revision + 1 WHERE id = $3`
 	now := j.now()
 	_, err := j.db.ExecContext(ctx, j.bind(q), now, now, id)
 	return err
@@ -104,10 +198,21 @@ func (j *Journal) MarkTriggerFired(ctx context.Context, id string) error {
 // Used by the cron live-reload + the webhook CLI's enable/disable
 // subcommands so an operator can pause a trigger without deleting it.
 func (j *Journal) SetTriggerState(ctx context.Context, id, state string) error {
-	const q = `UPDATE triggers SET state = $1, updated_at = $2 WHERE id = $3`
-	_, err := j.db.ExecContext(ctx, j.bind(q), state, j.now(), id)
+	// A disabled chain is excluded from cycle checks. Re-enabling it directly
+	// can close a cycle created while it was paused, so every caller must
+	// recreate the edge through CreateChainTrigger instead.
+	const q = `UPDATE triggers SET state = $1, updated_at = $2, revision = revision + 1
+		WHERE id = $3 AND NOT (kind = 'workflow_complete' AND state = 'disabled' AND $4 = 'active')`
+	res, err := j.db.ExecContext(ctx, j.bind(q), state, j.now(), id, state)
 	if err != nil {
 		return fmt.Errorf("journal: set trigger state: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("journal: set trigger state rows affected: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -118,9 +223,31 @@ func (j *Journal) SetTriggerState(ctx context.Context, id, state string) error {
 // prevents a tenant member from pairing their own slug with another tenant's
 // trigger id. A missing or mismatched row is deliberately indistinguishable.
 func (j *Journal) SetTriggerStateForWorkflow(ctx context.Context, id, workflowID, state string) error {
-	const q = `UPDATE triggers SET state = $1, updated_at = $2
-		WHERE id = $3 AND workflow_id = $4`
-	res, err := j.db.ExecContext(ctx, j.bind(q), state, j.now(), id, workflowID)
+	return j.setTriggerStateForWorkflow(ctx, id, workflowID, state, nil)
+}
+
+// SetTriggerStateForWorkflowIfRevision changes a trigger only when its
+// workflow binding and current control-plane revision both match. The check
+// is atomic with the update, so a concurrent runtime or authoring mutation
+// cannot be overwritten by a stale MCP read.
+func (j *Journal) SetTriggerStateForWorkflowIfRevision(ctx context.Context, id, workflowID, state string, expectedRevision int64) error {
+	if expectedRevision < 1 {
+		return fmt.Errorf("journal: trigger revision must be positive")
+	}
+	return j.setTriggerStateForWorkflow(ctx, id, workflowID, state, &expectedRevision)
+}
+
+func (j *Journal) setTriggerStateForWorkflow(ctx context.Context, id, workflowID, state string, expectedRevision *int64) error {
+	q := `UPDATE triggers SET state = $1, updated_at = $2, revision = revision + 1
+		WHERE id = $3 AND workflow_id = $4
+		  AND tenant_id IN (SELECT tenant_id FROM workflows WHERE id = $5)
+		  AND NOT (kind = 'workflow_complete' AND state = 'disabled' AND $6 = 'active')`
+	args := []any{state, j.now(), id, workflowID, workflowID, state}
+	if expectedRevision != nil {
+		q += ` AND revision = $7`
+		args = append(args, *expectedRevision)
+	}
+	res, err := j.db.ExecContext(ctx, j.bind(q), args...)
 	if err != nil {
 		return fmt.Errorf("journal: set trigger state for workflow: %w", err)
 	}
@@ -129,6 +256,9 @@ func (j *Journal) SetTriggerStateForWorkflow(ctx context.Context, id, workflowID
 		return fmt.Errorf("journal: set trigger state for workflow rows affected: %w", err)
 	}
 	if n != 1 {
+		if expectedRevision != nil {
+			return j.triggerRevisionConflictOrNotFound(ctx, id, workflowID, *expectedRevision)
+		}
 		return ErrNotFound
 	}
 	return nil
@@ -137,7 +267,7 @@ func (j *Journal) SetTriggerStateForWorkflow(ctx context.Context, id, workflowID
 // MarkTriggerError stores last_error for dashboard surfacing. Successful
 // later fires clear it via MarkTriggerFired.
 func (j *Journal) MarkTriggerError(ctx context.Context, id, msg string) error {
-	const q = `UPDATE triggers SET last_error = $1, updated_at = $2 WHERE id = $3`
+	const q = `UPDATE triggers SET last_error = $1, updated_at = $2, revision = revision + 1 WHERE id = $3`
 	_, err := j.db.ExecContext(ctx, j.bind(q), msg, j.now(), id)
 	return err
 }
@@ -176,6 +306,15 @@ type WebhookDeliveryClaim struct {
 // owns the row. A retry may have reclaimed an expired lease; token-guarded
 // writes prevent the stale owner from deleting or completing the new claim.
 var ErrWebhookDeliveryClaimLost = errors.New("journal: webhook delivery claim lost")
+
+// ErrTriggerRevisionConflict means an authoring mutation used a revision that
+// is no longer current. Callers should re-read the scoped trigger and retry
+// only after deciding whether the intervening change is still intended.
+var ErrTriggerRevisionConflict = errors.New("journal: trigger revision conflict")
+
+// ErrTriggerIdempotencyConflict means a caller reused a trigger-creation key
+// for different configuration. The original trigger remains authoritative.
+var ErrTriggerIdempotencyConflict = errors.New("journal: trigger idempotency key reused with different configuration")
 
 // ClaimWebhookDelivery leases one verified delivery to exactly one receiver.
 //
@@ -386,9 +525,41 @@ func (j *Journal) DeleteWebhookDelivery(ctx context.Context, triggerID, provider
 // keep using ListCronTriggers.
 func (j *Journal) ListTriggers(ctx context.Context) ([]Trigger, error) {
 	const q = `SELECT id, tenant_id, workflow_id, kind, config_json, state,
-		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at
+		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at, revision
 		FROM triggers ORDER BY created_at DESC`
 	return j.scanTriggers(ctx, q)
+}
+
+// ListTriggersPage returns one bounded page of estate-wide trigger rows.
+// Graph rebuilds use it instead of ListTriggers so one very large tenant does
+// not force the journal driver to materialise every trigger at once.
+func (j *Journal) ListTriggersPage(ctx context.Context, limit, offset int) ([]Trigger, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, fmt.Errorf("journal: list triggers: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, fmt.Errorf("journal: list triggers: negative offset")
+	}
+	q := fmt.Sprintf(`SELECT id, tenant_id, workflow_id, kind, config_json, state,
+		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at, revision
+		FROM triggers ORDER BY created_at DESC, id ASC LIMIT %d OFFSET %d`, limit+1, offset)
+	rows, err := j.db.QueryContext(ctx, j.bind(q))
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list triggers page: %w", err)
+	}
+	defer rows.Close()
+	out, err := scanTriggerRows(rows, j)
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }
 
 // ListTriggersForWorkflow returns every trigger row bound to the given
@@ -396,15 +567,141 @@ func (j *Journal) ListTriggers(ctx context.Context) ([]Trigger, error) {
 // page so an operator can see + manage inbound sources without dropping
 // into SQL.
 func (j *Journal) ListTriggersForWorkflow(ctx context.Context, workflowID string) ([]Trigger, error) {
-	const q = `SELECT id, tenant_id, workflow_id, kind, config_json, state,
-		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at
-		FROM triggers WHERE workflow_id = $1 ORDER BY created_at DESC`
+	// A workflow id is tenant-scoped at the MCP boundary, but old/restored
+	// databases can still contain a trigger row whose tenant marker disagrees
+	// with its workflow. Keep those rows out of workflow-scoped reads so a
+	// stale trigger config or bearer-presence marker cannot cross tenants.
+	const q = `SELECT t.id, t.tenant_id, t.workflow_id, t.kind, t.config_json, t.state,
+		t.token_id, t.secret_id, t.provider, t.last_fired_at, t.last_error, t.created_at, t.updated_at, t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND t.tenant_id = w.tenant_id
+		WHERE t.workflow_id = $1 ORDER BY t.created_at DESC`
 	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
 	if err != nil {
 		return nil, fmt.Errorf("journal: list triggers by workflow: %w", err)
 	}
 	defer rows.Close()
 	return scanTriggerRows(rows, j)
+}
+
+// GetTriggerForWorkflow returns one trigger only when it belongs to the
+// already-authorized workflow. The revision is the opaque optimistic-concurrency
+// token exposed to MCP authoring clients.
+func (j *Journal) GetTriggerForWorkflow(ctx context.Context, id, workflowID string) (Trigger, error) {
+	const q = `SELECT t.id, t.tenant_id, t.workflow_id, t.kind, t.config_json, t.state,
+		t.token_id, t.secret_id, t.provider, t.last_fired_at, t.last_error, t.created_at, t.updated_at, t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND t.tenant_id = w.tenant_id
+		WHERE t.id = $1 AND t.workflow_id = $2`
+	return j.scanTrigger(j.db.QueryRowContext(ctx, j.bind(q), id, workflowID))
+}
+
+// GetTriggerForWorkflowBounded returns a workflow-bound trigger receipt while
+// materialising config_json only when it fits maxConfigBytes. A zero bound
+// omits the configuration entirely but still reports its durable size. Runtime
+// callers that need the verifier or scheduler config should keep using
+// GetTriggerForWorkflow, while MCP control-plane reads should use this method
+// so a restored legacy row cannot allocate an arbitrary JSON blob.
+func (j *Journal) GetTriggerForWorkflowBounded(ctx context.Context, id, workflowID string, maxConfigBytes int) (Trigger, error) {
+	if maxConfigBytes < 0 {
+		return Trigger{}, errors.New("journal: negative trigger config bound")
+	}
+	if maxConfigBytes > 16<<20 {
+		return Trigger{}, errors.New("journal: trigger config bound exceeds 16 MiB")
+	}
+	q := j.boundedTriggerQuery(`WHERE t.id = $1 AND t.workflow_id = $2`, maxConfigBytes)
+	return j.scanBoundedTrigger(j.db.QueryRowContext(ctx, j.bind(q), id, workflowID))
+}
+
+// ListTriggersForWorkflowPage returns one bounded newest-first trigger page
+// with a lookahead flag. The unpaged method remains for dashboard and runtime
+// callers that already own their response budget.
+func (j *Journal) ListTriggersForWorkflowPage(ctx context.Context, workflowID string, limit, offset int) ([]Trigger, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, fmt.Errorf("journal: list triggers by workflow: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, fmt.Errorf("journal: list triggers by workflow: negative offset")
+	}
+	q := fmt.Sprintf(`SELECT t.id, t.tenant_id, t.workflow_id, t.kind, t.config_json, t.state,
+		t.token_id, t.secret_id, t.provider, t.last_fired_at, t.last_error, t.created_at, t.updated_at, t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND t.tenant_id = w.tenant_id
+		WHERE t.workflow_id = $1 ORDER BY t.created_at DESC, t.id ASC LIMIT %d OFFSET %d`, limit+1, offset)
+	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list triggers page: %w", err)
+	}
+	defer rows.Close()
+	out, err := scanTriggerRows(rows, j)
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// ListTriggersForWorkflowPageBounded is the MCP/read-model variant of the
+// trigger inventory. The SQL projection measures config_json and returns NULL
+// for values above maxConfigBytes, so the database driver never materialises a
+// giant or secret-bearing legacy configuration merely to render token/state
+// metadata.
+func (j *Journal) ListTriggersForWorkflowPageBounded(ctx context.Context, workflowID string, limit, offset, maxConfigBytes int) ([]Trigger, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, fmt.Errorf("journal: list bounded triggers by workflow: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, fmt.Errorf("journal: list bounded triggers by workflow: negative offset")
+	}
+	if maxConfigBytes < 0 {
+		return nil, false, errors.New("journal: negative trigger config bound")
+	}
+	if maxConfigBytes > 16<<20 {
+		return nil, false, errors.New("journal: trigger config bound exceeds 16 MiB")
+	}
+	q := j.boundedTriggerQuery(fmt.Sprintf("WHERE t.workflow_id = $1 ORDER BY t.created_at DESC, t.id ASC LIMIT %d OFFSET %d", limit+1, offset), maxConfigBytes)
+	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list bounded triggers page: %w", err)
+	}
+	defer rows.Close()
+	out, err := scanBoundedTriggerRows(rows, j)
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// boundedTriggerQuery returns the canonical trigger columns plus config size
+// and a conditional config value. maxConfigBytes is validated by callers.
+func (j *Journal) boundedTriggerQuery(where string, maxConfigBytes int) string {
+	var sizeExpr, valueExpr string
+	if j.engine == EnginePostgres {
+		sizeExpr = "octet_length(t.config_json::text)"
+		valueExpr = "NULL"
+		if maxConfigBytes > 0 {
+			valueExpr = "CASE WHEN " + sizeExpr + " <= " + strconv.Itoa(maxConfigBytes) + " THEN t.config_json::text ELSE NULL END"
+		}
+	} else {
+		sizeExpr = "length(CAST(t.config_json AS BLOB))"
+		valueExpr = "NULL"
+		if maxConfigBytes > 0 {
+			valueExpr = "CASE WHEN " + sizeExpr + " <= " + strconv.Itoa(maxConfigBytes) + " THEN t.config_json ELSE NULL END"
+		}
+	}
+	return `SELECT t.id, t.tenant_id, t.workflow_id, t.kind, ` + valueExpr + `, ` + sizeExpr + `,
+		t.state, t.token_id, t.secret_id, t.provider, t.last_fired_at, t.last_error, t.created_at, t.updated_at, t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND t.tenant_id = w.tenant_id ` + where
 }
 
 // DeleteTrigger removes a trigger row by id. Returns ErrNotFound when
@@ -427,8 +724,28 @@ func (j *Journal) DeleteTrigger(ctx context.Context, id string) error {
 // already authorized. Keep the unscoped DeleteTrigger for internal compensation
 // and CLI paths that resolve a globally unique trigger id directly.
 func (j *Journal) DeleteTriggerForWorkflow(ctx context.Context, id, workflowID string) error {
-	const q = `DELETE FROM triggers WHERE id = $1 AND workflow_id = $2`
-	res, err := j.db.ExecContext(ctx, j.bind(q), id, workflowID)
+	return j.deleteTriggerForWorkflow(ctx, id, workflowID, nil)
+}
+
+// DeleteTriggerForWorkflowIfRevision permanently removes a trigger only when
+// its workflow binding and current control-plane revision both match.
+func (j *Journal) DeleteTriggerForWorkflowIfRevision(ctx context.Context, id, workflowID string, expectedRevision int64) error {
+	if expectedRevision < 1 {
+		return fmt.Errorf("journal: trigger revision must be positive")
+	}
+	return j.deleteTriggerForWorkflow(ctx, id, workflowID, &expectedRevision)
+}
+
+func (j *Journal) deleteTriggerForWorkflow(ctx context.Context, id, workflowID string, expectedRevision *int64) error {
+	q := `DELETE FROM triggers
+		WHERE id = $1 AND workflow_id = $2
+		  AND tenant_id IN (SELECT tenant_id FROM workflows WHERE id = $3)`
+	args := []any{id, workflowID, workflowID}
+	if expectedRevision != nil {
+		q += ` AND revision = $4`
+		args = append(args, *expectedRevision)
+	}
+	res, err := j.db.ExecContext(ctx, j.bind(q), args...)
 	if err != nil {
 		return fmt.Errorf("journal: delete trigger for workflow: %w", err)
 	}
@@ -437,6 +754,9 @@ func (j *Journal) DeleteTriggerForWorkflow(ctx context.Context, id, workflowID s
 		return fmt.Errorf("journal: delete trigger for workflow rows affected: %w", err)
 	}
 	if n != 1 {
+		if expectedRevision != nil {
+			return j.triggerRevisionConflictOrNotFound(ctx, id, workflowID, *expectedRevision)
+		}
 		return ErrNotFound
 	}
 	return nil
@@ -446,6 +766,33 @@ func (j *Journal) DeleteTriggerForWorkflow(ctx context.Context, id, workflowID s
 // owned by the authorized workflow. The kind predicate prevents a crafted edit
 // request from writing cron-shaped config over a webhook verifier binding.
 func (j *Journal) UpdateCronTriggerConfigForWorkflow(ctx context.Context, id, workflowID string, config []byte) error {
+	return j.updateCronTriggerConfigForWorkflow(ctx, id, workflowID, config, nil)
+}
+
+// UpdateCronTriggerConfigForWorkflowIfRevision replaces a cron config only
+// when the caller's workflow binding and trigger revision are still current.
+func (j *Journal) UpdateCronTriggerConfigForWorkflowIfRevision(ctx context.Context, id, workflowID string, config []byte, expectedRevision int64) error {
+	if expectedRevision < 1 {
+		return fmt.Errorf("journal: trigger revision must be positive")
+	}
+	return j.updateCronTriggerConfigForWorkflow(ctx, id, workflowID, config, &expectedRevision)
+}
+
+// UpdateWebhookTriggerForWorkflowIfRevision changes a webhook's credential,
+// provider, and verifier options without changing its public bearer token.
+// The workflow binding, webhook kind, tenant relation, and optimistic
+// concurrency revision are all part of one conditional update, so an agent
+// cannot rebind a live endpoint from a stale trigger inventory read.
+func (j *Journal) UpdateWebhookTriggerForWorkflowIfRevision(ctx context.Context, id, workflowID, secretID, provider string, config []byte, expectedRevision int64) error {
+	if expectedRevision < 1 {
+		return fmt.Errorf("journal: trigger revision must be positive")
+	}
+	if id == "" || workflowID == "" || secretID == "" {
+		return ErrNotFound
+	}
+	if err := j.validateWebhookSecretTenant(ctx, workflowID, secretID); err != nil {
+		return err
+	}
 	cfg := outputArg(config, j.engine)
 	if cfg == nil {
 		cfg = "{}"
@@ -453,9 +800,42 @@ func (j *Journal) UpdateCronTriggerConfigForWorkflow(ctx context.Context, id, wo
 			cfg = []byte("{}")
 		}
 	}
-	const q = `UPDATE triggers SET config_json = $1, updated_at = $2
-		WHERE id = $3 AND workflow_id = $4 AND kind = 'cron'`
-	res, err := j.db.ExecContext(ctx, j.bind(q), cfg, j.now(), id, workflowID)
+	const q = `UPDATE triggers SET secret_id = $1, provider = $2, config_json = $3,
+		updated_at = $4, revision = revision + 1
+		WHERE id = $5 AND workflow_id = $6 AND kind = 'webhook'
+		  AND tenant_id IN (SELECT tenant_id FROM workflows WHERE id = $7)
+		  AND revision = $8`
+	res, err := j.db.ExecContext(ctx, j.bind(q), secretID, nullable(provider), cfg, j.now(), id, workflowID, workflowID, expectedRevision)
+	if err != nil {
+		return fmt.Errorf("journal: update webhook trigger for workflow: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("journal: update webhook trigger for workflow rows affected: %w", err)
+	}
+	if n != 1 {
+		return j.triggerRevisionConflictOrNotFound(ctx, id, workflowID, expectedRevision)
+	}
+	return nil
+}
+
+func (j *Journal) updateCronTriggerConfigForWorkflow(ctx context.Context, id, workflowID string, config []byte, expectedRevision *int64) error {
+	cfg := outputArg(config, j.engine)
+	if cfg == nil {
+		cfg = "{}"
+		if j.engine != EngineSQLite {
+			cfg = []byte("{}")
+		}
+	}
+	q := `UPDATE triggers SET config_json = $1, updated_at = $2, revision = revision + 1
+		WHERE id = $3 AND workflow_id = $4 AND kind = 'cron'
+		  AND tenant_id IN (SELECT tenant_id FROM workflows WHERE id = $5)`
+	args := []any{cfg, j.now(), id, workflowID, workflowID}
+	if expectedRevision != nil {
+		q += ` AND revision = $6`
+		args = append(args, *expectedRevision)
+	}
+	res, err := j.db.ExecContext(ctx, j.bind(q), args...)
 	if err != nil {
 		return fmt.Errorf("journal: update cron trigger config for workflow: %w", err)
 	}
@@ -464,9 +844,26 @@ func (j *Journal) UpdateCronTriggerConfigForWorkflow(ctx context.Context, id, wo
 		return fmt.Errorf("journal: update cron trigger config for workflow rows affected: %w", err)
 	}
 	if n != 1 {
+		if expectedRevision != nil {
+			return j.triggerRevisionConflictOrNotFound(ctx, id, workflowID, *expectedRevision)
+		}
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (j *Journal) triggerRevisionConflictOrNotFound(ctx context.Context, id, workflowID string, expectedRevision int64) error {
+	var current int64
+	const q = `SELECT t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND t.tenant_id = w.tenant_id
+		WHERE t.id = $1 AND t.workflow_id = $2`
+	if err := j.db.QueryRowContext(ctx, j.bind(q), id, workflowID).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("journal: read trigger revision after conflict: %w", err)
+	}
+	return fmt.Errorf("%w: expected %d, current %d", ErrTriggerRevisionConflict, expectedRevision, current)
 }
 
 // ListCronTriggers returns every active cron trigger. Used by the cron
@@ -474,9 +871,24 @@ func (j *Journal) UpdateCronTriggerConfigForWorkflow(ctx context.Context, id, wo
 // reload (week 9 wires LISTEN/NOTIFY for live reload on Postgres).
 func (j *Journal) ListCronTriggers(ctx context.Context) ([]Trigger, error) {
 	const q = `SELECT id, tenant_id, workflow_id, kind, config_json, state,
-		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at
+		token_id, secret_id, provider, last_fired_at, last_error, created_at, updated_at, revision
 		FROM triggers WHERE kind = 'cron' AND state = 'active'`
 	return j.scanTriggers(ctx, q)
+}
+
+// GetActiveCronTrigger resolves the authoritative row immediately before a
+// cron callback is dispatched. The in-process cron clock keeps a small cached
+// trigger snapshot between reconciles; looking it up again closes the window
+// where an operator disables or rewires a trigger after the clock selected its
+// old entry but before the reload loop removed that entry. The workflow join
+// also rejects imported rows whose trigger tenant no longer matches its owner.
+func (j *Journal) GetActiveCronTrigger(ctx context.Context, id string) (Trigger, error) {
+	const q = `SELECT t.id, t.tenant_id, t.workflow_id, t.kind, t.config_json, t.state,
+		t.token_id, t.secret_id, t.provider, t.last_fired_at, t.last_error,
+		t.created_at, t.updated_at, t.revision
+		FROM triggers t JOIN workflows w ON w.id = t.workflow_id AND w.tenant_id = t.tenant_id
+		WHERE t.id = $1 AND t.kind = 'cron' AND t.state = 'active'`
+	return j.scanTrigger(j.db.QueryRowContext(ctx, j.bind(q), id))
 }
 
 // scanTriggers is the shared body for ListTriggers + ListCronTriggers.
@@ -492,7 +904,7 @@ func (j *Journal) scanTriggers(ctx context.Context, q string) ([]Trigger, error)
 }
 
 // scanTriggerRows materialises Trigger structs from a *sql.Rows that
-// returns the canonical 13-column SELECT in the order ListTriggers uses.
+// returns the canonical 14-column SELECT in the order ListTriggers uses.
 // Shared between ListTriggers / ListCronTriggers / ListTriggersForWorkflow.
 func scanTriggerRows(rows *sql.Rows, j *Journal) ([]Trigger, error) {
 	var out []Trigger
@@ -511,7 +923,7 @@ func scanTriggerRows(rows *sql.Rows, j *Journal) ([]Trigger, error) {
 			updatedAt sql.NullString
 		)
 		if err := rows.Scan(&t.ID, &tenantID, &t.WorkflowID, &kind, &cfg, &t.State,
-			&tokenID, &secretID, &provider, &lastFired, &lastErr, &createdAt, &updatedAt); err != nil {
+			&tokenID, &secretID, &provider, &lastFired, &lastErr, &createdAt, &updatedAt, &t.Revision); err != nil {
 			return nil, fmt.Errorf("journal: scan trigger: %w", err)
 		}
 		t.TenantID = nullableString(tenantID)
@@ -541,35 +953,135 @@ func scanTriggerRows(rows *sql.Rows, j *Journal) ([]Trigger, error) {
 	return out, rows.Err()
 }
 
+func scanBoundedTriggerRows(rows *sql.Rows, j *Journal) ([]Trigger, error) {
+	var out []Trigger
+	for rows.Next() {
+		trigger, err := scanBoundedTriggerRow(rows, j)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, trigger)
+	}
+	return out, rows.Err()
+}
+
+type triggerRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func (j *Journal) scanBoundedTrigger(row triggerRowScanner) (Trigger, error) {
+	var (
+		t         Trigger
+		tenantID  sql.NullString
+		kind      string
+		cfg       []byte
+		cfgBytes  sql.NullInt64
+		tokenID   sql.NullString
+		secretID  sql.NullString
+		provider  sql.NullString
+		lastFired sql.NullString
+		lastErr   sql.NullString
+		createdAt sql.NullString
+		updatedAt sql.NullString
+	)
+	if err := row.Scan(&t.ID, &tenantID, &t.WorkflowID, &kind, &cfg, &cfgBytes, &t.State,
+		&tokenID, &secretID, &provider, &lastFired, &lastErr, &createdAt, &updatedAt, &t.Revision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Trigger{}, ErrNotFound
+		}
+		return Trigger{}, fmt.Errorf("journal: scan bounded trigger: %w", err)
+	}
+	t.TenantID = nullableString(tenantID)
+	t.Kind = TriggerKind(kind)
+	t.Config = cfg
+	if cfgBytes.Valid && cfgBytes.Int64 >= 0 {
+		t.ConfigBytes = int(cfgBytes.Int64)
+	}
+	t.ConfigTruncated = t.ConfigBytes > len(t.Config)
+	t.TokenID = nullableString(tokenID)
+	t.SecretID = nullableString(secretID)
+	t.Provider = nullableString(provider)
+	if lastFired.Valid {
+		if ts, err := j.parseTime(lastFired.String); err == nil {
+			t.LastFiredAt = &ts
+		}
+	}
+	t.LastError = nullableString(lastErr)
+	if createdAt.Valid {
+		if ts, err := j.parseTime(createdAt.String); err == nil {
+			t.CreatedAt = ts
+		}
+	}
+	if updatedAt.Valid {
+		if ts, err := j.parseTime(updatedAt.String); err == nil {
+			t.UpdatedAt = ts
+		}
+	}
+	return t, nil
+}
+
+func scanBoundedTriggerRow(row triggerRowScanner, j *Journal) (Trigger, error) {
+	return j.scanBoundedTrigger(row)
+}
+
 // CreateCronTrigger registers a cron-kind trigger. config is the JSON for
 // {spec, timezone} that the cron driver reads at startup.
 func (j *Journal) CreateCronTrigger(ctx context.Context, workflowID string, config []byte) (string, error) {
-	id, err := newID("trg_")
+	id, _, err := j.createCronTrigger(ctx, workflowID, config, "")
+	return id, err
+}
+
+// CreateCronTriggerWithIdempotency creates or replays a cron trigger under a
+// tenant/workflow/kind-scoped caller key.
+func (j *Journal) CreateCronTriggerWithIdempotency(ctx context.Context, workflowID string, config []byte, key string) (id string, replay bool, err error) {
+	return j.createCronTrigger(ctx, workflowID, config, key)
+}
+
+func (j *Journal) createCronTrigger(ctx context.Context, workflowID string, config []byte, key string) (id string, replay bool, err error) {
+	id, err = newID("trg_")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	cfg := outputArg(config, j.engine)
+	compareCfg := append([]byte(nil), config...)
 	if cfg == nil {
 		cfg = "{}"
+		compareCfg = []byte("{}")
 		if j.engine != EngineSQLite {
 			cfg = []byte("{}")
 		}
 	}
-	const q = `INSERT INTO triggers (id, tenant_id, workflow_id, kind, config_json, state)
-		SELECT $1, tenant_id, id, 'cron', $2, 'active'
-		FROM workflows WHERE id = $3`
-	res, err := j.db.ExecContext(ctx, j.bind(q), id, cfg, workflowID)
+	const q = `INSERT INTO triggers (id, tenant_id, workflow_id, kind, config_json, state, idempotency_key)
+		SELECT $1, tenant_id, id, 'cron', $2, 'active', $3
+		FROM workflows WHERE id = $4
+		ON CONFLICT DO NOTHING`
+	res, err := j.db.ExecContext(ctx, j.bind(q), id, cfg, nullable(key), workflowID)
 	if err != nil {
-		return "", fmt.Errorf("journal: create cron trigger: %w", err)
+		return "", false, fmt.Errorf("journal: create cron trigger: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return "", fmt.Errorf("journal: create cron trigger rows affected: %w", err)
+		return "", false, fmt.Errorf("journal: create cron trigger rows affected: %w", err)
 	}
-	if n != 1 {
-		return "", ErrNotFound
+	if n == 1 {
+		return id, false, nil
 	}
-	return id, nil
+	if key == "" {
+		return "", false, ErrNotFound
+	}
+	var existingID string
+	var existingCfg []byte
+	row := j.db.QueryRowContext(ctx, j.bind(`SELECT id, config_json FROM triggers WHERE workflow_id = $1 AND kind = 'cron' AND idempotency_key = $2`), workflowID, key)
+	if err := row.Scan(&existingID, &existingCfg); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, ErrNotFound
+		}
+		return "", false, fmt.Errorf("journal: read cron idempotency record: %w", err)
+	}
+	if !bytes.Equal(bytes.TrimSpace(existingCfg), bytes.TrimSpace(compareCfg)) {
+		return "", false, ErrTriggerIdempotencyConflict
+	}
+	return existingID, true, nil
 }
 
 // PurgeOldWebhookDeliveries trims rows older than retain. Run periodically
@@ -611,7 +1123,7 @@ func (j *Journal) scanTrigger(row *sql.Row) (Trigger, error) {
 		updatedAt sql.NullString
 	)
 	if err := row.Scan(&t.ID, &tenantID, &t.WorkflowID, &kind, &cfg, &t.State,
-		&tokenID, &secretID, &provider, &lastFired, &lastErr, &createdAt, &updatedAt); err != nil {
+		&tokenID, &secretID, &provider, &lastFired, &lastErr, &createdAt, &updatedAt, &t.Revision); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Trigger{}, ErrNotFound
 		}

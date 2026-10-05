@@ -1,12 +1,45 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 )
+
+func TestListNotificationChannelMetadataPageIsBoundedAndConfigFree(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.EnablePayloadEncryption(ctx, bytes.Repeat([]byte{0x72}, 32), nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ tenant, name string }{
+		{"acme", "alpha"}, {"globex", "bravo"}, {"acme", "charlie"},
+	} {
+		if _, err := j.CreateNotificationChannelInTenant(ctx, row.tenant, row.name, ChannelKindGenericWebhook, json.RawMessage(`{"url":"https://example.invalid/hook"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unkeyed := New(j.db, EngineSQLite)
+	if _, err := unkeyed.ListNotificationChannels(ctx); err == nil {
+		t.Fatal("full channel read unexpectedly succeeded without payload key")
+	}
+	first, more, err := unkeyed.ListNotificationChannelMetadataPage(ctx, 2, 0)
+	if err != nil || !more || len(first) != 2 || first[0].Name != "alpha" || first[1].Name != "bravo" {
+		t.Fatalf("first metadata page = %+v more=%v err=%v", first, more, err)
+	}
+	last, more, err := unkeyed.ListNotificationChannelMetadataPage(ctx, 2, 2)
+	if err != nil || more || len(last) != 1 || last[0].Name != "charlie" {
+		t.Fatalf("last metadata page = %+v more=%v err=%v", last, more, err)
+	}
+	if _, _, err := unkeyed.ListNotificationChannelMetadataPage(ctx, 501, 0); err == nil {
+		t.Fatal("oversized metadata page accepted")
+	}
+}
 
 func TestCreateNotificationChannelRejectsBadKind(t *testing.T) {
 	t.Parallel()
@@ -40,6 +73,95 @@ func TestCreateNotificationChannelRoundTrip(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].ID != id {
 		t.Fatalf("list = %+v", list)
+	}
+}
+
+func TestListNotificationChannelMetadataPageDoesNotMaterializeConfig(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	secret := strings.Repeat("s", 2<<20)
+	id, err := j.CreateNotificationChannelInTenant(ctx, "acme", "oversized", ChannelKindGenericWebhook,
+		json.RawMessage(`{"url":"https://example.invalid","auth_header":"`+secret+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, hasMore, err := j.ListNotificationChannelMetadataByTenantPage(ctx, "acme", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMore || len(page) != 1 {
+		t.Fatalf("metadata page = %+v has_more=%v", page, hasMore)
+	}
+	if page[0].ID != id || page[0].TenantID != "acme" || page[0].Name != "oversized" || page[0].Kind != ChannelKindGenericWebhook {
+		t.Fatalf("metadata row = %+v", page[0])
+	}
+	encoded, err := json.Marshal(page[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "auth_header") || strings.Contains(string(encoded), secret) {
+		t.Fatalf("metadata projection leaked config: %s", encoded)
+	}
+}
+
+func TestGetNotificationChannelMetadataForTenantDoesNotMaterializeConfig(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	secret := strings.Repeat("s", 4<<20)
+	id, err := j.CreateNotificationChannelInTenant(ctx, "acme", "oversized-exact", ChannelKindGenericWebhook,
+		json.RawMessage(`{"url":"https://example.invalid","auth_header":"`+secret+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := j.GetNotificationChannelMetadataForTenant(ctx, id, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.ID != id || metadata.TenantID != "acme" || metadata.Name != "oversized-exact" {
+		t.Fatalf("metadata = %+v", metadata)
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "auth_header") || strings.Contains(string(encoded), secret) {
+		t.Fatalf("metadata projection leaked config: %s", encoded)
+	}
+	if _, err := j.GetNotificationChannelMetadataForTenant(ctx, id, "globex"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign tenant lookup = %v, want ErrNotFound", err)
+	}
+}
+
+func TestListNotificationRoutesPageBoundedText(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_bounded_routes", "bounded-routes", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	name := strings.Repeat("n", 8192)
+	id, err := j.CreateNotificationChannelInTenant(ctx, "acme", name, ChannelKindGenericWebhook, json.RawMessage(`{"url":"https://example.invalid"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.AddNotificationRoute(ctx, "wf_bounded_routes", id, "failed"); err != nil {
+		t.Fatal(err)
+	}
+	statuses := strings.Repeat("x", 4096)
+	if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE workflow_notification_routes SET on_statuses = $1 WHERE workflow_id = $2 AND channel_id = $3`), statuses, "wf_bounded_routes", id); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := j.ListNotificationRoutesForWorkflowPageBounded(ctx, "wf_bounded_routes", 10, 0, 128, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 || !routes[0].ChannelNameTruncated || routes[0].ChannelNameBytes <= 128 || len([]byte(routes[0].ChannelName)) > 128 || !routes[0].OnStatusesTruncated || routes[0].OnStatusesBytes <= 256 || len([]byte(routes[0].OnStatuses)) > 256 {
+		t.Fatalf("bounded route = %+v", routes)
 	}
 }
 
@@ -105,6 +227,44 @@ func TestChannelsForRunTerminalFilters(t *testing.T) {
 	got, _ = j.ChannelsForRunTerminal(ctx, "wf_other", "failed")
 	if len(got) != 0 {
 		t.Fatalf("other workflow: %+v", got)
+	}
+}
+
+func TestNotificationRouteReadsFenceLegacyCrossTenantRows(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := j.CreateWorkflowInTenant(ctx, "wf_acme", "acme-flow", "h", "0.1.0", json.RawMessage(`{}`), "acme"); err != nil {
+		t.Fatal(err)
+	}
+	channelID, err := j.CreateNotificationChannelInTenant(ctx, "globex", "globex-ops", ChannelKindGenericWebhook, json.RawMessage(`{"url":"https://globex.example/hook"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a relation written before the tenant guard existed (or restored
+	// from a legacy database). New writes reject this topology, but reads and
+	// terminal delivery must still fail closed if one remains.
+	if _, err := j.db.ExecContext(ctx, j.bind(`INSERT INTO workflow_notification_routes (workflow_id, channel_id, on_statuses) VALUES ($1, $2, $3)`), "wf_acme", channelID, "failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	if routes, err := j.ListNotificationRoutesForWorkflow(ctx, "wf_acme"); err != nil {
+		t.Fatal(err)
+	} else if len(routes) != 0 {
+		t.Fatalf("cross-tenant route leaked through unpaged read: %+v", routes)
+	}
+	if routes, err := j.ListNotificationRoutesForWorkflowPage(ctx, "wf_acme", 10, 0); err != nil {
+		t.Fatal(err)
+	} else if len(routes) != 0 {
+		t.Fatalf("cross-tenant route leaked through paged read: %+v", routes)
+	}
+	if channels, err := j.ChannelsForRunTerminal(ctx, "wf_acme", "failed"); err != nil {
+		t.Fatal(err)
+	} else if len(channels) != 0 {
+		t.Fatalf("cross-tenant channel reached terminal notifier: %+v", channels)
 	}
 }
 

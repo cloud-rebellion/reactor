@@ -350,8 +350,12 @@ func deliverGitHubSecret(ctx context.Context, target credentials.Target, newValu
 		res.Error = "get public key: " + err.Error()
 		return res
 	}
-	pubKeyBody, _ := io.ReadAll(io.LimitReader(pubKeyResp.Body, 16<<10))
+	pubKeyBody, readErr := readBoundedProviderResponse(pubKeyResp.Body, 16<<10)
 	pubKeyResp.Body.Close()
+	if readErr != nil {
+		res.Error = "read public key: " + readErr.Error()
+		return res
+	}
 	if pubKeyResp.StatusCode < 200 || pubKeyResp.StatusCode >= 300 {
 		res.Status = pubKeyResp.StatusCode
 		res.Error = fmt.Sprintf("get public key: HTTP %d", pubKeyResp.StatusCode)

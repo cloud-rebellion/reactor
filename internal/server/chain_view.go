@@ -22,8 +22,16 @@ func renderDownstreamChainSection(rows []journal.ChainTriggerView) string {
 	b.WriteString(`<p class="muted">These workflows dispatch automatically whenever this workflow terminates with one of the listed statuses. The downstream workflow receives a payload carrying <code>source_run_id</code>, <code>source_status</code>, <code>source_workflow_slug</code>, and (for failures) <code>source_error_text</code>.</p>`)
 	b.WriteString(`<table><thead><tr><th>Downstream workflow</th><th>Fires on</th></tr></thead><tbody>`)
 	for _, r := range rows {
-		fmt.Fprintf(&b, `<tr><td><a href="/workflows/%s"><code>%s</code></a></td><td><code>%s</code></td></tr>`,
-			template.URLQueryEscaper(r.DownstreamSlug),
+		// Slugs are tenant-scoped. Carry the owner tenant in the link so a
+		// global admin opening a chain cannot land on a same-slug workflow
+		// belonging to another tenant. Members ignore the query selector because
+		// their authenticated tenant scope always wins in workflowIDForViewer.
+		href := "/workflows/" + template.URLQueryEscaper(r.DownstreamSlug)
+		if r.DownstreamTenantID != "" {
+			href += "?tenant=" + template.URLQueryEscaper(r.DownstreamTenantID)
+		}
+		fmt.Fprintf(&b, `<tr><td><a href="%s"><code>%s</code></a></td><td><code>%s</code></td></tr>`,
+			href,
 			template.HTMLEscapeString(r.DownstreamSlug),
 			template.HTMLEscapeString(r.OnStatuses),
 		)

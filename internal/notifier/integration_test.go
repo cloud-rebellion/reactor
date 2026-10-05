@@ -65,7 +65,7 @@ func TestDispatcherTerminalEventReachesNotifier(t *testing.T) {
 		WorkflowSlug: "demo",
 		Status:       "failed_dlq",
 		TriggerKind:  "webhook",
-		ErrorText:    "step 'charge_card' returned 500",
+		ErrorText:    "credential-canary",
 	})
 
 	if got := hits.Load(); got != 1 {
@@ -75,12 +75,14 @@ func TestDispatcherTerminalEventReachesNotifier(t *testing.T) {
 		`"status":"failed_dlq"`,
 		`"workflow_slug":"demo"`,
 		`"run_id":"run_xyz"`,
-		`charge_card`,
 		`https://reactor.example.com/runs/run_xyz`,
 	} {
 		if !strings.Contains(lastBody, want) {
 			t.Fatalf("missing %q in receiver body\n--- body ---\n%s", want, lastBody)
 		}
+	}
+	if strings.Contains(lastBody, "credential-canary") || strings.Contains(lastBody, `"error_text"`) {
+		t.Fatal("raw step error escaped from terminal event into webhook HTTP payload")
 	}
 }
 

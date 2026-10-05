@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -164,12 +165,87 @@ func TestScheduleSignalAndFire(t *testing.T) {
 	}
 }
 
+func TestFireSignalForTenantRefusesForeignSchedule(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflowInTenant(ctx, "wf_signal_other", "signal-other", "h", "0.1.0", json.RawMessage(`{}`), "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateRun(ctx, "run_signal_other", "wf_signal_other", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.ScheduleSignal(ctx, "run_signal_other", "approval", "approval", "sig_tenant_bound", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := j.FireSignalForTenant(ctx, "tenant-a", "sig_tenant_bound", []byte(`{"approved":true}`)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign tenant signal error = %v, want ErrNotFound", err)
+	}
+	before, err := j.FindLatestSignalSchedule(ctx, "run_signal_other", "approval")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.SignalPayload) != 0 {
+		t.Fatalf("foreign delivery mutated payload: %s", before.SignalPayload)
+	}
+	runID, name, err := j.FireSignalForTenant(ctx, "tenant-b", "sig_tenant_bound", []byte(`{"approved":true}`))
+	if err != nil || runID != "run_signal_other" || name != "approval" {
+		t.Fatalf("same-tenant signal = run=%q name=%q err=%v", runID, name, err)
+	}
+}
+
 func TestFireSignalUnknownToken(t *testing.T) {
 	t.Parallel()
 	j, cleanup := newTestJournal(t)
 	defer cleanup()
 	if _, _, err := j.FireSignal(context.Background(), "sig_unknown", nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+func TestFireSignalRejectsExpiredSchedule(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := j.ScheduleSignal(ctx, "run_1", "approval", "approval", "sig_expired", time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := j.FireSignal(ctx, "sig_expired", []byte(`{"approved":true}`)); !errors.Is(err, ErrSignalExpired) {
+		t.Fatalf("expired signal error = %v, want ErrSignalExpired", err)
+	}
+	schedule, err := j.FindLatestSignalSchedule(ctx, "run_1", "approval")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.Fired || len(schedule.SignalPayload) != 0 {
+		t.Fatalf("expired delivery mutated schedule: %+v", schedule)
+	}
+}
+
+func TestFireSignalRejectsAlreadyFiredScheduleBeforePayload(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := j.ScheduleSignal(ctx, "run_1", "approval", "approval", "sig_fired", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.FireSchedule(ctx, "sched_missing"); err == nil {
+		t.Fatal("missing schedule unexpectedly fired")
+	}
+	// Resolve the generated id so this test models the scheduler's durable
+	// fired claim without depending on an in-memory token.
+	schedule, err := j.FindLatestSignalSchedule(ctx, "run_1", "approval")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.FireSchedule(ctx, schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := j.FireSignal(ctx, "sig_fired", []byte(`{"approved":true}`)); !errors.Is(err, ErrAlreadyFired) {
+		t.Fatalf("fired schedule error = %v, want ErrAlreadyFired", err)
 	}
 }
 

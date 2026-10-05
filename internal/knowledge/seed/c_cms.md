@@ -28,21 +28,29 @@ _, err := reactor.Step(flow, ctx, "create-post", reactor.StepOpts{
     IdempotencyKey: "wp-post:" + in.Slug, Timeout: 30 * time.Second,
 }, func(ctx context.Context) (map[string]any, error) {
     creds := string(vault.MustGet("wordpress-key").Reveal()) // "user:app-password"
-    req, _ := http.NewRequestWithContext(ctx, "POST",
-        "https://your-site/wp-json/wp/v2/posts", body)
-    req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
-    req.Header.Set("Content-Type", "application/json")
-    // ... use ahttp.Client{}.Do(req), decode the response
+    c := &ahttp.Client{
+        CredentialOrigin: "https://your-reviewed-site.example", // operator-owned configuration
+        Headers: map[string]string{
+            "Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(creds)),
+        },
+    }
+    var out map[string]any
+    if err := c.PostJSON(ctx, "https://your-reviewed-site.example/wp-json/wp/v2/posts", body, &out); err != nil {
+        return nil, err
+    }
+    return out, nil
 })
 ```
 
 ## Bearer-token CMSes (Webflow, Contentful, Sanity, Strapi, DatoCMS)
 
-Plain `&ahttp.Client{Bearer: string(vault.MustGet("<key-name>").Reveal())}`, then
-`PostJSON` / `Do`. Notes:
-- **Contentful**: create is a `PUT` to an entry id with header
+Use `&ahttp.Client{Bearer: string(vault.MustGet("<key-name>").Reveal()), CredentialOrigin: "https://<reviewed-provider-host>"}`, then
+`PostJSON`, `PutJSON`, `PatchJSON`, or `Delete` according to the documented
+provider operation. Notes:
+- **Contentful**: create uses `PutJSON` to an entry id with header
   `X-Contentful-Content-Type`; new entries are drafts, publish with a second
-  `PUT .../published` carrying `X-Contentful-Version`.
+  PUT to `.../published` carrying `X-Contentful-Version`; use `Put` if the
+  documented operation expects an empty request body.
 - **DatoCMS** also needs header `X-Api-Version: 3`.
 
 ## Other auth shapes
@@ -60,6 +68,7 @@ Plain `&ahttp.Client{Bearer: string(vault.MustGet("<key-name>").Reveal())}`, the
   `IdempotencyKey` (see [[i_step-keys]]); a key derived from the post slug is the
   canonical shape.
 - Base hosts are often site- or project-specific (WordPress, Sanity, Strapi,
-  Drupal, Ghost). Take them from the workflow input or a second vault value, not
-  a hardcoded guess. Confirm details against the docs link in the Environment.
+  Drupal, Ghost). Take each exact origin from reviewed operator configuration,
+  not from workflow input or an upstream response. Pin the same origin on the
+  SDK client. Confirm details against the docs link in the Environment.
 - See [[c_generic-api]] for the general auth-shape patterns.

@@ -43,6 +43,21 @@ type Runner struct {
 	stop chan struct{}
 }
 
+// RotateOneWithLocalMintAck is the explicit acknowledgement path for a
+// provider that generates a replacement value inside Reactor. It is intended
+// for an operator-triggered rotation (dashboard or CLI). Scheduled rotations
+// use the durable acknowledgement recorded on the credential at creation;
+// they never get an implicit approval merely because auto_rotate is enabled.
+//
+// Keep RotateOne as the compatibility entry point for roll-at-source and
+// reminder-only providers. A local minter is accepted there only when its
+// credential carries LocalMintAcknowledgementKey, which is what makes a
+// scheduler restart safe and prevents a forgotten UI checkbox from becoming a
+// destructive rotation.
+func (r *Runner) RotateOneWithLocalMintAck(ctx context.Context, credentialID string, acknowledged bool) error {
+	return r.rotateOne(ctx, credentialID, acknowledged)
+}
+
 // Run blocks, ticking the runner at TickInterval until ctx is cancelled
 // or Stop is called.
 func (r *Runner) Run(ctx context.Context) error {
@@ -149,6 +164,22 @@ func (r *Runner) ProviderCapabilities(provider string) (canAutoRotate, mintsValu
 // On any error: stamp last_rotation_error and audit a failure row,
 // return the error to the caller.
 func (r *Runner) RotateOne(ctx context.Context, credentialID string) error {
+	return r.rotateOne(ctx, credentialID, false)
+}
+
+// Initialize prepares the runner's defaults and stop channel before Run is
+// launched in a daemon goroutine. The serve lifecycle calls this synchronously
+// so an immediate shutdown cannot race Run's lazy stop-channel initialization.
+// Run remains safe for existing callers that do not need an explicit startup
+// fence.
+func (r *Runner) Initialize() {
+	if r == nil {
+		return
+	}
+	r.applyDefaults()
+}
+
+func (r *Runner) rotateOne(ctx context.Context, credentialID string, explicitLocalMintAck bool) error {
 	r.applyDefaults()
 	cred, err := r.Repo.Get(ctx, credentialID)
 	if err != nil {
@@ -171,6 +202,11 @@ func (r *Runner) RotateOne(ctx context.Context, credentialID string) error {
 			Detail:       jsonObject("provider", provider.Name()),
 		})
 		return nil
+	}
+	if MintsValueLocally(provider) && !explicitLocalMintAck && !credentials.LocalMintAcknowledged(cred.ProviderMeta) {
+		err := errors.New("local-mint provider requires explicit acknowledgement before replacing the stored credential value")
+		_ = r.recordError(ctx, credentialID, "local_mint_ack_required", err)
+		return fmt.Errorf("provider %q: %w", provider.Name(), err)
 	}
 
 	_ = r.Repo.AppendAudit(ctx, credentials.AuditEntry{

@@ -82,8 +82,9 @@ func oauthProvidersBody(list []oauth.Provider, redirectURI, errMsg string) strin
 		b.WriteString(`<div class="err" style="background:#fff;border:1px solid var(--err);padding:12px 16px;margin:0 0 16px;border-radius:3px;">` +
 			template.HTMLEscapeString(errMsg) + `</div>`)
 	}
-	fmt.Fprintf(&b, `<p class="muted">Register your OAuth app per provider. Set the provider's redirect/callback URL to <code>%s</code>. Client secrets are encrypted at rest and never shown back. Only enabled providers appear on the Connections page.</p>`,
+	fmt.Fprintf(&b, `<p class="muted">Register your OAuth app per provider. Set the provider's redirect/callback URL to <code>%s</code>. Client secrets are encrypted at rest and never shown back. Disabling a provider blocks new consent, token release, and brokered requests for its existing connections.</p>`,
 		template.HTMLEscapeString(redirectURI))
+	b.WriteString(`<p><a href="/oauth-broker-policies">Review connection API policies</a></p>`)
 
 	if len(list) > 0 {
 		b.WriteString(`<table><thead><tr><th>Provider</th><th>Client id</th><th>Secret</th><th>Scopes</th><th>Status</th><th></th></tr></thead><tbody>`)
@@ -132,7 +133,7 @@ func oauthProvidersBody(list []oauth.Provider, redirectURI, errMsg string) strin
   <label>Client id <input type="text" name="client_id" autocomplete="off"></label>
   <label>Client secret (leave blank to keep current) <input type="password" name="client_secret" autocomplete="new-password"></label>
   <label>Scopes (space-separated) <input type="text" name="scopes" autocomplete="off" placeholder="https://www.googleapis.com/auth/gmail.send"></label>
-  <label class="form-inline"><input type="checkbox" name="enabled"> Enabled (show on the Connections page)</label>
+  <label class="form-inline"><input type="checkbox" name="enabled"> Enabled (allow connections and runtime use)</label>
   <button type="submit" class="btn-primary">Save provider</button>
 </form>`)
 	b.WriteString(`<script src="/assets/oauth-presets.js"></script>`)

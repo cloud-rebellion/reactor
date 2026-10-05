@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -83,6 +84,28 @@ func TestDecryptWrongKey(t *testing.T) {
 	}
 	if _, err := Decrypt(bad, blob); err == nil {
 		t.Fatal("decrypt with wrong key should fail")
+	}
+}
+
+func TestCredentialBoundEncryptionRejectsCiphertextSwap(t *testing.T) {
+	t.Parallel()
+	key := mustKey(t)
+	pt := []byte("bound-secret")
+	blob, err := EncryptForID(key, "cred-a", pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(blob, pt) {
+		t.Fatal("encrypted credential blob contains plaintext")
+	}
+	if got, err := DecryptForID(key, "cred-a", blob); err != nil || !bytes.Equal(got, pt) {
+		t.Fatalf("decrypt with original id: got=%q err=%v", got, err)
+	}
+	if _, err := DecryptForID(key, "cred-b", blob); err == nil {
+		t.Fatal("ciphertext copied to another credential id decrypted successfully")
+	}
+	if _, err := Decrypt(key, blob); err == nil {
+		t.Fatal("credential-bound v2 blob decrypted through unbound API")
 	}
 }
 
@@ -166,6 +189,16 @@ func TestSecretRedactsAcrossSurfaces(t *testing.T) {
 	}
 }
 
+func TestSecretRevealDoesNotExposeCachedBackingBytes(t *testing.T) {
+	t.Parallel()
+	s := NewSecret([]byte("super-secret-value"))
+	got := s.Reveal()
+	got[0] = 'X'
+	if string(s.Reveal()) != "super-secret-value" {
+		t.Fatalf("mutating Reveal result changed cached secret: %q", s.Reveal())
+	}
+}
+
 func TestSecretFingerprintStable(t *testing.T) {
 	t.Parallel()
 	a := NewSecret([]byte("xyz"))
@@ -199,6 +232,56 @@ func TestStorePutGet(t *testing.T) {
 	}
 	if string(got.Reveal()) != "sk_live_abc" {
 		t.Fatalf("got %q", got.Reveal())
+	}
+}
+
+func TestStoreBoundsAndBindsPlaintextAtRest(t *testing.T) {
+	t.Parallel()
+	backend := NewMemoryBackend()
+	store, err := NewStore(backend, mustKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.Put(ctx, "cred-a", []byte("secret-a")); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := backend.Get(ctx, "cred-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blob) == 0 || blob[0] != VersionV2 || bytes.Contains(blob, []byte("secret-a")) {
+		t.Fatalf("stored credential blob is not bound encrypted data: version=%x blob=%q", blob[0], blob)
+	}
+	if err := store.Put(ctx, "too-large", bytes.Repeat([]byte("x"), MaxSecretBytes+1)); !errors.Is(err, ErrSecretTooLarge) {
+		t.Fatalf("oversized credential put error=%v, want ErrSecretTooLarge", err)
+	}
+}
+
+func TestStoreMigratesUnboundV1BlobToCredentialBoundV2(t *testing.T) {
+	t.Parallel()
+	backend := NewMemoryBackend()
+	key := mustKey(t)
+	legacy, err := Encrypt(key, []byte("legacy-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Put(context.Background(), "cred-legacy", legacy); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(backend, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.Get(context.Background(), "cred-legacy"); err != nil || string(got.Reveal()) != "legacy-secret" {
+		t.Fatalf("legacy read: got=%v err=%v", got, err)
+	}
+	migrated, err := backend.Get(context.Background(), "cred-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrated) == 0 || migrated[0] != VersionV2 {
+		t.Fatalf("legacy blob was not migrated to v2: version=%x", migrated[0])
 	}
 }
 

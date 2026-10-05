@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"html/template"
@@ -299,6 +300,7 @@ func (s *Server) credentialCreate(w http.ResponseWriter, r *http.Request) {
 		Name:                 name,
 		Service:              service,
 		Provider:             provider,
+		AllowLocalMint:       r.PostFormValue("confirm_replace") == "on",
 		AutoRotate:           autoRotate,
 		RotationIntervalDays: intervalDays,
 	}); err != nil {
@@ -354,14 +356,35 @@ func (s *Server) credentialRotate(w http.ResponseWriter, r *http.Request) {
 	// So the product's headline button did nothing observable on its most common
 	// configuration, and an operator could not tell that from a real rotation.
 	var outcome string
+	allowLocalMint := r.PostFormValue("allow_local_mint") == "on"
+	localMint := false
 	if c, cerr := s.Credentials.Get(r.Context(), id); cerr == nil {
-		if canAuto, _, perr := s.Rotator.ProviderCapabilities(c.Provider); perr == nil && !canAuto {
-			outcome = "Recorded a rotation reminder. Provider \"" + c.Provider +
-				"\" cannot roll this credential programmatically, so the stored value is unchanged: rotate it at the issuing service, then paste the new value into \"Update value\" below."
+		if canAuto, mintsLocally, perr := s.Rotator.ProviderCapabilities(c.Provider); perr == nil {
+			localMint = mintsLocally
+			if mintsLocally && !allowLocalMint {
+				s.errorPage(w, "rotate", fmt.Errorf("provider %q generates replacement values locally; tick the acknowledgement before rotating", c.Provider))
+				return
+			}
+			if !canAuto {
+				outcome = "Recorded a rotation reminder. Provider \"" + c.Provider +
+					"\" cannot roll this credential programmatically, so the stored value is unchanged: rotate it at the issuing service, then paste the new value into \"Update value\" below."
+			}
 		}
 	}
-	if err := s.Rotator.RotateOne(r.Context(), id); err != nil {
-		s.errorPage(w, "rotate", err)
+	var rotateErr error
+	if localMint {
+		if ackRotator, ok := s.Rotator.(interface {
+			RotateOneWithLocalMintAck(context.Context, string, bool) error
+		}); ok {
+			rotateErr = ackRotator.RotateOneWithLocalMintAck(r.Context(), id, allowLocalMint)
+		} else {
+			rotateErr = errors.New("rotation provider does not expose the local-mint acknowledgement boundary")
+		}
+	} else {
+		rotateErr = s.Rotator.RotateOne(r.Context(), id)
+	}
+	if rotateErr != nil {
+		s.errorPage(w, "rotate", rotateErr)
 		return
 	}
 	if outcome == "" {

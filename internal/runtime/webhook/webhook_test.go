@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -94,6 +95,15 @@ func newTestReceiverForProvider(t *testing.T, secretValue, provider string) (*Re
 	if err := v.Put(context.Background(), "cred_hmac", []byte(secretValue)); err != nil {
 		t.Fatalf("vault put: %v", err)
 	}
+	// Keep the credential metadata in sync with the vault fixture so the
+	// receiver's runtime tenant fence exercises the same ownership contract as
+	// production. The vault itself is intentionally id-only and cannot answer
+	// this question.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO credentials (id, tenant_id, name, service, provider, blob) VALUES (?,?,?,?,?,?)`,
+		"cred_hmac", journal.DefaultTenant, "webhook", "reactor-webhook", "shared-secret", []byte("sentinel")); err != nil {
+		t.Fatalf("credential metadata: %v", err)
+	}
 
 	tokenID, _ := journal.NewTokenID()
 	if _, err := j.CreateWebhookTrigger(context.Background(), "wf_1", tokenID, "cred_hmac", provider, []byte(`{}`)); err != nil {
@@ -117,6 +127,20 @@ func bytesN(n int, b byte) []byte {
 		out[i] = b
 	}
 	return out
+}
+
+// newWebhookTestServer deliberately binds IPv4. Some developer and CI
+// sandboxes deny IPv6 loopback listeners even though the webhook HTTP
+// contract is otherwise fully available over loopback.
+func newWebhookTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable in this test environment: %v", err)
+	}
+	ts := &httptest.Server{Listener: listener, Config: &http.Server{Handler: handler}}
+	ts.Start()
+	return ts
 }
 
 func sign(secret, body []byte) string {
@@ -161,7 +185,7 @@ func TestWebhookAutomationV1HappyPath(t *testing.T) {
 	r, disp, _, tok := newTestReceiverForProvider(t, "test-secret", ProviderAutomationV1)
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	timestamp := strconv.FormatInt(r.now().Unix(), 10)
@@ -181,6 +205,12 @@ func TestWebhookAutomationV1HappyPath(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		buf, _ := io.ReadAll(resp.Body)
 		t.Fatalf("got %d %s, want 202", resp.StatusCode, buf)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store, max-age=0" {
+		t.Fatalf("webhook receipt Cache-Control = %q, want no-store", got)
+	}
+	if got := resp.Header.Get("Pragma"); got != "no-cache" {
+		t.Fatalf("webhook receipt Pragma = %q, want no-cache", got)
 	}
 	var receipt deliveryReceipt
 	if err := json.NewDecoder(resp.Body).Decode(&receipt); err != nil {
@@ -270,7 +300,7 @@ func TestWebhookAutomationV1RejectsInvalidEnvelopesBeforeDispatch(t *testing.T) 
 	r, disp, _, tok := newTestReceiverForProvider(t, "test-secret", ProviderAutomationV1)
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	now := r.now()
@@ -923,7 +953,7 @@ func TestWebhookGenericHappyPath(t *testing.T) {
 
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	body := []byte(`{"event":"order.created","id":"ord_1"}`)
@@ -948,6 +978,71 @@ func TestWebhookGenericHappyPath(t *testing.T) {
 	}
 }
 
+func TestWebhookRejectsCrossTenantSecretReference(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "cross-tenant.db")
+	silent := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	if err := migrate.Up(ctx, silent, "sqlite://"+dbPath); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	j := journal.New(db, journal.EngineSQLite)
+	const workflowID = "wf_webhook_cross_tenant"
+	if err := j.CreateWorkflowInTenant(ctx, workflowID, "cross-tenant", "h", "0.1.0", json.RawMessage(`{}`), "tenant-a"); err != nil {
+		t.Fatalf("workflow: %v", err)
+	}
+	tokenID, err := journal.NewTokenID()
+	if err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	// Create the trigger before its metadata appears to model a legacy vault-only
+	// row. A later restore or administrative edit can leave that row pointing at
+	// a credential owned by another tenant; delivery must still refuse it.
+	if _, err := j.CreateWebhookTrigger(ctx, workflowID, tokenID, "cred_cross_tenant", "generic", nil); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO credentials (id, tenant_id, name, service, provider, blob) VALUES (?,?,?,?,?,?)`,
+		"cred_cross_tenant", "tenant-b", "cross-tenant", "reactor-webhook", "shared-secret", []byte("sentinel")); err != nil {
+		t.Fatalf("foreign credential metadata: %v", err)
+	}
+	v, err := vault.NewStore(vault.NewMemoryBackend(), bytesN(32, 0xAB))
+	if err != nil {
+		t.Fatalf("vault: %v", err)
+	}
+	if err := v.Put(ctx, "cred_cross_tenant", []byte("cross-tenant-secret")); err != nil {
+		t.Fatalf("vault put: %v", err)
+	}
+	disp := &captureDispatcher{}
+	r := &Receiver{
+		Journal: j,
+		Vault:   v,
+		Disp:    disp,
+		Log:     silent,
+		Now:     func() time.Time { return time.Unix(1_700_000_000, 0) },
+	}
+	router := chi.NewRouter()
+	r.Mount(router)
+	body := []byte(`{"event":"cross-tenant"}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/"+tokenID, bytes.NewReader(body))
+	req.Header.Set("X-Webhook-Signature", "sha256="+sign([]byte("cross-tenant-secret"), body))
+	req.Header.Set("X-Webhook-Delivery", "cross-tenant-1")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("got %d %s, want 401", recorder.Code, recorder.Body.String())
+	}
+	if disp.calls.Load() != 0 {
+		t.Fatal("cross-tenant webhook dispatched")
+	}
+}
+
 func TestWebhookSyncReturnsOutput(t *testing.T) {
 	t.Parallel()
 	r, _, j, _ := newTestReceiver(t, "shhh")
@@ -958,7 +1053,7 @@ func TestWebhookSyncReturnsOutput(t *testing.T) {
 	}
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	body := []byte(`{"q":"hello"}`)
@@ -1007,7 +1102,7 @@ func TestWebhookBadSignature(t *testing.T) {
 	r, disp, _, tok := newTestReceiver(t, "shhh")
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	body := []byte(`{}`)
@@ -1033,7 +1128,7 @@ func TestWebhookDedupReplay(t *testing.T) {
 	r, disp, _, tok := newTestReceiver(t, "shhh")
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	body := []byte(`{"id":"evt_dup"}`)
@@ -1080,7 +1175,7 @@ func TestWebhookActiveLeaseRetriesAfterExpiry(t *testing.T) {
 
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	post := func() *http.Response {
@@ -1147,7 +1242,7 @@ func TestWebhookDeliveryIDPayloadMismatchConflicts(t *testing.T) {
 	r, disp, _, tok := newTestReceiver(t, "shhh")
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	post := func(body []byte) *http.Response {
@@ -1183,7 +1278,7 @@ func TestWebhookDispatchFailureReleasesClaim(t *testing.T) {
 	disp.err = errors.New("dispatcher unavailable")
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	body := []byte(`{"id":"evt_retry_dispatch"}`)
@@ -1222,7 +1317,7 @@ func TestWebhookDisabledWorkflowDoesNotCompleteReceipt(t *testing.T) {
 	disp.err = dispatcher.ErrWorkflowDisabled
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	body := []byte(`{"id":"evt_paused"}`)
@@ -1260,7 +1355,7 @@ func TestWebhookUnknownToken(t *testing.T) {
 	r, _, _, _ := newTestReceiver(t, "x")
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/webhook/whk_doesnotexist", "application/json", strings.NewReader("{}"))
@@ -1320,7 +1415,7 @@ func TestWebhookOversizeBodyRejected(t *testing.T) {
 	r, disp, _, tok := newTestReceiver(t, "shhh")
 	router := chi.NewRouter()
 	r.Mount(router)
-	srv := httptest.NewServer(router)
+	srv := newWebhookTestServer(t, router)
 	defer srv.Close()
 
 	huge := bytes.Repeat([]byte("a"), MaxBodyBytes+10)

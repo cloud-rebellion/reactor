@@ -71,6 +71,13 @@ func TestRequestRunCancelOutcomes(t *testing.T) {
 	if claims, err := j.ClaimQueuedRuns(ctx, "worker", 10, time.Minute); err != nil || len(claims) != 0 {
 		t.Fatalf("cancelled queued run was claimable: %v, %v", claims, err)
 	}
+	usage, err := j.TenantUsageSince(ctx, DefaultTenant, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Runs != 2 {
+		t.Fatalf("operator cancellations were not metered: %+v", usage)
+	}
 
 	// Terminal run -> nothing to do.
 	seedRun(t, j, "run_done", "running")
@@ -84,6 +91,57 @@ func TestRequestRunCancelOutcomes(t *testing.T) {
 	// Unknown run -> ErrNotFound.
 	if _, err := j.RequestRunCancel(ctx, "run_nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown cancel err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRequestRunCancelForTenantScopesMutation(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	for _, wf := range []struct {
+		id     string
+		tenant string
+	}{
+		{id: "wf_tenant_a", tenant: "tenant-a"},
+		{id: "wf_tenant_b", tenant: "tenant-b"},
+	} {
+		if err := j.CreateWorkflow(ctx, wf.id, wf.id, "h", "0.1.0", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE workflows SET tenant_id = $1 WHERE id = $2`), wf.tenant, wf.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.CreateRun(ctx, "run_tenant_b", "wf_tenant_b", "manual", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, emptyTenant := range []string{"", "   "} {
+		if out, err := j.RequestRunCancelForTenant(ctx, "run_tenant_b", emptyTenant); !errors.Is(err, ErrNotFound) || out != CancelNotPossible {
+			t.Fatalf("empty tenant cancel = %q, %v; want not_cancellable + ErrNotFound", out, err)
+		}
+	}
+
+	if out, err := j.RequestRunCancelForTenant(ctx, "run_tenant_b", "tenant-a"); !errors.Is(err, ErrNotFound) || out != CancelNotPossible {
+		t.Fatalf("foreign cancel = %q, %v; want not_cancellable + ErrNotFound", out, err)
+	}
+	info, err := j.GetRun(ctx, "run_tenant_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status != "running" || info.CancelRequested {
+		t.Fatalf("foreign cancel mutated run: %+v", info)
+	}
+
+	if out, err := j.RequestRunCancelForTenant(ctx, "run_tenant_b", "tenant-b"); err != nil || out != CancelRequested {
+		t.Fatalf("same-tenant cancel = %q, %v; want requested", out, err)
+	}
+	info, err = j.GetRun(ctx, "run_tenant_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.CancelRequested {
+		t.Fatalf("same-tenant cancel did not set flag: %+v", info)
 	}
 }
 
@@ -144,5 +202,11 @@ func TestRunLogsRoundTrip(t *testing.T) {
 	}
 	if got, _ := j.GetRunLogs(ctx, "run_logs"); len(got) != 3 {
 		t.Fatalf("re-save changed count: %v", got)
+	}
+	if err := j.SaveRunLogs(ctx, "run_logs", []string{"retry line"}); err != nil {
+		t.Fatalf("save retry tail: %v", err)
+	}
+	if got, _ := j.GetRunLogs(ctx, "run_logs"); len(got) != 4 || got[3] != "retry line" {
+		t.Fatalf("retry tail was not appended: %v", got)
 	}
 }

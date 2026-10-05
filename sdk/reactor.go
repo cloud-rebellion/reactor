@@ -102,10 +102,18 @@ type Signal struct {
 
 // StepOpts controls how a step is recorded, retried, and timed out.
 //
-// IdempotencyKey deduplicates side effects across retries: the host records
-// the first observed (run, step, key) combination and returns the cached
-// output on retry. Required for any step that produces an external side
-// effect; the lint rule enforces this.
+// IdempotencyKey lets the host reuse the output of a completed (run, step,
+// key) on replay. It does not make an external provider mutation exactly
+// once: a provider may accept it before Reactor records the Step result.
+// Required for any Step that produces an external side effect; the lint rule
+// enforces this.
+//
+// InputHash is an optional caller-supplied, stable fingerprint of the values
+// captured by the step closure. It is folded into the durable replay identity
+// (and hashed before it crosses the workflow boundary), so a changed input
+// cannot silently reuse an output just because the side-effect key stayed the
+// same. Pass a digest or other bounded opaque fingerprint, never the raw
+// payload. When empty, the runtime fingerprints the step options only.
 //
 // RetryPolicy: nil means no retry. Use ExpBackoff for the default
 // full-jitter exponential.
@@ -113,6 +121,7 @@ type Signal struct {
 // Timeout: zero means inherit from the run's overall budget.
 type StepOpts struct {
 	IdempotencyKey string
+	InputHash      string
 	RetryPolicy    RetryPolicy
 	Timeout        time.Duration
 }
@@ -122,6 +131,36 @@ type StepOpts struct {
 // attempts.
 type RetryPolicy interface {
 	NextDelay(attempt int) (time.Duration, bool)
+}
+
+// RetryAfterHint is implemented by provider errors that carry a minimum wait
+// before another attempt. The second result is false when the provider's
+// window is too long for an automatic in-worker retry. A caller can then
+// arrange a durable reschedule or leave the failure for operator redrive.
+type RetryAfterHint interface {
+	RetryAfterDelay() (time.Duration, bool)
+}
+
+// MaxAutomaticRetryAfter is the longest provider window a live Step retry may
+// wait through. Longer windows require an explicit durable reschedule.
+const MaxAutomaticRetryAfter = 30 * time.Second
+
+// RespectRetryAfter applies a provider's minimum delay to a retry policy's
+// chosen delay. It follows wrapped errors and never shortens the policy delay.
+// A false result means an automatic retry would violate the provider window.
+func RespectRetryAfter(err error, delay time.Duration) (time.Duration, bool) {
+	var hint RetryAfterHint
+	if !errors.As(err, &hint) {
+		return delay, true
+	}
+	after, allowed := hint.RetryAfterDelay()
+	if !allowed || after > MaxAutomaticRetryAfter {
+		return 0, false
+	}
+	if after > delay {
+		return after, true
+	}
+	return delay, true
 }
 
 // BoundedRetryPolicy is the crash-safe extension to RetryPolicy. The compiled

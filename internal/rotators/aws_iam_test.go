@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // formValue parses a x-www-form-urlencoded body and returns the named param.
@@ -166,6 +167,17 @@ func TestAWSIAMRotateBadCurrentKeyFails(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "parse current key") {
 		t.Fatalf("want parse error, got %v", err)
+	}
+}
+
+func TestAWSIAMProviderRejectsLinkLocalAPIBase(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	current, _ := json.Marshal(awsAccessKeyPair{AccessKeyID: "AKIA", SecretAccessKey: "secret"})
+	_, err := (&AWSIAMProvider{APIBase: "http://169.254.169.254"}).Rotate(ctx, string(current), map[string]string{"iam_user_name": "u"})
+	if err == nil || !strings.Contains(err.Error(), "ssrf") {
+		t.Fatalf("metadata API base error = %v, want SSRF refusal", err)
 	}
 }
 

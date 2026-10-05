@@ -1,6 +1,8 @@
 # Workflow chaining
 
-Run workflow B automatically whenever workflow A terminates. No new runtime concept and no schema change beyond a new `kind` value on the existing triggers table.
+Run workflow B automatically whenever workflow A terminates. Chain triggers use
+the existing `triggers` table; terminal side effects are recorded in the
+durable `terminal_effects` receipt so a daemon crash can recover the handoff.
 
 ## Quick start
 
@@ -14,7 +16,9 @@ The upstream workflow's detail page now shows a "Downstream workflows" section l
 
 ## Schema
 
-No new tables. A new `kind` value on `triggers` from migration 0004:
+A new `kind` value on `triggers` from migration 0004 stores the chain
+relationship. Migration 0038 adds one `terminal_effects` row per run so the
+post-terminal handoff can recover after a host crash:
 
 ```text
 kind = 'workflow_complete'
@@ -32,11 +36,11 @@ The trigger row's `workflow_id` is the **downstream**. The upstream lives in `co
 
 ## Status CSV
 
-Same shape as notification routes ([Notifications](/docs/notifications)). Trim + lowercase + dedupe + sort on write. Empty defaults to `succeeded`. Self-loops (downstream == source) are rejected at create time.
+Same shape as notification routes ([Notifications](/docs/notifications)). Trim + lowercase + dedupe + sort on write. Empty defaults to `succeeded`. Self-loops and any cycle that would make a terminal run reach an already-visited workflow are rejected at create time.
 
 ## Payload to the downstream workflow
 
-The dispatcher calls `disp.Dispatch(ctx, trigger, payload)` where `payload` is:
+The dispatcher calls the trusted `DispatchTerminalChain` path where `payload` is:
 
 ```json
 {
@@ -73,19 +77,40 @@ When a run terminates:
 1. The supervisor returns to the dispatcher with the run's status.
 2. The dispatcher invokes the `OnTerminal` callback (set in `serve.go`).
 3. The callback closes the log buffer (always), fires notifications (when status is terminal-class), then calls `fireChainedWorkflows`.
-4. `fireChainedWorkflows` looks up matching chain triggers, marshals the payload, calls `disp.Dispatch` for each downstream.
+4. `fireChainedWorkflows` looks up matching chain triggers, marshals the payload, and calls `DispatchTerminalChain` for each downstream. Every peer is attempted; a failed handoff leaves the terminal-effect receipt retryable, while deterministic source/trigger idempotency prevents peers that already accepted their run from being duplicated on retry.
+5. The callback acknowledges the `terminal_effects` receipt. The leader retries
+   an unacknowledged receipt after a crash; delivery is at-least-once, so a
+   downstream receiver should deduplicate by `source_run_id`.
 
-Chain firing is synchronous inside the inFlight goroutine, so graceful drain (`SIGINT` -> wait for in-flight runs) covers chained workflows too. Failures log but do not abort the loop; one bad downstream does not block peers.
+The journal query and the fire boundary both require the source workflow, chain
+trigger, and downstream workflow to carry the same tenant identity. Legacy or
+imported rows that violate that relationship are omitted from the dispatch
+projection, and the fire path skips any row that fails the authoritative source
+run check. A malformed relationship therefore cannot turn a terminal event in
+one tenant into a downstream run in another.
+
+Chain firing is synchronous inside the inFlight goroutine, so graceful drain (`SIGINT` -> wait for in-flight runs) covers chained workflows too. Failures log and do not abort the loop; one bad downstream does not block peers, and the terminal receipt stays pending until the failed handoff is recovered.
 
 ## Diamond shapes and fan-out
 
 A workflow can have multiple downstream chains and multiple upstream chains. `ChainTriggersForSource` returns every matching trigger in one query, so an upstream that terminates fires every downstream in parallel.
 
-There is no built-in deduplication: if you wire two chain triggers from A->B (one on succeeded, one on failed_dlq), B fires twice when A succeeds AND lands in failed_dlq (which can't happen for the same run, but is mentioned because the path is "every matching trigger fires").
+There is no built-in deduplication across two distinct chain trigger rows. A
+single receipt is deduplicated by run id, while separate rows intentionally
+fire separately.
 
-## Self-loop guard
+## Cycle guard
 
-`CreateChainTrigger` rejects `source_workflow_id == downstream_workflow_id` with a clear error. Other cycles (A -> B -> A) are not detected at create time; an operator who wires them in a loop sees the dispatcher firing perpetually and should disable one of the chain triggers.
+`CreateChainTrigger` rejects `source_workflow_id == downstream_workflow_id` and
+walks the existing active chain edges before inserting a new edge. A cycle such
+as A -> B -> C -> A is rejected with no trigger row written, so a terminal run
+cannot recursively re-enter an already visited workflow. Disabling an existing
+edge removes it from the cycle check; reactivating a disabled chain through MCP
+the dashboard, or the CLI is intentionally refused and requires creating a
+fresh cycle-checked edge.
+The cycle read and trigger write share a topology lock (a transaction-scoped
+Postgres advisory lock or SQLite writer transaction), so concurrent authors
+cannot validate two opposing edges against the same old graph.
 
 ## Operator surfaces
 
@@ -112,7 +137,7 @@ There is no inline edit form for chain triggers in this release; delete and re-c
 
 ## Tests
 
-- Journal: self-loop rejection, round-trip with defaults, CSV filter, downstream + upstream view correctness.
+- Journal: self-loop and multi-hop cycle rejection, round-trip with defaults, CSV filter, downstream + upstream view correctness.
 - Dispatcher hook: every matching trigger fires, continue-past-failures, no-op on empty, nil-guards, error_text propagates into payload.
 - Server: dashboard form happy path covers both views via `/workflows/{slug}` detail page, unknown source returns 404.
 

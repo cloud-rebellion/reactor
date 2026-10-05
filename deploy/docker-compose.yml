@@ -1,7 +1,9 @@
 # DEVELOPMENT / SINGLE-NODE EXAMPLE ONLY.
 #
-# This file intentionally uses SQLite and starts no distributed worker. It is
-# suitable for a local evaluation, not for the Hash e-signature bridge or any
+# This file intentionally uses SQLite and starts no distributed worker. The
+# host-network loopback setup requires Linux, or Docker Desktop with its host
+# networking feature enabled. It is suitable for a local evaluation, not for
+# the Hash e-signature bridge or any
 # production deployment. Production operators must supply their own reviewed
 # Postgres-backed serve + worker topology; see docs/scaling.md and
 # docs/hash-esign-bridge.md.
@@ -10,8 +12,28 @@ services:
     image: reactor:latest
     container_name: reactor
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:7777:7777"
+    # Keep the evaluation container from becoming a host-level resource or
+    # privilege escape when an authored workflow misbehaves. These are outer
+    # fences for the whole daemon; production deployments still need reviewed
+    # per-workflow cgroup delegation or a stronger container/VM boundary.
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Override REACTOR_MEMORY_LIMIT / REACTOR_PIDS_LIMIT after sizing the
+    # authored workload; the defaults are intentionally bounded.
+    mem_limit: ${REACTOR_MEMORY_LIMIT:-1g}
+    pids_limit: ${REACTOR_PIDS_LIMIT:-512}
+    # Use the host network for this local-only HTTP example so the daemon can
+    # bind loopback inside the container and still be reachable at the host's
+    # 127.0.0.1:7777. A bridge-published port would require a wildcard bind,
+    # which Reactor intentionally rejects for plain HTTP MCP. Public or
+    # multi-host deployments need a reviewed TLS/proxy topology instead.
+    network_mode: host
     volumes:
       - reactor-state:/var/lib/reactor
     environment:
@@ -26,7 +48,13 @@ services:
       - serve
       - --root=/var/lib/reactor
       - --db=sqlite:///var/lib/reactor/reactor.db
-      - --addr=:7777
+      - --addr=127.0.0.1:7777
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7777/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
 
   reactor-init:
     image: reactor:latest

@@ -72,7 +72,29 @@
         text = "Every year on " + MONTH[mon] + " " + dom + " at " + fmtTime(t);
       }
       spec.value = cron;
-      if (summary) summary.innerHTML = text + ' <span class="muted">cron: <code>' + cron + "</code></span>";
+      renderSummary(text, cron, false);
+    }
+
+    // Keep operator-entered cron text out of an HTML parser.  The advanced
+    // field is intentionally free-form, so even an internal operator can
+    // paste markup-like text here.
+    function renderSummary(label, cron, custom) {
+      if (!summary) return;
+      summary.textContent = "";
+      summary.appendChild(document.createTextNode(label + (custom ? "" : " ")));
+      if (!custom) {
+        var muted = document.createElement("span");
+        muted.className = "muted";
+        muted.appendChild(document.createTextNode("cron: "));
+        var code = document.createElement("code");
+        code.textContent = cron;
+        muted.appendChild(code);
+        summary.appendChild(muted);
+        return;
+      }
+      var customCode = document.createElement("code");
+      customCode.textContent = cron;
+      summary.appendChild(customCode);
     }
 
     function fmtTime(t) {
@@ -89,7 +111,7 @@
     // If the operator types raw cron under Advanced, respect it: stop letting
     // the summary overwrite, but keep showing what they typed.
     spec.addEventListener("input", function (e) {
-      if (e.isTrusted && summary) summary.innerHTML = 'Custom cron: <code>' + (spec.value || "") + "</code>";
+      if (e.isTrusted) renderSummary("Custom cron: ", spec.value || "", true);
     });
   }
 

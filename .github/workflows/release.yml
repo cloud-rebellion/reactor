@@ -55,6 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -65,6 +69,29 @@ jobs:
           NFPM_VERSION=2.39.0
           curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb" -o /tmp/nfpm.deb
           sudo dpkg -i /tmp/nfpm.deb
+
+      - name: install RPM inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm cpio
+
+      - name: verify package lifecycle hooks
+        run: |
+          for script in packaging/scripts/stage-sdk-module.sh packaging/scripts/verify-sdk-module.sh packaging/scripts/postinstall.sh packaging/scripts/preremove.sh packaging/scripts/preremove_test.sh; do
+            sh -n "$script"
+          done
+          packaging/scripts/preremove_test.sh
+
+      - name: stage and verify offline workflow SDK
+        run: |
+          packaging/scripts/stage-sdk-module.sh dist/reactor-sdk
+          packaging/scripts/verify-sdk-module.sh dist/reactor-sdk
+          tar -C dist/reactor-sdk -czf "dist/reactor-sdk-${GITHUB_REF_NAME}.tar.gz" .
+          extracted=$(mktemp -d)
+          tar -xzf "dist/reactor-sdk-${GITHUB_REF_NAME}.tar.gz" -C "$extracted"
+          packaging/scripts/verify-sdk-module.sh "$extracted"
+          chmod -R u+w "$extracted"
+          rm -rf -- "$extracted"
 
       - name: build .deb + .rpm (amd64 + arm64)
         env:
@@ -81,6 +108,25 @@ jobs:
           done
           ls -la dist/
 
+      - name: verify packaged SDK payload
+        run: |
+          for deb in dist/*.deb; do
+            extracted=$(mktemp -d)
+            dpkg-deb --extract "$deb" "$extracted"
+            test -x "$extracted/usr/bin/reactor"
+            packaging/scripts/verify-sdk-module.sh "$extracted/usr/lib/reactor-sdk"
+            chmod -R u+w "$extracted"
+            rm -rf -- "$extracted"
+          done
+          for rpm_pkg in dist/*.rpm; do
+            extracted=$(mktemp -d)
+            (cd "$extracted" && rpm2cpio "$GITHUB_WORKSPACE/$rpm_pkg" | cpio --extract --make-directories --quiet)
+            test -x "$extracted/usr/bin/reactor"
+            packaging/scripts/verify-sdk-module.sh "$extracted/usr/lib/reactor-sdk"
+            chmod -R u+w "$extracted"
+            rm -rf -- "$extracted"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: reactor-packages
@@ -90,6 +136,7 @@ jobs:
           path: |
             dist/*.deb
             dist/*.rpm
+            dist/reactor-sdk-*.tar.gz
 
   release:
     needs: [build, package]
@@ -104,17 +151,41 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: changelog extract
-        id: changelog
+      - name: archive release binaries for Homebrew
         run: |
-          {
-            echo "notes<<EOF"
-            awk -v ver="${GITHUB_REF_NAME#v}" '
-              /^## / { if (capture) exit; if (index($0, ver)) { capture=1; next } }
-              capture { print }
-            ' CHANGELOG.md
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          for platform in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+            binary="reactor-${GITHUB_REF_NAME}-${platform}"
+            # upload-artifact/download-artifact do not preserve executable
+            # mode. Homebrew installs the archive member without adding it.
+            chmod 0755 "dist/$binary"
+            test -x "dist/$binary"
+            tar -C dist -czf "dist/${binary}.tar.gz" "$binary"
+          done
+
+      - name: changelog extract
+        run: |
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            /^## / { if (capture) exit; if (index($0, ver)) { capture=1; next } }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+
+      - name: render homebrew formula
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          FORMULA=dist/reactor.rb
+          sed \
+            -e "s/VERSION_PLACEHOLDER/$VER/g" \
+            -e "s/DARWIN_ARM64_SHA256_PLACEHOLDER/$(sha256sum dist/reactor-${GITHUB_REF_NAME}-darwin-arm64.tar.gz | cut -d' ' -f1)/g" \
+            -e "s/DARWIN_AMD64_SHA256_PLACEHOLDER/$(sha256sum dist/reactor-${GITHUB_REF_NAME}-darwin-amd64.tar.gz | cut -d' ' -f1)/g" \
+            -e "s/LINUX_ARM64_SHA256_PLACEHOLDER/$(sha256sum dist/reactor-${GITHUB_REF_NAME}-linux-arm64.tar.gz | cut -d' ' -f1)/g" \
+            -e "s/LINUX_AMD64_SHA256_PLACEHOLDER/$(sha256sum dist/reactor-${GITHUB_REF_NAME}-linux-amd64.tar.gz | cut -d' ' -f1)/g" \
+            -e "s/SDK_SHA256_PLACEHOLDER/$(sha256sum dist/reactor-sdk-${GITHUB_REF_NAME}.tar.gz | cut -d' ' -f1)/g" \
+            packaging/homebrew/reactor.rb.tmpl > "$FORMULA"
+          ruby -c "$FORMULA"
+          if grep -q PLACEHOLDER "$FORMULA"; then
+            echo "homebrew formula still has unrendered placeholders" >&2
+            exit 1
+          fi
 
       - name: gh release
         env:
@@ -122,23 +193,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
-            --notes "${{ steps.changelog.outputs.notes }}"
-
-      - name: render homebrew formula
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          mkdir -p dist/homebrew
-          FORMULA=dist/homebrew/reactor.rb
-          sed \
-            -e "s/VERSION_PLACEHOLDER/$VER/g" \
-            -e "s/DARWIN_ARM64_SHA256_PLACEHOLDER/$(cat dist/reactor-${GITHUB_REF_NAME}-darwin-arm64.sha256 | cut -d' ' -f1)/g" \
-            -e "s/DARWIN_AMD64_SHA256_PLACEHOLDER/$(cat dist/reactor-${GITHUB_REF_NAME}-darwin-amd64.sha256 | cut -d' ' -f1)/g" \
-            -e "s/LINUX_ARM64_SHA256_PLACEHOLDER/$(cat dist/reactor-${GITHUB_REF_NAME}-linux-arm64.sha256 | cut -d' ' -f1)/g" \
-            -e "s/LINUX_AMD64_SHA256_PLACEHOLDER/$(cat dist/reactor-${GITHUB_REF_NAME}-linux-amd64.sha256 | cut -d' ' -f1)/g" \
-            packaging/homebrew/reactor.rb.tmpl > "$FORMULA"
-
-      - name: attach homebrew formula to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "$GITHUB_REF_NAME" dist/homebrew/reactor.rb --clobber
+            --notes-file release-notes.md

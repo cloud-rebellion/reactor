@@ -225,10 +225,75 @@ func (j *Journal) ListGrants(ctx context.Context) ([]Grant, error) {
 	return out, rows.Err()
 }
 
+// ListGrantsPage returns one bounded page of estate-wide grants. It retains
+// the legacy raw relation semantics of ListGrants for compatibility; callers
+// that need a workflow-scoped tenant fence should use
+// ListGrantsForWorkflowPage. Graph edges are still tenant-filtered at the
+// projection boundary, where both endpoint nodes are available.
+func (j *Journal) ListGrantsPage(ctx context.Context, limit, offset int) ([]Grant, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, errors.New("journal: list grants: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, errors.New("journal: list grants: negative offset")
+	}
+	const q = `SELECT workflow_id, credential_id, granted_at, granted_by, note
+		FROM workflow_secret_grants ORDER BY workflow_id, credential_id LIMIT $1 OFFSET $2`
+	rows, err := j.db.QueryContext(ctx, j.bind(q), limit+1, offset)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list grants page: %w", err)
+	}
+	defer rows.Close()
+	var out []Grant
+	for rows.Next() {
+		var (
+			g         Grant
+			granted   sql.NullString
+			grantedBy sql.NullString
+			note      sql.NullString
+		)
+		if err := rows.Scan(&g.WorkflowID, &g.CredentialID, &granted, &grantedBy, &note); err != nil {
+			return nil, false, fmt.Errorf("journal: scan grant: %w", err)
+		}
+		g.GrantedBy = nullableString(grantedBy)
+		g.Note = nullableString(note)
+		if granted.Valid {
+			if t, err := j.parseTime(granted.String); err == nil {
+				g.GrantedAt = t
+			}
+		}
+		out = append(out, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
 // ListGrantsForWorkflow narrows ListGrants to one workflow.
 func (j *Journal) ListGrantsForWorkflow(ctx context.Context, workflowID string) ([]Grant, error) {
-	const q = `SELECT workflow_id, credential_id, granted_at, granted_by, note
-		FROM workflow_secret_grants WHERE workflow_id = $1 ORDER BY credential_id`
+	// Keep the relation read fail-closed for rows restored from a database
+	// predating the cross-tenant grant guard. A workflow-scoped lookup must not
+	// expose a credential id merely because a stale grant row names that
+	// workflow; the target must still belong to the workflow's tenant. OAuth
+	// connections use the separate oauth:<id> namespace, so retain them through
+	// the second EXISTS branch.
+	const q = `SELECT g.workflow_id, g.credential_id, g.granted_at, g.granted_by, g.note
+		FROM workflow_secret_grants g
+		JOIN workflows w ON w.id = g.workflow_id
+		WHERE g.workflow_id = $1
+		  AND (EXISTS (SELECT 1 FROM credentials c
+		               WHERE c.id = g.credential_id AND c.tenant_id = w.tenant_id)
+		       OR EXISTS (SELECT 1 FROM oauth_connections o
+		                  WHERE g.credential_id = 'oauth:' || o.id AND o.tenant_id = w.tenant_id))
+		ORDER BY g.credential_id`
 	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID)
 	if err != nil {
 		return nil, fmt.Errorf("journal: list grants by workflow: %w", err)
@@ -255,6 +320,127 @@ func (j *Journal) ListGrantsForWorkflow(ctx context.Context, workflowID string) 
 		out = append(out, g)
 	}
 	return out, rows.Err()
+}
+
+// ListGrantsForWorkflowPage returns one bounded page of grants for a workflow.
+// The MCP control plane uses this instead of loading an unbounded ACL into an
+// HTTP response; the workflow tenant is resolved by the caller before this
+// method is reached.
+func (j *Journal) ListGrantsForWorkflowPage(ctx context.Context, workflowID string, limit, offset int) ([]Grant, bool, error) {
+	if workflowID == "" {
+		return nil, false, errors.New("journal: list grants by workflow: workflow_id required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, errors.New("journal: list grants by workflow: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, errors.New("journal: list grants by workflow: negative offset")
+	}
+	const q = `SELECT g.workflow_id, g.credential_id, g.granted_at, g.granted_by, g.note
+		FROM workflow_secret_grants g
+		JOIN workflows w ON w.id = g.workflow_id
+		WHERE g.workflow_id = $1
+		  AND (EXISTS (SELECT 1 FROM credentials c
+		               WHERE c.id = g.credential_id AND c.tenant_id = w.tenant_id)
+		       OR EXISTS (SELECT 1 FROM oauth_connections o
+		                  WHERE g.credential_id = 'oauth:' || o.id AND o.tenant_id = w.tenant_id))
+		ORDER BY g.credential_id LIMIT $2 OFFSET $3`
+	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID, limit+1, offset)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list grants by workflow page: %w", err)
+	}
+	defer rows.Close()
+	var out []Grant
+	for rows.Next() {
+		var (
+			g         Grant
+			granted   sql.NullString
+			grantedBy sql.NullString
+			note      sql.NullString
+		)
+		if err := rows.Scan(&g.WorkflowID, &g.CredentialID, &granted, &grantedBy, &note); err != nil {
+			return nil, false, err
+		}
+		g.GrantedBy = nullableString(grantedBy)
+		g.Note = nullableString(note)
+		if granted.Valid {
+			if t, err := j.parseTime(granted.String); err == nil {
+				g.GrantedAt = t
+			}
+		}
+		out = append(out, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// ListGrantsForWorkflowPageMetadata is the MCP/read-model projection of the
+// workflow grant index. Grant notes are free-form operator text and legacy
+// rows are not guaranteed to respect the current write bound; the control
+// plane only needs the credential id and actor metadata, so this query never
+// selects note.
+func (j *Journal) ListGrantsForWorkflowPageMetadata(ctx context.Context, workflowID string, limit, offset int) ([]Grant, bool, error) {
+	if workflowID == "" {
+		return nil, false, errors.New("journal: list grant metadata by workflow: workflow_id required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		return nil, false, errors.New("journal: list grant metadata by workflow: page limit exceeds 500")
+	}
+	if offset < 0 {
+		return nil, false, errors.New("journal: list grant metadata by workflow: negative offset")
+	}
+	const q = `SELECT g.workflow_id, g.credential_id, g.granted_at, g.granted_by
+		FROM workflow_secret_grants g
+		JOIN workflows w ON w.id = g.workflow_id
+		WHERE g.workflow_id = $1
+		  AND (EXISTS (SELECT 1 FROM credentials c
+		               WHERE c.id = g.credential_id AND c.tenant_id = w.tenant_id)
+		       OR EXISTS (SELECT 1 FROM oauth_connections o
+		                  WHERE g.credential_id = 'oauth:' || o.id AND o.tenant_id = w.tenant_id))
+		ORDER BY g.credential_id LIMIT $2 OFFSET $3`
+	rows, err := j.db.QueryContext(ctx, j.bind(q), workflowID, limit+1, offset)
+	if err != nil {
+		return nil, false, fmt.Errorf("journal: list grant metadata by workflow: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Grant, 0, limit)
+	for rows.Next() {
+		var (
+			g         Grant
+			granted   sql.NullString
+			grantedBy sql.NullString
+		)
+		if err := rows.Scan(&g.WorkflowID, &g.CredentialID, &granted, &grantedBy); err != nil {
+			return nil, false, fmt.Errorf("journal: scan grant metadata: %w", err)
+		}
+		g.GrantedBy = nullableString(grantedBy)
+		if granted.Valid {
+			if t, err := j.parseTime(granted.String); err == nil {
+				g.GrantedAt = t
+			}
+		}
+		out = append(out, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }
 
 // RunIdentity is the authoritative answer to "which workflow is this run, and

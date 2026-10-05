@@ -58,3 +58,28 @@ func TestLoginThrottleLocksAfterMaxFailures(t *testing.T) {
 		t.Fatal("reset should clear the counter")
 	}
 }
+
+func TestLoginThrottleBoundsDistinctFailuresAndExpiresOldEntries(t *testing.T) {
+	tr := newLoginThrottle()
+	tr.maxEntries = 2
+	now := time.Unix(1_700_000_000, 0)
+	tr.now = func() time.Time { return now }
+	tr.recordFailure("1.2.3.4|alice")
+	tr.recordFailure("1.2.3.4|bob")
+	if len(tr.failures) != 2 || !tr.locked("1.2.3.4|charlie") {
+		t.Fatalf("full tracker accepted an untracked identity: entries=%d", len(tr.failures))
+	}
+	tr.recordFailure("1.2.3.4|charlie")
+	if len(tr.failures) != 2 {
+		t.Fatalf("tracker grew past its cap: entries=%d", len(tr.failures))
+	}
+	tr.reset("1.2.3.4|alice")
+	if tr.locked("1.2.3.4|charlie") {
+		t.Fatal("released capacity did not admit another identity")
+	}
+	tr.recordFailure("1.2.3.4|charlie")
+	now = now.Add(tr.lockWindow + time.Minute)
+	if tr.locked("1.2.3.4|dana") || len(tr.failures) != 0 {
+		t.Fatalf("old partial failures were not evicted: entries=%d", len(tr.failures))
+	}
+}

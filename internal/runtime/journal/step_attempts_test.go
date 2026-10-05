@@ -132,6 +132,49 @@ func TestDurableStepEndContinuationSurvivesCrashWindow(t *testing.T) {
 	}
 }
 
+func TestProviderRetryDeadlineSurvivesRestartWithoutConsumingAttempt(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	first, err := j.ClaimStepAttemptSeq(ctx, "run_1", "provider-read", 12, 3, "idem", "hash")
+	if err != nil || first.Attempt != 1 {
+		t.Fatalf("first claim = %+v, %v", first, err)
+	}
+	_, err = j.FinalizeStepAttemptSeqWithRetryAfter(ctx, "run_1", "provider-read", 12, 1, nil, "HTTP 429", true, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := j.LatestStepAttemptSeq(ctx, "run_1", "provider-read", 12)
+	if err != nil || state.Status != StatusRetrying || state.RetryNotBefore.Before(time.Now().Add(4*time.Second)) {
+		t.Fatalf("durable provider deadline = %+v, %v", state, err)
+	}
+	// This is the claim a fresh worker makes after the first one crashes
+	// immediately after the StepEnd commit. Repeated claims wait on the same
+	// persisted deadline and do not spend a retry budget slot.
+	for i := 0; i < 2; i++ {
+		waiting, err := j.ClaimStepAttemptSeq(ctx, "run_1", "provider-read", 12, 3, "idem", "hash")
+		if err != nil || waiting.RetryWait <= 0 || waiting.Attempt != 2 || waiting.Exhausted {
+			t.Fatalf("waiting claim %d = %+v, %v", i, waiting, err)
+		}
+		if count, err := j.AttemptCountSeq(ctx, "run_1", "provider-read", 12); err != nil || count != 1 {
+			t.Fatalf("waiting count = %d, %v; want 1", count, err)
+		}
+	}
+	_, err = j.db.ExecContext(ctx, j.bind(`UPDATE steps SET retry_not_before = $1 WHERE run_id = $2 AND seq = $3 AND step_name = $4`),
+		j.formatTime(time.Now().Add(-time.Second)), "run_1", 12, "provider-read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := j.ClaimStepAttemptSeq(ctx, "run_1", "provider-read", 12, 3, "idem", "hash")
+	if err != nil || second.Attempt != 2 || second.RetryWait != 0 || second.Exhausted {
+		t.Fatalf("claim after deadline = %+v, %v; want attempt 2", second, err)
+	}
+	if count, err := j.AttemptCountSeq(ctx, "run_1", "provider-read", 12); err != nil || count != 2 {
+		t.Fatalf("post-deadline count = %d, %v; want 2", count, err)
+	}
+}
+
 func TestFinalizeStepAttemptAtomicallyCreatesDeadLetterAndRejectsDuplicateEnd(t *testing.T) {
 	t.Parallel()
 	j, cleanup := newTestJournal(t)
@@ -604,5 +647,43 @@ func TestDeadLetterDistributedRedriveQueuesBeforeWorkerClaim(t *testing.T) {
 	}
 	if claimed, err := j.StartDeadLetterRetryQueuedItem(ctx, "run_1", item.ID); err != nil || claimed {
 		t.Fatalf("second distributed redrive claim = %v, %v; want false", claimed, err)
+	}
+}
+
+func TestDeadLetterRedriveAdmissionRespectsDisabledWorkflow(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	claim, err := j.ClaimStepAttemptSeq(ctx, "run_1", "send", 1, 1, "idem", "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadLettered, err := j.FinalizeStepAttemptSeq(ctx, "run_1", "send", 1, claim.Attempt, nil, "permanent", false); err != nil || !deadLettered {
+		t.Fatalf("terminal finalize = %v, %v", deadLettered, err)
+	}
+	if err := j.MarkRunFinished(ctx, "run_1", "failed_dlq"); err != nil {
+		t.Fatal(err)
+	}
+	item, err := j.FindDeadLetterByRun(ctx, "run_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SetWorkflowEnabled(ctx, "wf_1", false); err != nil {
+		t.Fatal(err)
+	}
+
+	if claimed, err := j.StartDeadLetterRetryItem(ctx, "run_1", item.ID); claimed || !errors.Is(err, ErrWorkflowDisabled) {
+		t.Fatalf("disabled local redrive = claimed %v err %v; want false/ErrWorkflowDisabled", claimed, err)
+	}
+	if claimed, err := j.StartDeadLetterRetryQueuedItem(ctx, "run_1", item.ID); claimed || !errors.Is(err, ErrWorkflowDisabled) {
+		t.Fatalf("disabled queued redrive = claimed %v err %v; want false/ErrWorkflowDisabled", claimed, err)
+	}
+	info, err := j.GetRun(ctx, "run_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Status != "failed_dlq" {
+		t.Fatalf("disabled redrive mutated run status to %q", info.Status)
 	}
 }

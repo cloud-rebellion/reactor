@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,14 +14,35 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/bright-interaction/reactor/internal/flowblocks"
 	"github.com/bright-interaction/reactor/internal/knowledge"
 	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
+	"github.com/bright-interaction/reactor/internal/workflowproof"
 )
+
+const workflowArtifactMarker = ".artifact_sha256"
+
+// errWorkflowSourceUnavailable means the dashboard cannot prove that the
+// source being edited corresponds to the workflow's current immutable
+// artifact. A mutable legacy directory is never an acceptable fallback for a
+// journal-backed workflow because it may be shared by tenants with the same
+// slug.
+var errWorkflowSourceUnavailable = errors.New("workflow source snapshot unavailable")
+
+// errWorkflowRevisionFenceUnavailable means a journal-backed editor save was
+// wired to a registrar that cannot atomically compare the reviewed version.
+// Refusing the save is safer than silently appending over a concurrent MCP or
+// CLI revision.
+var errWorkflowRevisionFenceUnavailable = errors.New("workflow revision fence unavailable")
+
+var errWorkflowExpectedVersionInvalid = errors.New("invalid expected workflow version")
 
 // workflowDetail renders the three-pane view for one workflow:
 // DAG (from dag.json), code (workflow.go or main.go), JSON (dag.json).
@@ -47,24 +70,36 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	root := s.WorkflowsRoot
-	if root == "" && s.Registry != nil {
-		root = s.Registry.Root
+	dir, sourceErr := s.workflowSourceDir(ctx, slug, editTenantScope(r))
+	if sourceErr != nil {
+		if errors.Is(sourceErr, errWorkflowSourceUnavailable) {
+			http.Error(w, "workflow source snapshot unavailable; rebuild and re-register this workflow before editing", http.StatusConflict)
+			return
+		}
+		s.errorPage(w, "resolve workflow source", sourceErr)
+		return
 	}
-	dir := filepath.Join(root, slug)
 
-	codeBytes, codePath := readFirstAvailable(dir, "main.go", "workflow.go")
-	dagBytes, dagPath := readFirstAvailable(dir, "dag.json")
+	codeBytes, codePath, codeTruncated := readFirstAvailableBounded(dir, maxFlowSourceBytes, "main.go", "workflow.go", "source/main.go")
+	dagBytes, dagPath, dagTruncated := readFirstAvailableBounded(dir, maxFlowDAGBytes, "dag.json", "source/dag.json")
 
 	availableSet := map[string]bool{}
-	if list, err := s.Registry.List(); err == nil {
-		for _, sl := range list {
-			availableSet[sl] = true
-		}
+	var available []string
+	if scope := editTenantScope(r); scope != "" {
+		available, _ = s.Registry.ListForTenant(scope)
+	} else {
+		available, _ = s.Registry.List()
+	}
+	for _, sl := range available {
+		availableSet[sl] = true
 	}
 
 	triggers, _ := s.Journal.ListTriggersForWorkflow(ctx, wfID)
-	triggerWritesEnabled := s.Vault != nil
+	readOnly := false
+	if user, ok := UserFromContext(r.Context()); ok {
+		readOnly = !user.IsAdmin()
+	}
+	triggerWritesEnabled := s.Vault != nil && !readOnly
 
 	wf, wfErr := s.Journal.GetWorkflow(ctx, wfID)
 	if wfErr != nil {
@@ -72,6 +107,17 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 		// between the two reads). Render with a zero baseline so the
 		// form still works rather than erroring the whole page.
 		s.Log.Warn("workflowDetail: GetWorkflow failed", "wfID", wfID, "err", wfErr)
+	}
+	currentVersion := 0
+	var currentVersionRecord journal.WorkflowVersion
+	if version, versionErr := s.Journal.CurrentWorkflowVersionRecordBounded(ctx, wfID, maxFlowDAGBytes); versionErr == nil {
+		currentVersionRecord = version
+		currentVersion = version.Version
+		var snapshotErr error
+		if dagBytes, dagTruncated, snapshotErr = workflowDetailSnapshot(version, codeBytes, codeTruncated, dagBytes, dagTruncated); snapshotErr != nil {
+			http.Error(w, "workflow source snapshot changed during page load; reload to review the current version", http.StatusConflict)
+			return
+		}
 	}
 
 	// Pull a freshly-minted webhook secret out of the single-use
@@ -89,11 +135,21 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 		s.errorPage(w, "resolve workflow tenant", err)
 		return
 	}
-	triggerActionQuery := ""
+	// Slugs are unique per tenant, not globally. Every form on this page must
+	// carry the selected tenant when a global admin opened a duplicate slug;
+	// otherwise the POST resolves whichever tenant's row the bare-slug lookup
+	// happens to return (and can mutate the wrong workflow).
+	workflowActionQuery := ""
 	if viewerScope(r) == "" && channelScope != "" {
-		triggerActionQuery = "?tenant=" + url.QueryEscape(channelScope)
+		workflowActionQuery = "?tenant=" + url.QueryEscape(channelScope)
 	}
-	allChannels, _ := s.Journal.ListNotificationChannelsByTenant(ctx, channelScope)
+	artifactSHA256, flowProofStatus, flowProofReason := s.workflowDetailProof(ctx, slug, channelScope, currentVersionRecord)
+	channelPage := notificationPageIndex(r, "channel_page")
+	allChannels, channelHasMore, err := s.Journal.ListNotificationChannelMetadataByTenantPage(ctx, channelScope, notificationPageSize, channelPage*notificationPageSize)
+	if err != nil {
+		s.errorPage(w, "list notification channels", err)
+		return
+	}
 	downstream, _ := s.Journal.ChainTriggersDownstreamOf(ctx, wfID)
 	rateLimit, _ := s.Journal.WorkflowRateLimit(ctx, wfID)
 
@@ -103,15 +159,23 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 		Body: template.HTML(workflowDetailBody(workflowDetailData{
 			Slug:                        slug,
 			ID:                          wfID,
+			CurrentVersion:              currentVersion,
+			ArtifactSHA256:              artifactSHA256,
+			FlowProofStatus:             flowProofStatus,
+			FlowProofReason:             flowProofReason,
+			ReadOnly:                    readOnly,
 			Deployed:                    availableSet[slug],
 			CodePath:                    codePath,
 			Code:                        string(codeBytes),
 			DAGPath:                     dagPath,
 			DAG:                         string(dagBytes),
-			EditEnabled:                 s.CodeValidator != nil,
+			DAGTruncated:                dagTruncated,
+			CodeTruncated:               codeTruncated,
+			EditEnabled:                 s.CodeValidator != nil && !readOnly && !codeTruncated,
 			Triggers:                    triggers,
 			TriggerWritesEnabled:        triggerWritesEnabled,
-			TriggerActionQuery:          triggerActionQuery,
+			WorkflowActionQuery:         workflowActionQuery,
+			TriggerActionQuery:          workflowActionQuery,
 			NewWebhookToken:             flash["new_webhook_token"],
 			NewWebhookSecret:            flash["new_webhook_secret"],
 			NewWebhookProvider:          flash["new_webhook_provider"],
@@ -120,19 +184,86 @@ func (s *Server) workflowDetail(w http.ResponseWriter, r *http.Request) {
 			RateLimitPerMin:             rateLimit,
 			NotificationRoutes:          routes,
 			AllNotificationChannels:     allChannels,
+			NotificationChannelPage:     channelPage,
+			NotificationChannelHasMore:  channelHasMore,
 			DownstreamChains:            downstream,
 		})),
 	})
 }
 
+// The editor workspace is mutable. A rebuild or local change between its
+// verification and page rendering must not pair stale source with a newly
+// verified version. The canvas and DAG editor always use the bounded journal
+// DAG from the same immutable version shown in the header. Oversized source
+// is omitted by workflowDetailBody, while a legacy version without a usable
+// code hash remains visibly unverified under workflowDetailProof.
+func workflowDetailSnapshot(version journal.WorkflowVersion, code []byte, codeTruncated bool, workspaceDAG []byte, workspaceDAGTruncated bool) ([]byte, bool, error) {
+	if version.Version < 1 || version.ArtifactSHA256 == "" {
+		return workspaceDAG, workspaceDAGTruncated, nil
+	}
+	if !codeTruncated && len(version.CodeHash) == 16 {
+		sum := sha256.Sum256(code)
+		if hex.EncodeToString(sum[:])[:16] != version.CodeHash {
+			return nil, false, errWorkflowSourceUnavailable
+		}
+	}
+	return version.DAG, version.DAGTruncated, nil
+}
+
+// workflowDetailProof returns the same immutable source/DAG proof used by the
+// dispatcher and MCP readiness receipts. The dashboard is an inspection
+// surface, so an unverifiable version still renders its metadata with a
+// warning; it must never be presented as an executable or trusted flow.
+func (s *Server) workflowDetailProof(_ context.Context, slug, tenant string, version journal.WorkflowVersion) (artifactSHA256, status, reason string) {
+	artifactSHA256 = strings.TrimSpace(version.ArtifactSHA256)
+	if version.Version <= 0 || artifactSHA256 == "" {
+		return artifactSHA256, "missing", "no immutable artifact is pinned"
+	}
+	if version.DAGTruncated {
+		return artifactSHA256, "unavailable", fmt.Sprintf("workflow DAG is %d bytes and exceeds the bounded visual projection", version.DAGBytes)
+	}
+	stateRoot := strings.TrimSpace(s.State)
+	if stateRoot == "" {
+		root := strings.TrimSpace(s.WorkflowsRoot)
+		if root == "" && s.Registry != nil {
+			root = strings.TrimSpace(s.Registry.Root)
+		}
+		if filepath.Base(filepath.Clean(root)) == "workflows" {
+			stateRoot = filepath.Dir(root)
+		} else {
+			stateRoot = root
+		}
+	}
+	if stateRoot == "" {
+		return artifactSHA256, "unavailable", "workflow state root is not configured"
+	}
+	proof := workflowproof.CheckVersionForTenant(stateRoot, slug, tenant, version)
+	return artifactSHA256, proof.Status, proof.Reason
+}
+
 type workflowDetailData struct {
-	Slug, ID                    string
-	Deployed                    bool
-	CodePath, Code              string
-	DAGPath, DAG                string
-	EditEnabled                 bool
-	Triggers                    []journal.Trigger
-	TriggerWritesEnabled        bool
+	Slug, ID        string
+	CurrentVersion  int
+	ArtifactSHA256  string
+	FlowProofStatus string
+	FlowProofReason string
+	// ReadOnly is true for an authenticated member. Members can inspect a
+	// workflow and run/cancel runs in their tenant, but all authoring,
+	// lifecycle, trigger, notification, and editor mutations are admin-only.
+	ReadOnly             bool
+	Deployed             bool
+	CodePath, Code       string
+	CodeTruncated        bool
+	DAGPath, DAG         string
+	DAGTruncated         bool
+	EditEnabled          bool
+	Triggers             []journal.Trigger
+	TriggerWritesEnabled bool
+	// WorkflowActionQuery disambiguates admin mutations when duplicate slugs
+	// exist across tenants. Members are pinned by session scope and leave it
+	// empty; TriggerActionQuery is retained as a separate field for trigger
+	// rendering tests and compatibility.
+	WorkflowActionQuery         string
 	TriggerActionQuery          string
 	NewWebhookToken             string
 	NewWebhookSecret            string
@@ -141,73 +272,95 @@ type workflowDetailData struct {
 	EstimatedMinutesSavedPerRun int
 	RateLimitPerMin             int
 	NotificationRoutes          []journal.NotificationRouteWithChannel
-	AllNotificationChannels     []journal.NotificationChannel
+	AllNotificationChannels     []journal.NotificationChannelMetadata
+	NotificationChannelPage     int
+	NotificationChannelHasMore  bool
 	DownstreamChains            []journal.ChainTriggerView
 }
 
 func workflowDetailBody(d workflowDetailData) string {
 	var b strings.Builder
+	workflowActionQuery := d.WorkflowActionQuery
 
 	// Top metadata strip.
 	deploy := `<span class="tag tag-off">missing</span>`
 	if d.Deployed {
 		deploy = `<span class="tag tag-on">deployed</span>`
 	}
+	artifactDigest := strings.TrimSpace(d.ArtifactSHA256)
+	if artifactDigest == "" {
+		artifactDigest = "-"
+	}
+	artifactStatus := workflowProofTag(d.FlowProofStatus)
 	fmt.Fprintf(&b, `<table>
 <tr><th>Slug</th><td><code>%s</code></td></tr>
 <tr><th>ID</th><td><code>%s</code></td></tr>
+<tr><th>Immutable version</th><td>%s</td></tr>
+<tr><th>Artifact SHA-256</th><td><code>%s</code></td></tr>
+<tr><th>Flow proof</th><td>%s%s</td></tr>
 <tr><th>Binary</th><td>%s</td></tr>
 </table>`,
-		template.HTMLEscapeString(d.Slug), template.HTMLEscapeString(d.ID), deploy)
+		template.HTMLEscapeString(d.Slug), template.HTMLEscapeString(d.ID),
+		workflowVersionLabel(d.CurrentVersion), template.HTMLEscapeString(boundWorkflowArtifactDigest(artifactDigest)),
+		artifactStatus, workflowProofReasonHTML(d.FlowProofReason), deploy)
 
 	// Lifecycle actions: manual run + enable/disable + delete.
 	b.WriteString(`<h2>Run now</h2>`)
-	fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/run" class="form">
+	fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/run%s" class="form">
   <label>Payload (JSON, optional)
     <textarea name="payload" rows="4" placeholder='{"hello":"world"}'></textarea>
   </label>
   <label class="form-inline"><input type="checkbox" name="dry_run"> Test run (dry run): execute with this input but suppress notifications + downstream chains. Workflow code can read REACTOR_MODE=dry_run to mock its own external calls.</label>
   <button type="submit" class="btn-primary">Dispatch</button>
   <span class="muted">Fires the workflow as a manual trigger. The run shows up at <code>/runs</code> within a second.</span>
-</form>`, template.URLQueryEscaper(d.Slug))
+</form>`, template.URLQueryEscaper(d.Slug), workflowActionQuery)
 
-	b.WriteString(`<h2>Lifecycle</h2>`)
-	fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/disable" class="form-inline">
+	if !d.ReadOnly {
+		b.WriteString(`<h2>Lifecycle</h2>`)
+		fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/disable%s" class="form-inline">
   <button type="submit">Disable</button>
   <span class="muted">Stops dispatcher from accepting new runs. Existing runs continue.</span>
 </form>
-<form method="POST" action="/workflows/%s/enable" class="form-inline">
+<form method="POST" action="/workflows/%s/enable%s" class="form-inline">
   <button type="submit">Enable</button>
 </form>
-<form method="POST" action="/workflows/%s/delete" class="form-inline" data-confirm="Delete workflow + all run history? This cannot be undone.">
+<form method="POST" action="/workflows/%s/delete%s" class="form-inline" data-confirm="Delete workflow + all run history? This cannot be undone.">
   <button type="submit" class="btn-link">Delete (irreversible)</button>
 </form>`,
-		template.URLQueryEscaper(d.Slug),
-		template.URLQueryEscaper(d.Slug),
-		template.URLQueryEscaper(d.Slug),
-	)
+			template.URLQueryEscaper(d.Slug),
+			workflowActionQuery,
+			template.URLQueryEscaper(d.Slug),
+			workflowActionQuery,
+			template.URLQueryEscaper(d.Slug),
+			workflowActionQuery,
+		)
 
-	// Time-saved baseline: drives the home dashboard headline number.
-	b.WriteString(`<h2>Time saved</h2>`)
-	fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/minutes-saved" class="form-inline">
+		// Time-saved baseline: drives the home dashboard headline number.
+		b.WriteString(`<h2>Time saved</h2>`)
+		fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/minutes-saved%s" class="form-inline">
   <label>Manual baseline <input type="number" name="minutes" min="0" max="100000" value="%d" required> minutes per successful run</label>
   <button type="submit">Save</button>
   <span class="muted">How long a person would have spent doing this run by hand. The home dashboard's "Time saved" tile is the sum across all workflows of (this number x succeeded runs).</span>
 </form>`,
-		template.URLQueryEscaper(d.Slug),
-		d.EstimatedMinutesSavedPerRun,
-	)
+			template.URLQueryEscaper(d.Slug),
+			workflowActionQuery,
+			d.EstimatedMinutesSavedPerRun,
+		)
 
-	// Rate limit: cap how fast this workflow may start runs.
-	b.WriteString(`<h2>Rate limit</h2>`)
-	fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/rate-limit" class="form-inline">
+		// Rate limit: cap how fast this workflow may start runs.
+		b.WriteString(`<h2>Rate limit</h2>`)
+		fmt.Fprintf(&b, `<form method="POST" action="/workflows/%s/rate-limit%s" class="form-inline">
   <label>Max runs <input type="number" name="per_min" min="0" max="100000" value="%d" required> per minute (0 = unlimited)</label>
   <button type="submit">Save</button>
   <span class="muted">Runs past this in any 60s window are refused (the trigger source backs off). Counted across instances.</span>
 </form>`,
-		template.URLQueryEscaper(d.Slug),
-		d.RateLimitPerMin,
-	)
+			template.URLQueryEscaper(d.Slug),
+			workflowActionQuery,
+			d.RateLimitPerMin,
+		)
+	} else {
+		b.WriteString(`<p class="muted">Workflow configuration is read-only for members. Ask an administrator to change lifecycle, limits, triggers, notifications, or source.</p>`)
+	}
 
 	// Triggers section: surface every inbound source + let the operator
 	// add/remove without dropping into SQL.
@@ -215,7 +368,7 @@ func workflowDetailBody(d workflowDetailData) string {
 
 	// Notifications routing section: which channels fire on which
 	// terminal statuses for this workflow.
-	b.WriteString(renderNotificationRoutesSection(d.Slug, d.NotificationRoutes, d.AllNotificationChannels))
+	b.WriteString(renderNotificationRoutesSectionForTenantPage(d.Slug, d.NotificationRoutes, d.AllNotificationChannels, d.ReadOnly, workflowActionQuery, d.NotificationChannelPage, d.NotificationChannelHasMore))
 
 	// Downstream chain section: workflows that fire when THIS workflow
 	// terminates. The upstream side (workflows that THIS depends on)
@@ -228,8 +381,9 @@ func workflowDetailBody(d workflowDetailData) string {
 	// Code view keeps the whole-file editors for devs. CSP stays script-src
 	// 'self': every bit of logic lives in /assets, no inline JS.
 	b.WriteString(`<h2>Editor</h2>`)
-	fmt.Fprintf(&b, `<div id="wf-editor" data-slug="%s" data-editable="%t">`,
-		template.HTMLEscapeString(d.Slug), d.EditEnabled)
+	editable := d.EditEnabled && !d.CodeTruncated
+	fmt.Fprintf(&b, `<div id="wf-editor" data-slug="%s" data-editable="%t" data-action-query="%s" data-expected-version="%d">`,
+		template.HTMLEscapeString(d.Slug), editable, template.HTMLEscapeString(workflowActionQuery), d.CurrentVersion)
 	b.WriteString(`<div class="wf-toolbar" role="tablist">` +
 		`<button type="button" class="wf-tab is-active" data-view="visual">Visual</button>` +
 		`<button type="button" class="wf-tab" data-view="code">Code</button>` +
@@ -237,15 +391,37 @@ func workflowDetailBody(d workflowDetailData) string {
 
 	// Visual view: the data-flow map.
 	b.WriteString(`<section class="wf-view" data-view="visual">`)
-	if d.DAG == "" {
+	if d.FlowProofStatus == "visual_unverified" || d.FlowProofStatus == "legacy_manifest_unpinned" {
+		fmt.Fprintf(&b, `<p class="callout">This legacy artifact passed the available executable integrity checks, but its retained source manifest was not pinned when published. An already enabled version can keep running under its original proof policy. The displayed inner-step block annotations are unverified; rebuild and review a corrected flow before enabling this version again.%s</p>`, workflowProofReasonHTML(d.FlowProofReason))
+	} else if d.FlowProofStatus != "verified" {
+		fmt.Fprintf(&b, `<p class="callout">This visual flow is inspection data only. Immutable source/DAG proof is <strong>%s</strong>; Reactor will keep enablement and dispatch closed until the retained artifact and flow verify together.%s</p>`,
+			template.HTMLEscapeString(displayWorkflowProofStatus(d.FlowProofStatus)), workflowProofReasonHTML(d.FlowProofReason))
+	} else {
+		b.WriteString(`<p class="muted">Durable flow proof verified against the immutable artifact and retained source. Review the durable nodes and edges before enabling; inner-step visual blocks are author-declared annotations.</p>`)
+	}
+	b.WriteString(`<p class="flow-note">This canvas shows the author-declared dependency graph; runtime step receipts show the actual path. Optional visual blocks inside a step are author-declared annotations, not inferred or independently executed. Undeclared branch predicates, error paths, loops, aggregation, and data transforms inside Go nodes remain unavailable.</p>`)
+	if d.DAGTruncated {
+		b.WriteString(`<p class="warn">dag.json exceeds the dashboard flow projection limit and was not embedded. Inspect the bounded MCP flow resource or replace the oversized artifact before treating this view as complete.</p>`)
+	} else if d.DAG == "" {
 		b.WriteString(`<p class="empty">No dag.json found at <code>` + template.HTMLEscapeString(d.DAGPath+"/dag.json") + `</code>. Hand-built workflows can run without one; codegen-generated workflows always include it.</p>`)
 	} else {
 		// Cytoscape canvas. Data lives in a non-executing JSON island the
 		// dag-render.js script reads; CSP stays script-src 'self'.
+		stepFlows := flowblocks.FromDAG([]byte(d.DAG), maxFlowDAGBytes)
 		b.WriteString(`<div id="dag-canvas" class="wf-canvas"></div>`)
-		fmt.Fprintf(&b, `<script type="application/json" id="dag-data">%s</script>`, template.JSEscapeString(d.DAG))
+		fmt.Fprintf(&b, `<script type="application/json" id="dag-data">%s</script>`, scriptJSON([]byte(d.DAG)))
+		if stepFlows.Complete && len(stepFlows.Steps) > 0 {
+			if raw, err := json.Marshal(stepFlows); err == nil {
+				fmt.Fprintf(&b, `<script type="application/json" id="step-flows-data">%s</script>`, scriptJSON(raw))
+			}
+		}
 		b.WriteString(`<script src="/assets/cytoscape.min.js"></script>`)
 		b.WriteString(`<script src="/assets/dag-render.js"></script>`)
+		if len(stepFlows.Steps) > 0 || !stepFlows.Complete {
+			b.WriteString(`<details class="wf-steptable"><summary>Declared visual blocks inside steps</summary>`)
+			b.WriteString(renderAllDeclaredStepFlows(stepFlows))
+			b.WriteString(`</details>`)
+		}
 		// Step summary table stays as accessible fallback (also useful with
 		// JS off, or to read idempotency keys / timeouts beside the graph).
 		b.WriteString(`<details class="wf-steptable"><summary>Step table + dag.json source</summary>`)
@@ -258,12 +434,17 @@ func workflowDetailBody(d workflowDetailData) string {
 
 	// Code view: whole-file editors for devs.
 	b.WriteString(`<section class="wf-view" data-view="code" hidden>`)
-	if d.Code == "" {
+	if d.CodeTruncated {
+		fmt.Fprintf(&b, `<p class="warn">Source at <code>%s</code> exceeds the dashboard projection limit and was not embedded. Use the bounded MCP source resource or rebuild the workflow before editing it here.</p>`, template.HTMLEscapeString(d.CodePath))
+	} else if d.Code == "" {
 		b.WriteString(`<p class="empty">Source not bundled at <code>` + template.HTMLEscapeString(d.CodePath) + `</code>. Operators can copy main.go into the workflow directory to surface it here.</p>`)
 	} else {
 		fmt.Fprintf(&b, `<p class="muted">From <code>%s</code></p>`, template.HTMLEscapeString(d.CodePath))
 		if d.EditEnabled {
-			fmt.Fprintf(&b, `<form method="post" action="/workflows/%s/code">`, template.URLQueryEscaper(d.Slug))
+			fmt.Fprintf(&b, `<form method="post" action="/workflows/%s/code%s">`, template.URLQueryEscaper(d.Slug), workflowActionQuery)
+			if d.CurrentVersion > 0 {
+				fmt.Fprintf(&b, `<input type="hidden" name="expected_version" value="%d">`, d.CurrentVersion)
+			}
 			fmt.Fprintf(&b, `<textarea name="body" rows="20" class="wf-codearea">%s</textarea>`, template.HTMLEscapeString(d.Code))
 			b.WriteString(`<p><button type="submit" class="btn-primary">Save (runs go vet + reactor lint + go build)</button> <span class="muted">Failed validation returns 422 with the issue list.</span></p></form>`)
 		} else {
@@ -272,10 +453,15 @@ func workflowDetailBody(d workflowDetailData) string {
 			b.WriteString(`</pre>`)
 		}
 	}
-	if d.EditEnabled && d.DAG != "" {
-		fmt.Fprintf(&b, `<h3>dag.json</h3><form method="post" action="/workflows/%s/dag">`, template.URLQueryEscaper(d.Slug))
+	if d.EditEnabled && d.DAG != "" && !d.DAGTruncated {
+		fmt.Fprintf(&b, `<h3>dag.json</h3><form method="post" action="/workflows/%s/dag%s">`, template.URLQueryEscaper(d.Slug), workflowActionQuery)
+		if d.CurrentVersion > 0 {
+			fmt.Fprintf(&b, `<input type="hidden" name="expected_version" value="%d">`, d.CurrentVersion)
+		}
 		fmt.Fprintf(&b, `<textarea name="body" rows="14" class="wf-codearea">%s</textarea>`, template.HTMLEscapeString(prettyJSON(d.DAG)))
 		b.WriteString(`<p><button type="submit" class="btn-primary">Save (runs JSON Schema validate)</button></p></form>`)
+	} else if d.EditEnabled && d.DAGTruncated {
+		b.WriteString(`<p class="warn">The dag.json editor is disabled because the retained file exceeds the dashboard projection limit. Use the MCP flow inspection and replace it through a bounded authoring revision.</p>`)
 	}
 	b.WriteString(`</section></div>`)
 
@@ -287,6 +473,10 @@ func workflowDetailBody(d workflowDetailData) string {
 		`<h3 id="wf-drawer-title">node</h3></div>` +
 		`<button type="button" id="wf-drawer-close" class="wf-drawer-x" aria-label="Close">&times;</button></header>` +
 		`<div class="wf-drawer-body"><p id="wf-drawer-meta" class="muted"></p>` +
+		`<section id="wf-drawer-blockflow" class="wf-drawer-blockflow" hidden><div class="wf-drawer-sechdr">Declared block flow <span class="muted">inside this durable step</span></div>` +
+		`<p class="flow-note">Author-declared review metadata. Only the enclosing durable step has an execution receipt; inspect the Go source to confirm these operations.</p>` +
+		`<div id="wf-blockflow-canvas" class="wf-blockflow-canvas" role="img" aria-label="Declared block data flow"></div>` +
+		`<div id="wf-blockflow-list" class="wf-blockflow-list"></div></section>` +
 		`<div id="wf-drawer-dataflow" class="wf-dataflow"></div>` +
 		`<div class="wf-drawer-codewrap"><div class="wf-drawer-sechdr">Code <span class="muted">edit this node, Apply re-runs the validator</span></div>` +
 		`<textarea id="wf-drawer-code" class="wf-codearea" rows="16" spellcheck="false"></textarea></div>` +
@@ -296,6 +486,51 @@ func workflowDetailBody(d workflowDetailData) string {
 	b.WriteString(`<script src="/assets/workflow-editor.js"></script>`)
 
 	return b.String()
+}
+
+func workflowVersionLabel(version int) string {
+	if version < 1 {
+		return `<span class="tag tag-off">none</span>`
+	}
+	return fmt.Sprintf(`<code>v%d</code>`, version)
+}
+
+func boundWorkflowArtifactDigest(digest string) string {
+	if len(digest) <= 128 {
+		return digest
+	}
+	return digest[:128] + "..."
+}
+
+func displayWorkflowProofStatus(status string) string {
+	switch status {
+	case "verified", "visual_unverified", "legacy_manifest_unpinned", "unavailable", "legacy_unverified", "mismatch", "missing":
+		return status
+	default:
+		return "unknown"
+	}
+}
+
+func workflowProofTag(status string) string {
+	status = displayWorkflowProofStatus(status)
+	class := "tag-warn"
+	if status == "verified" {
+		class = "tag-on"
+	} else if status == "missing" {
+		class = "tag-off"
+	}
+	return fmt.Sprintf(`<span class="tag %s">%s</span>`, class, template.HTMLEscapeString(status))
+}
+
+func workflowProofReasonHTML(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return ""
+	}
+	if len(reason) > 512 {
+		reason = reason[:512] + "..."
+	}
+	return ` <span class="muted">` + template.HTMLEscapeString(reason) + `</span>`
 }
 
 // renderDAGSummary parses dag.json and renders a small step list that
@@ -311,15 +546,27 @@ func renderDAGSummary(src string) string {
 			TimeoutSeconds float64  `json:"timeout_seconds,omitempty"`
 		} `json:"steps"`
 		Nodes []struct {
+			ID   string `json:"id"`
 			Name string `json:"name"`
 			Kind string `json:"kind"`
 		} `json:"nodes"`
+		Edges []struct {
+			From string `json:"from"`
+			To   string `json:"to"`
+		} `json:"edges"`
 		Triggers []struct {
 			Kind string `json:"kind"`
 		} `json:"triggers"`
 	}
+	if len(src) > maxFlowDAGBytes {
+		return `<p class="warn">dag.json is too large to render safely.</p>`
+	}
 	if err := json.Unmarshal([]byte(src), &dag); err != nil {
 		return `<p class="warn">dag.json is not parseable: ` + template.HTMLEscapeString(err.Error()) + `</p>`
+	}
+	if (len(dag.Steps) > 0 && len(dag.Steps) > maxFlowNodes) ||
+		(len(dag.Steps) == 0 && (len(dag.Nodes) > maxFlowNodes || len(dag.Edges) > maxFlowEdges)) || len(dag.Triggers) > maxFlowNodes {
+		return `<p class="warn">dag.json exceeds the visual summary limits.</p>`
 	}
 
 	type step struct {
@@ -328,19 +575,98 @@ func renderDAGSummary(src string) string {
 		Idem           string
 		TimeoutSeconds float64
 	}
+	// Keep this table in lockstep with dag-render.js and the MCP flow
+	// normalizer: a non-empty steps[] is the executable representation, so a
+	// stale visual nodes[] companion must not add rows that cannot run. An
+	// empty steps[] is the legacy visual-editor form and uses nodes[].
 	steps := make([]step, 0, len(dag.Steps)+len(dag.Nodes))
+	byName := make(map[string]int, len(dag.Steps)+len(dag.Nodes))
 	for _, s := range dag.Steps {
-		steps = append(steps, step{Name: s.Name, Kind: s.Kind, DependsOn: s.DependsOn, Idem: s.IdempotencyKey, TimeoutSeconds: s.TimeoutSeconds})
+		if s.Name == "" {
+			continue
+		}
+		if len(s.Name) > maxFlowIdentifier || len(s.DependsOn) > maxFlowEdges {
+			return `<p class="warn">dag.json contains an oversized step definition.</p>`
+		}
+		if _, exists := byName[s.Name]; exists {
+			continue
+		}
+		byName[s.Name] = len(steps)
+		steps = append(steps, step{Name: s.Name, Kind: boundFlowDisplay(s.Kind), DependsOn: append([]string(nil), s.DependsOn...), Idem: boundFlowDisplay(s.IdempotencyKey), TimeoutSeconds: s.TimeoutSeconds})
 	}
-	for _, n := range dag.Nodes {
-		steps = append(steps, step{Name: n.Name, Kind: n.Kind})
+	if len(dag.Steps) == 0 {
+		for _, n := range dag.Nodes {
+			name := n.ID
+			if name == "" {
+				name = n.Name
+			}
+			if name == "" {
+				continue
+			}
+			if len(name) > maxFlowIdentifier {
+				return `<p class="warn">dag.json contains an oversized node identifier.</p>`
+			}
+			if _, exists := byName[name]; exists {
+				continue
+			}
+			byName[name] = len(steps)
+			steps = append(steps, step{Name: name, Kind: boundFlowDisplay(n.Kind)})
+		}
+	}
+	// Normalize legacy depends_on values before considering visual edges. The flow
+	// renderer drops dangling and self references, so this summary must do the
+	// same or the table can claim lineage that the canvas and runtime ignore.
+	usedEdges := 0
+	for i := range steps {
+		filtered := steps[i].DependsOn[:0]
+		for _, dep := range steps[i].DependsOn {
+			if dep == "" || dep == steps[i].Name || len(dep) > maxFlowIdentifier {
+				continue
+			}
+			if _, ok := byName[dep]; !ok {
+				continue
+			}
+			updated := appendUnique(filtered, dep)
+			if len(updated) == len(filtered) {
+				continue
+			}
+			filtered = updated
+			usedEdges++
+			if usedEdges > maxFlowEdges {
+				return `<p class="warn">dag.json exceeds the visual edge limits.</p>`
+			}
+		}
+		steps[i].DependsOn = filtered
+	}
+	// Top-level edges[] belongs to the nodes[] encoding. The canvas and run
+	// flow ignore it when executable steps[] exists; the accessible table must
+	// not present a stale edge between two real steps as a dependency.
+	if len(dag.Steps) == 0 {
+		for _, edge := range dag.Edges {
+			if edge.From == "" || edge.To == "" || edge.From == edge.To {
+				continue
+			}
+			target, targetOK := byName[edge.To]
+			if _, sourceOK := byName[edge.From]; !sourceOK || !targetOK {
+				continue
+			}
+			updated := appendUnique(steps[target].DependsOn, edge.From)
+			if len(updated) == len(steps[target].DependsOn) {
+				continue
+			}
+			steps[target].DependsOn = updated
+			usedEdges++
+			if usedEdges > maxFlowEdges {
+				return `<p class="warn">dag.json exceeds the visual edge limits.</p>`
+			}
+		}
 	}
 
 	var b strings.Builder
 	if len(dag.Triggers) > 0 {
 		var ts []string
 		for _, t := range dag.Triggers {
-			ts = append(ts, template.HTMLEscapeString(t.Kind))
+			ts = append(ts, template.HTMLEscapeString(boundFlowDisplay(t.Kind)))
 		}
 		b.WriteString(`<p>Triggers: `)
 		b.WriteString(strings.Join(ts, ", "))
@@ -521,19 +847,32 @@ func (s *Server) graphJSON(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-// readFirstAvailable returns the first existing file under dir from
-// the candidate names, or empty bytes + the (last attempted) path.
-// Used by /workflows/{slug} so we can render gracefully whether the
-// source landed as workflow.go (codegen) or main.go (hand-built).
-func readFirstAvailable(dir string, names ...string) ([]byte, string) {
+// readFirstAvailableBounded is the dashboard counterpart to the MCP flow
+// projection boundary. It reads at most max+1 bytes so an imported or damaged
+// dag.json cannot be fully materialized into the HTML page before the browser
+// applies its own graph limits. The caller receives a clear truncation bit and
+// can render a warning instead of a misleading partial graph.
+func readFirstAvailableBounded(dir string, max int, names ...string) ([]byte, string, bool) {
+	if max <= 0 {
+		return nil, filepath.Join(dir, names[len(names)-1]), false
+	}
 	for _, n := range names {
 		p := filepath.Join(dir, n)
-		data, err := os.ReadFile(p)
-		if err == nil {
-			return data, p
+		f, err := os.Open(p)
+		if err != nil {
+			continue
 		}
+		data, readErr := io.ReadAll(io.LimitReader(f, int64(max)+1))
+		_ = f.Close()
+		if readErr != nil {
+			continue
+		}
+		if len(data) > max {
+			return data[:max], p, true
+		}
+		return data, p, false
 	}
-	return nil, filepath.Join(dir, names[len(names)-1])
+	return nil, filepath.Join(dir, names[len(names)-1]), false
 }
 
 // prettyJSON re-indents src for display. Returns src unchanged if it
@@ -582,14 +921,13 @@ func onboardingBody(hasWorkflow, hasCred, hasRun bool) string {
 	b.WriteString(step(1, true, "Daemon up", `<p>If you're reading this page the daemon's HTTP listener is alive. Healthz lives at <a href="/healthz"><code>/healthz</code></a>.</p>`))
 
 	b.WriteString(step(2, false, "Connect your AI coding client", `
-<p>Reactor's builder is <strong>your</strong> AI coding CLI (Claude Code or Codex), not a server-side API key: the client reads your live environment over MCP and writes the workflow Go. Install the reactor MCP server; each command prints the config snippet to paste in:</p>
-<pre>reactor mcp install --client claude-code   # Claude Code (.claude/settings.json)
-reactor mcp install --client codex         # Codex CLI (~/.codex/config.toml)
-reactor mcp install --client claude-desktop
-reactor mcp install --client cursor
-reactor mcp install --client continue
-reactor mcp install --client cline</pre>
-<p>Add <code>--allow-write</code> to register the authoring tools (<code>reactor_create_workflow</code>, <code>reactor_grant_secret</code>, <code>reactor_dispatch_workflow</code>). Restart the client; <code>tools/list</code> should now show the reactor tools.</p>
+	<p>Reactor's builder is <strong>your</strong> AI coding CLI (Claude Code or Codex), not a server-side API key: the client reads your live environment over MCP and writes the workflow Go. The daemon serves MCP over authenticated HTTP at <code>/mcp</code>. MCP clients do not reuse the browser's dashboard session. After <code>reactor setup</code>, sign in and mint a user API token at <a href="/tokens"><code>/tokens</code></a> (it is shown once), then keep it in the client environment before generating a registration:</p>
+<pre>export REACTOR_MCP_TOKEN='rtr_...'
+reactor mcp install --client claude-code --token-env REACTOR_MCP_TOKEN
+reactor mcp check --url http://127.0.0.1:7777/mcp</pre>
+<p>The installer prints equivalent HTTP snippets for Codex, Claude Desktop, Cursor, Continue, and Cline. Loopback development may use an explicitly configured no-auth daemon; remote endpoints must use HTTPS and an authenticated bearer, and the installer refuses to print an unauthenticated remote registration.</p>
+<p>These commands default to <code>http://127.0.0.1:7777/mcp</code>; pass <code>--url</code> for another host or TLS endpoint. Remote endpoints must use HTTPS and an authenticated bearer. A dedicated <code>REACTOR_MCP_TOKEN</code> configured on the daemon is an alternative to a user API token; set its matching <code>REACTOR_MCP_TENANT</code> explicitly. Start the daemon with <code>reactor serve</code> and enable only the required <code>--mcp-allow-*</code> capabilities.</p>
+<p>For a narrowly scoped client, enable only the daemon capabilities it needs: <code>--mcp-allow-authoring</code> for <code>reactor_create_workflow</code>, <code>--mcp-allow-secrets</code> for vault grants, and <code>--mcp-allow-dispatch</code> for <code>reactor_dispatch_workflow</code>. Restart the client; <code>tools/list</code> should show the selected tools.</p>
 <p class="muted">The in-dashboard prompt bar (a convenience that builds server-side) is optional and only appears when <code>ANTHROPIC_API_KEY</code> is set. You do not need it: the CLI-over-MCP path above is the primary one.</p>`))
 
 	b.WriteString(step(3, hasCred, "Add your first credential", `
@@ -647,27 +985,52 @@ func (s *Server) runTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Replay any buffered lines first so a late subscriber sees the
-	// run from the beginning.
-	for _, line := range s.LogBuffer.Snapshot(id) {
+	// Replay the buffered tail and subscribe under one per-run lock. Taking a
+	// snapshot and subscribing in separate calls leaves a gap where a line can
+	// be appended to neither the replay nor the live stream.
+	snapshot, sub := s.LogBuffer.SubscribeWithSnapshot(id)
+	snapshot = boundRunDetailLogs(snapshot)
+	// After a daemon restart the in-memory buffer is empty, while the durable
+	// run is already terminal and its log tail lives in the journal. Do not
+	// leave a client hanging on a brand-new open subscription in that case.
+	if len(snapshot) == 0 {
+		if info, err := s.Journal.GetRunForTenantMetadata(r.Context(), id, viewerScope(r), 0); err == nil && isTerminalStatus(info.Status) {
+			if persisted, logErr := s.Journal.GetRunLogsPageForTenantBounded(r.Context(), id, info.TenantID, maxRunDetailLogLines, 0, maxRunDetailLogLineBytes); logErr == nil {
+				snapshot = boundRunDetailPersistedLogs(persisted)
+			}
+			for _, line := range snapshot {
+				writeSSE(w, line)
+			}
+			flusher.Flush()
+			s.LogBuffer.Unsubscribe(id, sub)
+			return
+		}
+	}
+	for _, line := range snapshot {
 		writeSSE(w, line)
 	}
 	flusher.Flush()
-
-	sub := s.LogBuffer.Subscribe(id)
 	defer s.LogBuffer.Unsubscribe(id, sub)
 
 	ctx := r.Context()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-heartbeat.C:
+			// Keep an otherwise-quiet SSE connection visible to reverse
+			// proxies and browsers. A comment is valid SSE and carries no
+			// workflow data.
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
 		case line, ok := <-sub:
 			if !ok {
 				// Buffer closed (run finished + cleanup ran).
 				return
 			}
-			writeSSE(w, line)
+			writeSSE(w, boundRunDetailLogLine(line))
 			flusher.Flush()
 		}
 	}
@@ -682,17 +1045,25 @@ func writeSSE(w http.ResponseWriter, line string) {
 	fmt.Fprint(w, "\n")
 }
 
+// Retained source snapshots normally carry a registry manifest with these
+// bounds. Legacy artifacts may not, so materialisation enforces the same
+// per-file and aggregate limits before copying bytes into the editor
+// workspace.
+const (
+	maxWorkflowMaterializedFileBytes  = 16 << 20
+	maxWorkflowMaterializedTotalBytes = 64 << 20
+)
+
 // maxEditBody caps the size of a code or dag save. 1 MiB is plenty for
 // a workflow.go (the lint already forbids the heavy stdlib that would
 // bloat output) + dag.json should be a few KB. A bigger payload almost
 // certainly indicates a misuse of the endpoint.
 const maxEditBody = 1 << 20
 
-// workflowSaveCode replaces <root>/workflows/<slug>/main.go (preferred)
-// or workflow.go after running the same validator the codegen
-// orchestrator uses. On success the file is atomically renamed into
-// place + a git commit lands. On validation failure: 422 with the
-// validator's error message in the response body.
+// workflowSaveCode replaces the workflow-ID editor workspace source after
+// running the same validator the codegen orchestrator uses. On success the
+// file is atomically renamed into place, rebuilt into an immutable artifact,
+// and committed. On validation failure: 422 with the validator's error.
 func (s *Server) workflowSaveCode(w http.ResponseWriter, r *http.Request) {
 	slug, ok := slugFromRequest(w, r)
 	if !ok {
@@ -709,17 +1080,44 @@ func (s *Server) workflowSaveCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir := filepath.Join(s.WorkflowsRoot, slug)
-	// Read the sibling dag.json so the validator gets a complete
-	// EmitInput shape; the chain checks dag.json validity too.
-	dagBytes, _ := os.ReadFile(filepath.Join(dir, "dag.json"))
+	expectedVersion, err := s.workflowEditVersion(r.Context(), r, slug, editTenantScope(r))
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(err, errWorkflowExpectedVersionInvalid) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else {
+			s.errorPage(w, "resolve workflow version", err)
+		}
+		return
+	}
+	dir, err := s.workflowSourceDir(r.Context(), slug, editTenantScope(r))
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(err, errWorkflowSourceUnavailable) {
+			http.Error(w, "workflow source snapshot unavailable; rebuild and re-register this workflow before editing", http.StatusConflict)
+		} else {
+			s.errorPage(w, "resolve workflow source", err)
+		}
+		return
+	}
+	// Read the sibling dag.json so the validator gets a complete EmitInput
+	// shape; the chain checks dag.json validity too. A retained oversized DAG
+	// is not safe to splice into an edit workspace, so refuse the edit rather
+	// than silently validating against a truncated projection.
+	dagBytes, _, dagTruncated := readFirstAvailableBounded(dir, maxFlowDAGBytes, "dag.json", "source/dag.json")
+	if dagTruncated {
+		http.Error(w, "workflow DAG exceeds the dashboard projection limit; rebuild before editing source", http.StatusConflict)
+		return
+	}
 
-	if status, err := s.writeValidatedCode(r.Context(), slug, dir, viewerScope(r), body, dagBytes); err != nil {
+	if status, err := s.writeValidatedCode(r.Context(), slug, dir, editTenantScope(r), expectedVersion, body, dagBytes); err != nil {
 		// 422 is a build/lint failure: the workflow author needs the compiler
 		// output to fix their own code, so surface it. Everything else
 		// (including 500) is an internal error that must not leak SQL/paths/vault
 		// detail to the client; route it through the generic error page.
-		if status == http.StatusUnprocessableEntity {
+		if status == http.StatusUnprocessableEntity || status == http.StatusConflict || status == http.StatusServiceUnavailable {
 			http.Error(w, err.Error(), status)
 		} else {
 			s.errorPage(w, "save code", err)
@@ -727,7 +1125,7 @@ func (s *Server) workflowSaveCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "/workflows/"+slug, http.StatusSeeOther)
+	http.Redirect(w, r, workflowEditRedirect(r, slug), http.StatusSeeOther)
 }
 
 // writeValidatedCode validates body (a full main.go) through the code
@@ -735,7 +1133,7 @@ func (s *Server) workflowSaveCode(w http.ResponseWriter, r *http.Request) {
 // in a tmp dir so a failed validate never leaves a half-written file. Returns
 // (0, nil) on success; on failure an HTTP status (422 for a validation error,
 // 500 for IO) plus the error to surface.
-func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant string, body, dagBytes []byte) (int, error) {
+func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant string, expectedVersion int, body, dagBytes []byte) (int, error) {
 	tmpDir, err := os.MkdirTemp("", "reactor-edit-")
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("tmp dir: %w", err)
@@ -750,6 +1148,10 @@ func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant
 	if err := s.CodeValidator.Validate(ctx, tmpDir, slug, string(body), string(dagBytes)); err != nil {
 		return http.StatusUnprocessableEntity, fmt.Errorf("validation failed:\n%w", err)
 	}
+	owner, status, err := s.workflowOwnerForEdit(ctx, slug, viewerTenant)
+	if err != nil {
+		return status, err
+	}
 
 	// Atomic rename: the destination already exists, so write to a sibling
 	// temp + rename over it.
@@ -759,15 +1161,28 @@ func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant
 	}
 	// Keep the current source so a failed rebuild can be rolled back rather
 	// than leaving the tree describing code that is not what runs.
-	var prev []byte
-	hadPrev := false
-	if b, rerr := os.ReadFile(dest); rerr == nil {
-		prev, hadPrev = b, true
+	prev, _, prevTruncated := readFirstAvailableBounded(dir, maxFlowSourceBytes, "main.go")
+	if prevTruncated {
+		return http.StatusConflict, errors.New("existing workflow source exceeds the dashboard projection limit; rebuild before editing")
 	}
-	restore := func() {
+	_, prevErr := os.Stat(dest)
+	hadPrev := prevErr == nil
+	restore := func() error {
 		if hadPrev {
-			_ = os.WriteFile(dest, prev, 0o600)
+			stagePath, err := stageFile(dir, prev)
+			if err != nil {
+				return fmt.Errorf("stage previous source: %w", err)
+			}
+			if err := os.Rename(stagePath, dest); err != nil {
+				_ = os.Remove(stagePath)
+				return fmt.Errorf("restore previous source: %w", err)
+			}
+			return nil
 		}
+		if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove uncommitted source: %w", err)
+		}
+		return nil
 	}
 
 	stagePath, err := stageFile(dir, body)
@@ -789,20 +1204,28 @@ func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant
 	// save and no fix. RegisterFromDir rebuilds even for an existing slug
 	// (SkipIfExists reuses the workflow id and appends an artifact-bound version).
 	if s.WorkflowRegister == nil {
-		restore()
+		if restoreErr := restore(); restoreErr != nil {
+			if s.Log != nil {
+				s.Log.Error("editor: rollback after missing rebuild capability failed", "slug", slug, "err", restoreErr)
+			}
+			return http.StatusInternalServerError, fmt.Errorf("rebuild unavailable and source rollback failed: %w", restoreErr)
+		}
 		return http.StatusServiceUnavailable, errors.New("this build cannot recompile workflows, so the save would not change what runs; use the reactor CLI on a host with the Go toolchain")
 	}
-	// A rebuild must not move the workflow between tenants, so pass its CURRENT
-	// owner rather than the editor's scope.
-	owner := ""
-	if s.Journal != nil {
-		if wfID, lerr := s.Journal.WorkflowIDBySlugInTenant(ctx, slug, viewerTenant); lerr == nil {
-			owner, _ = s.Journal.WorkflowTenant(ctx, wfID)
+	if _, err := s.registerWorkflowEdit(ctx, slug, dir, owner, expectedVersion); err != nil {
+		if restoreErr := restore(); restoreErr != nil {
+			return http.StatusInternalServerError, fmt.Errorf("rebuild failed and source rollback failed: %v; original rebuild error: %w", restoreErr, err)
 		}
+		status := http.StatusUnprocessableEntity
+		if errors.Is(err, journal.ErrWorkflowVersionConflict) {
+			status = http.StatusConflict
+		} else if errors.Is(err, errWorkflowRevisionFenceUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		return status, fmt.Errorf("rebuild failed, previous source restored:\n%w", err)
 	}
-	if _, err := s.WorkflowRegister.RegisterFromDir(ctx, slug, dir, owner); err != nil {
-		restore()
-		return http.StatusUnprocessableEntity, fmt.Errorf("rebuild failed, previous source restored:\n%w", err)
+	if err := s.markWorkflowWorkspaceCurrent(ctx, slug, viewerTenant, dir); err != nil && s.Log != nil {
+		s.Log.Warn("editor: workflow workspace marker refresh failed", "slug", slug, "err", err)
 	}
 	// Commit only once the rebuild succeeded, so git records what is actually
 	// running rather than a source revision that never compiled into place.
@@ -810,8 +1233,333 @@ func (s *Server) writeValidatedCode(ctx context.Context, slug, dir, viewerTenant
 	return 0, nil
 }
 
+// editTenantScope resolves the tenant selector used by admin dashboard links.
+// Members are always pinned to their session tenant; admins may select a
+// tenant with ?tenant= when two tenants share a slug.
+func editTenantScope(r *http.Request) string {
+	if scope := viewerScope(r); scope != "" {
+		return scope
+	}
+	if tenant := strings.TrimSpace(r.URL.Query().Get("tenant")); tenant != "" {
+		return tenant
+	}
+	// Dashboard requests without an authenticated member scope or explicit
+	// tenant selector are the single-tenant/default-tenant path. Resolve that
+	// owner explicitly before tenant-aware artifact checks; an empty selector
+	// would otherwise be rejected as an invalid tenant and make valid legacy
+	// dashboard links unusable.
+	return journal.DefaultTenant
+}
+
+func workflowEditRedirect(r *http.Request, slug string) string {
+	path := "/workflows/" + url.PathEscape(slug)
+	if viewerScope(r) == "" {
+		if tenant := strings.TrimSpace(r.URL.Query().Get("tenant")); tenant != "" {
+			path += "?tenant=" + url.QueryEscape(tenant)
+		}
+	}
+	return path
+}
+
+// workflowSourceDir returns an editor workspace isolated by workflow id. The
+// immutable artifact is the source of truth for newly registered workflows;
+// materialising its retained snapshot avoids sharing the legacy
+// workflows/<slug> directory when two tenants reuse a slug. Journal-backed
+// workflows with only a mutable legacy source, a missing artifact, or a
+// missing retained snapshot fail closed. A metadata-only row with no source
+// at all may still use a new private workspace so an operator can author its
+// first executable version safely.
+func (s *Server) workflowSourceDir(ctx context.Context, slug, tenant string) (string, error) {
+	root := s.WorkflowsRoot
+	if root == "" && s.Registry != nil {
+		root = s.Registry.Root
+	}
+	legacy := filepath.Join(root, slug)
+	if s.Journal == nil {
+		return legacy, nil
+	}
+	wfID, err := s.Journal.WorkflowIDBySlugInTenant(ctx, slug, tenant)
+	if err != nil {
+		return "", err
+	}
+	workspace := filepath.Join(root, ".editor", wfID)
+	version, err := s.Journal.CurrentWorkflowVersionRecordBounded(ctx, wfID, maxFlowDAGBytes)
+	if err != nil && !errors.Is(err, journal.ErrNotFound) {
+		return "", fmt.Errorf("resolve workflow version: %w", err)
+	}
+	if err == nil && version.ArtifactSHA256 != "" {
+		if version.DAGTruncated {
+			return "", fmt.Errorf("%w: workflow DAG is %d bytes and exceeds the bounded dashboard projection", errWorkflowSourceUnavailable, version.DAGBytes)
+		}
+		registryRoot := root
+		if s.Registry != nil {
+			registryRoot = s.Registry.Root
+		}
+		artifact, artifactErr := registry.New(registryRoot).ArtifactPathForTenant(slug, version.ArtifactSHA256, tenant)
+		if artifactErr != nil {
+			return "", fmt.Errorf("%w: immutable artifact cannot be verified: %v", errWorkflowSourceUnavailable, artifactErr)
+		}
+		source := filepath.Join(filepath.Dir(artifact), "source")
+		sourceHasManifest, sourceManifestErr := registry.VerifySourceManifestIfPresent(source)
+		if sourceManifestErr != nil {
+			return "", fmt.Errorf("%w: retained source manifest could not be verified", errWorkflowSourceUnavailable)
+		}
+		if !workflowSourcePresent(source) {
+			return "", fmt.Errorf("%w: artifact %s has no retained main.go", errWorkflowSourceUnavailable, version.ArtifactSHA256)
+		}
+		// Verify the retained source before trusting an already-materialized
+		// workspace marker. The artifact may be deleted or tampered with after
+		// the previous editor load; the marker alone is not source proof.
+		workspaceHasManifest, workspaceManifestErr := registry.VerifySourceManifestIfPresent(workspace)
+		workspaceManifestMatches := !sourceHasManifest || (workspaceHasManifest && workspaceManifestErr == nil)
+		if workflowWorkspaceMatches(workspace, version.ArtifactSHA256) &&
+			workspaceManifestMatches &&
+			registry.VerifySourceCodeHash(filepath.Join(workspace, "main.go"), version.CodeHash) == nil &&
+			verifyWorkflowDAGSnapshot(workspace, version.DAG) == nil {
+			return workspace, nil
+		}
+		if err := registry.VerifySourceCodeHash(filepath.Join(source, "main.go"), version.CodeHash); err != nil {
+			return "", fmt.Errorf("%w: retained source does not match recorded code hash", errWorkflowSourceUnavailable)
+		}
+		if err := verifyWorkflowDAGSnapshot(source, version.DAG); err != nil {
+			return "", fmt.Errorf("%w: retained DAG does not match recorded workflow version", errWorkflowSourceUnavailable)
+		}
+		if materializeErr := materializeWorkflowSource(source, workspace, version.ArtifactSHA256); materializeErr != nil {
+			return "", fmt.Errorf("materialize workflow source: %w", materializeErr)
+		}
+		return workspace, nil
+	}
+	// Never reuse an existing mutable directory once a workflow is journal
+	// backed. It predates artifact retention and may belong to another tenant
+	// with the same slug. An empty metadata row is still editable, but only in
+	// the private workflow-id workspace created above.
+	if workflowSourcePresent(workspace) || workflowSourcePresent(legacy) {
+		return "", fmt.Errorf("%w: workflow %q has no retained immutable source; rebuild and re-register it", errWorkflowSourceUnavailable, slug)
+	}
+	return workspace, nil
+}
+
+func workflowSourcePresent(dir string) bool {
+	info, err := os.Lstat(filepath.Join(dir, "main.go"))
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular()
+}
+
+func verifyWorkflowDAGSnapshot(dir string, expected []byte) error {
+	path := filepath.Join(dir, "dag.json")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("workflow DAG is not a regular file")
+	}
+	got, _, truncated := readFirstAvailableBounded(dir, maxFlowDAGBytes, "dag.json")
+	if truncated {
+		return errors.New("workflow DAG exceeds the bounded projection")
+	}
+	if len(got) == 0 {
+		return errors.New("workflow DAG is empty")
+	}
+	return registry.VerifyDAGSnapshot(got, expected)
+}
+
+func workflowWorkspaceMatches(workspace, digest string) bool {
+	if !workflowSourcePresent(workspace) {
+		return false
+	}
+	marker := filepath.Join(workspace, workflowArtifactMarker)
+	info, err := os.Lstat(marker)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false
+	}
+	raw, err := os.ReadFile(marker)
+	return err == nil && strings.TrimSpace(string(raw)) == digest
+}
+
+func materializeWorkflowSource(source, workspace, digest string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("retained source is not a directory")
+	}
+	parent := filepath.Dir(workspace)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp(parent, ".editor-source-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	var totalBytes int64
+	err = filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("retained source contains symlink %q", rel)
+		}
+		dest := filepath.Join(stage, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(dest, 0o700)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("retained source contains special file %q", rel)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() < 0 || info.Size() > maxWorkflowMaterializedFileBytes {
+			return fmt.Errorf("retained source file %q exceeds %d-byte limit", rel, maxWorkflowMaterializedFileBytes)
+		}
+		if totalBytes > maxWorkflowMaterializedTotalBytes-info.Size() {
+			return fmt.Errorf("retained source exceeds %d-byte total limit", maxWorkflowMaterializedTotalBytes)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, maxWorkflowMaterializedFileBytes+1))
+		_ = file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if int64(len(data)) > maxWorkflowMaterializedFileBytes {
+			return fmt.Errorf("retained source file %q exceeds %d-byte limit", rel, maxWorkflowMaterializedFileBytes)
+		}
+		totalBytes += int64(len(data))
+		if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(dest, data, 0o600)
+	})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(stage, workflowArtifactMarker), []byte(digest+"\n"), 0o600); err != nil {
+		return err
+	}
+	existing, statErr := os.Lstat(workspace)
+	if statErr == nil {
+		if existing.Mode()&os.ModeSymlink != 0 || !existing.IsDir() {
+			return errors.New("editor workspace is not a directory")
+		}
+		backup, err := os.MkdirTemp(parent, ".editor-source-old-")
+		if err != nil {
+			return err
+		}
+		_ = os.RemoveAll(backup)
+		if err := os.Rename(workspace, backup); err != nil {
+			return err
+		}
+		if err := os.Rename(stage, workspace); err != nil {
+			_ = os.Rename(backup, workspace)
+			return err
+		}
+		return os.RemoveAll(backup)
+	}
+	if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	return os.Rename(stage, workspace)
+}
+
+func (s *Server) markWorkflowWorkspaceCurrent(ctx context.Context, slug, tenant, workspace string) error {
+	if s.Journal == nil {
+		return nil
+	}
+	wfID, err := s.Journal.WorkflowIDBySlugInTenant(ctx, slug, tenant)
+	if err != nil {
+		return err
+	}
+	version, err := s.Journal.CurrentWorkflowVersionRecordBounded(ctx, wfID, 0)
+	if err != nil {
+		return err
+	}
+	if version.ArtifactSHA256 == "" {
+		return nil
+	}
+	return os.WriteFile(filepath.Join(workspace, workflowArtifactMarker), []byte(version.ArtifactSHA256+"\n"), 0o600)
+}
+
+// workflowOwnerForEdit resolves the existing workflow before any source or
+// DAG mutation. A missing/ambiguous tenant resolution must fail closed rather
+// than letting RegisterFromDir create or update a workflow in the default
+// tenant. Nil Journal is retained for isolated dashboard handler tests.
+func (s *Server) workflowOwnerForEdit(ctx context.Context, slug, tenant string) (string, int, error) {
+	if s.Journal == nil {
+		return "", 0, nil
+	}
+	wfID, err := s.Journal.WorkflowIDBySlugInTenant(ctx, slug, tenant)
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return "", http.StatusNotFound, errors.New("workflow not registered")
+		}
+		return "", http.StatusInternalServerError, fmt.Errorf("resolve workflow: %w", err)
+	}
+	owner, err := s.Journal.WorkflowTenant(ctx, wfID)
+	if err != nil {
+		return "", http.StatusInternalServerError, fmt.Errorf("resolve workflow tenant: %w", err)
+	}
+	return owner, 0, nil
+}
+
+// workflowEditVersion captures the immutable baseline before the editor
+// materialises its source workspace. Reading this first means any concurrent
+// MCP/CLI revision that lands before workflowSourceDir is observed by the
+// expected-version CAS instead of being silently overwritten from stale bytes.
+func (s *Server) workflowEditVersion(ctx context.Context, r *http.Request, slug, tenant string) (int, error) {
+	if s.Journal == nil {
+		return 0, nil
+	}
+	wfID, err := s.Journal.WorkflowIDBySlugInTenant(ctx, slug, tenant)
+	if err != nil {
+		return 0, err
+	}
+	version, err := s.Journal.CurrentWorkflowVersionRecordBounded(ctx, wfID, 0)
+	if err != nil {
+		return 0, fmt.Errorf("resolve workflow version: %w", err)
+	}
+	if version.Version < 1 {
+		return 0, fmt.Errorf("resolve workflow version: invalid current version %d", version.Version)
+	}
+	if raw := strings.TrimSpace(r.FormValue("expected_version")); raw != "" {
+		expected, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || expected < 1 {
+			return 0, fmt.Errorf("%w: expected_version must be a positive integer", errWorkflowExpectedVersionInvalid)
+		}
+		return expected, nil
+	}
+	return version.Version, nil
+}
+
+// registerWorkflowEdit routes journal-backed dashboard revisions through the
+// optional expected-version surface. An adapter that only implements the
+// legacy registrar is rejected for an existing journal row so editor saves
+// cannot append over a newer MCP or CLI revision.
+func (s *Server) registerWorkflowEdit(ctx context.Context, slug, dir, tenant string, expectedVersion int) (string, error) {
+	if expectedVersion > 0 {
+		fenced, ok := s.WorkflowRegister.(WorkflowRegistrarWithExpectedVersion)
+		if !ok {
+			return "", errWorkflowRevisionFenceUnavailable
+		}
+		return fenced.RegisterFromDirExpected(ctx, slug, dir, tenant, expectedVersion)
+	}
+	return s.WorkflowRegister.RegisterFromDir(ctx, slug, dir, tenant)
+}
+
 // stageFile writes body to a unique sibling temp file in dir, returning its
-// path for an atomic rename over the destination. A fixed "<dest>.new" name
+// path for an atomic rename over the destination. A fixed destination name
 // (as this used to use, with O_TRUNC) let two concurrent saves for one slug
 // interleave: A writes its stage, B truncates and is mid-write, A renames, and
 // B's half-written buffer is published as main.go, bytes no validator ever saw.
@@ -832,7 +1580,8 @@ func stageFile(dir string, body []byte) (string, error) {
 	return f.Name(), nil
 }
 
-// workflowSaveDAG replaces dag.json after schema validation.
+// workflowSaveDAG replaces dag.json after schema validation and rebuilds the
+// immutable executable so the visual flow and the artifact remain aligned.
 func (s *Server) workflowSaveDAG(w http.ResponseWriter, r *http.Request) {
 	slug, ok := slugFromRequest(w, r)
 	if !ok {
@@ -850,22 +1599,100 @@ func (s *Server) workflowSaveDAG(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir := filepath.Join(s.WorkflowsRoot, slug)
+	expectedVersion, err := s.workflowEditVersion(r.Context(), r, slug, editTenantScope(r))
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(err, errWorkflowExpectedVersionInvalid) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else {
+			s.errorPage(w, "resolve workflow version", err)
+		}
+		return
+	}
+	dir, dirErr := s.workflowSourceDir(r.Context(), slug, editTenantScope(r))
+	if dirErr != nil {
+		if errors.Is(dirErr, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(dirErr, errWorkflowSourceUnavailable) {
+			http.Error(w, "workflow source snapshot unavailable; rebuild and re-register this workflow before editing", http.StatusConflict)
+		} else {
+			s.errorPage(w, "resolve workflow source", dirErr)
+		}
+		return
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		s.errorPage(w, "mkdir dest", err)
 		return
 	}
-	stagePath := filepath.Join(dir, "dag.json.new")
-	if err := os.WriteFile(stagePath, body, 0o600); err != nil {
+	owner, ownerStatus, ownerErr := s.workflowOwnerForEdit(r.Context(), slug, editTenantScope(r))
+	if ownerErr != nil {
+		if ownerStatus == http.StatusNotFound {
+			http.Error(w, ownerErr.Error(), ownerStatus)
+		} else {
+			s.errorPage(w, "resolve workflow", ownerErr)
+		}
+		return
+	}
+	// A registered workflow must be rebuilt against its new DAG. Without this
+	// gate the dashboard could display a flow that the immutable executable
+	// never implements. Nil Journal is the draft-only handler-test path.
+	codeBytes, _, codeTruncated := readFirstAvailableBounded(dir, maxFlowSourceBytes, "main.go", "workflow.go", "source/main.go")
+	if s.Journal != nil && codeTruncated {
+		http.Error(w, "workflow source exceeds the dashboard projection limit; rebuild before editing this DAG", http.StatusConflict)
+		return
+	}
+	if s.Journal != nil && len(codeBytes) == 0 {
+		http.Error(w, "workflow source not bundled; rebuild cannot verify this DAG", http.StatusConflict)
+		return
+	}
+	if s.Journal != nil && s.WorkflowRegister == nil {
+		http.Error(w, "this build cannot recompile workflows, so the DAG was not changed", http.StatusServiceUnavailable)
+		return
+	}
+	dest := filepath.Join(dir, "dag.json")
+	previous, _, previousTruncated := readFirstAvailableBounded(dir, maxFlowDAGBytes, "dag.json")
+	if previousTruncated {
+		http.Error(w, "existing workflow DAG exceeds the dashboard projection limit; replace it through a bounded authoring revision", http.StatusConflict)
+		return
+	}
+	_, readErr := os.Stat(dest)
+	hadPrevious := readErr == nil
+	stagePath, err := stageFile(dir, body)
+	if err != nil {
 		s.errorPage(w, "write stage", err)
 		return
 	}
-	if err := os.Rename(stagePath, filepath.Join(dir, "dag.json")); err != nil {
+	if err := os.Rename(stagePath, dest); err != nil {
+		_ = os.Remove(stagePath)
 		s.errorPage(w, "rename", err)
 		return
 	}
+	restore := func() {
+		if hadPrevious {
+			_ = os.WriteFile(dest, previous, 0o600)
+		} else {
+			_ = os.Remove(dest)
+		}
+	}
+	if s.Journal != nil {
+		if _, err := s.registerWorkflowEdit(r.Context(), slug, dir, owner, expectedVersion); err != nil {
+			restore()
+			status := http.StatusUnprocessableEntity
+			if errors.Is(err, journal.ErrWorkflowVersionConflict) {
+				status = http.StatusConflict
+			} else if errors.Is(err, errWorkflowRevisionFenceUnavailable) {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "rebuild failed, previous DAG restored:\n"+err.Error(), status)
+			return
+		}
+		if err := s.markWorkflowWorkspaceCurrent(r.Context(), slug, editTenantScope(r), dir); err != nil && s.Log != nil {
+			s.Log.Warn("editor: workflow workspace marker refresh failed", "slug", slug, "err", err)
+		}
+	}
 	s.commitOptional(r.Context(), dir, slug, "edit "+slug+" dag.json via dashboard")
-	http.Redirect(w, r, "/workflows/"+slug, http.StatusSeeOther)
+	http.Redirect(w, r, workflowEditRedirect(r, slug), http.StatusSeeOther)
 }
 
 // readEditBody handles both raw POST bodies and form-encoded posts
@@ -903,6 +1730,8 @@ func (s *Server) commitOptional(ctx context.Context, dir, slug, msg string) {
 		return
 	}
 	if err := s.CodeCommitter.Commit(ctx, dir, slug, msg); err != nil {
-		s.Log.Warn("editor: git commit failed", "slug", slug, "err", err)
+		if s.Log != nil {
+			s.Log.Warn("editor: git commit failed", "slug", slug, "err", err)
+		}
 	}
 }

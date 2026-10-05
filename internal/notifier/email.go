@@ -3,12 +3,16 @@ package notifier
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/smtp"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/reactor/internal/safehttp"
 )
 
 // EmailSender delivers via SMTP. Config shape:
@@ -23,17 +27,18 @@ import (
 //	  "starttls": true            // optional, default true on port 587
 //	}
 //
-// STARTTLS is the default for port 587; plain port 25 or implicit
-// TLS on 465 are also supported. Username/password are passed via
+// STARTTLS is the default for port 587 and required when selected;
+// port 465 uses implicit TLS. Plain port 25 is also supported. Username/password are passed via
 // PLAIN auth so any standards-compliant SMTP server works.
 //
-// Future enhancement: pull the password from the vault by
-// password_credential_id rather than a plaintext field. Wired the
-// shape but kept the plaintext path so a fresh install does not need
-// the vault.
+// Reactor resolves password_credential_id from the vault immediately before
+// delivery; the plaintext password form remains for legacy operator-managed
+// channels, while MCP-created channels require the credential reference.
 type EmailSender struct {
 	// dial is the test seam; nil means use the default net dialer.
 	dial func(network, addr string, timeout time.Duration) (net.Conn, error)
+	// tlsRoots is a test seam for local SMTP certificates; nil uses system roots.
+	tlsRoots *x509.CertPool
 }
 
 // NewEmailSender returns a sender backed by the stdlib net/smtp client.
@@ -66,13 +71,16 @@ func (s *EmailSender) Send(ctx context.Context, cfg json.RawMessage, ev Event) e
 	if c.Port == 0 {
 		c.Port = 587
 	}
+	if c.Port == 465 && c.StartTLS != nil && *c.StartTLS {
+		return fmt.Errorf("email: port 465 uses implicit TLS; do not request STARTTLS")
+	}
 	addr := net.JoinHostPort(c.Host, fmt.Sprintf("%d", c.Port))
 
 	dialer := s.dial
 	if dialer == nil {
 		dialer = func(network, addr string, timeout time.Duration) (net.Conn, error) {
-			d := net.Dialer{Timeout: timeout}
-			return d.DialContext(ctx, network, addr)
+			allowPrivate := os.Getenv("REACTOR_SMTP_ALLOW_PRIVATE") == "1"
+			return safehttp.DialContext(ctx, network, addr, allowPrivate)
 		}
 	}
 
@@ -95,6 +103,14 @@ func (s *EmailSender) Send(ctx context.Context, cfg json.RawMessage, ev Event) e
 	// hang the dispatcher's graceful Drain. SetDeadline covers every
 	// subsequent read+write on this conn.
 	_ = conn.SetDeadline(time.Now().Add(timeout))
+	tlsCfg := &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12, RootCAs: s.tlsRoots}
+	if c.Port == 465 {
+		secureConn := tls.Client(conn, tlsCfg)
+		if err := secureConn.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("email: implicit TLS: %w", err)
+		}
+		conn = secureConn
+	}
 
 	client, err := smtp.NewClient(conn, c.Host)
 	if err != nil {
@@ -107,11 +123,11 @@ func (s *EmailSender) Send(ctx context.Context, cfg json.RawMessage, ev Event) e
 		wantSTARTTLS = *c.StartTLS
 	}
 	if wantSTARTTLS {
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			tlsCfg := &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}
-			if err := client.StartTLS(tlsCfg); err != nil {
-				return fmt.Errorf("email: STARTTLS: %w", err)
-			}
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return fmt.Errorf("email: STARTTLS required but SMTP server did not advertise it")
+		}
+		if err := client.StartTLS(tlsCfg); err != nil {
+			return fmt.Errorf("email: STARTTLS: %w", err)
 		}
 	}
 	if c.Username != "" {

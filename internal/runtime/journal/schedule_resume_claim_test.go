@@ -214,4 +214,52 @@ func TestClaimScheduleAndFailArtifactFenceRollsBackAsOneUnit(t *testing.T) {
 	if err != nil || len(logs) != 1 || logs[0] != WorkflowArtifactFenceRunLog {
 		t.Fatalf("artifact-fence logs = %v, %v", logs, err)
 	}
+	effects, err := j.ClaimTerminalEffects(ctx, 10, time.Minute)
+	if err != nil || len(effects) != 1 || effects[0].RunID != "run_1" || effects[0].Status != "failed" {
+		t.Fatalf("artifact-fenced terminal effect = %+v, %v; want failed receipt", effects, err)
+	}
+}
+
+func TestClaimScheduleResumeFinalizesRacingCancellationFlag(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	id, err := j.ScheduleSleep(ctx, "run_1", "wait", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SetRunStatus(ctx, "run_1", "running"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := j.RequestRunCancel(ctx, "run_1")
+	if err != nil || outcome != CancelRequested {
+		t.Fatalf("request cancellation = %q, %v; want requested", outcome, err)
+	}
+	// Simulate the narrow race where the supervisor has already committed its
+	// suspended state while the cancel watcher has not yet finalized the flag.
+	if err := j.SetRunStatus(ctx, "run_1", "suspended"); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := j.ClaimScheduleResume(ctx, id, false)
+	if err != nil || claimed {
+		t.Fatalf("cancelled schedule claim = %v, %v; want false", claimed, err)
+	}
+	info, err := j.GetRun(ctx, "run_1")
+	if err != nil || info.Status != "cancelled" || !info.CancelRequested {
+		t.Fatalf("racing cancellation resurrected run = %+v, %v", info, err)
+	}
+	schedule, err := j.FindLatestSleepSchedule(ctx, "run_1", "wait")
+	if err != nil || !schedule.Fired {
+		t.Fatalf("racing cancellation left schedule pending = %+v, %v", schedule, err)
+	}
+	usage, err := j.TenantUsageSince(ctx, DefaultTenant, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Runs != 1 {
+		t.Fatalf("scheduler cancellation was not metered: %+v", usage)
+	}
 }

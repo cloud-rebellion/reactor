@@ -85,6 +85,7 @@ var (
 	ErrInvalidPassword = errors.New("auth: invalid password")
 	ErrDisabled        = errors.New("auth: user disabled")
 	ErrUsernameTaken   = errors.New("auth: username already in use")
+	ErrTenantNotFound  = errors.New("auth: tenant not found")
 	ErrSessionExpired  = errors.New("auth: session expired")
 )
 
@@ -313,6 +314,13 @@ func (s *Store) SetUserRole(ctx context.Context, id string, role Role) error {
 func (s *Store) SetUserTenant(ctx context.Context, id, tenantID string) error {
 	if tenantID == "" {
 		tenantID = "default"
+	}
+	var exists int
+	if err := s.db.QueryRowContext(ctx, s.bind(`SELECT 1 FROM tenants WHERE tenant_id = $1`), tenantID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrTenantNotFound
+		}
+		return fmt.Errorf("auth: check tenant: %w", err)
 	}
 	const q = `UPDATE users SET tenant_id = $1, updated_at = $2 WHERE id = $3`
 	res, err := s.db.ExecContext(ctx, s.bind(q), tenantID, nowUTC(), id)
@@ -614,7 +622,13 @@ func (s *Store) ResolveAPIToken(ctx context.Context, raw string) (User, error) {
 		return User{}, ErrSessionExpired
 	}
 	if expiresRaw.Valid {
-		if t, perr := parseTime(expiresRaw.String); perr == nil && time.Now().UTC().After(t) {
+		t, perr := parseTime(expiresRaw.String)
+		if perr != nil {
+			// Corrupt auth metadata must never silently become a bearer
+			// token with no deadline. Fail closed and require a replacement.
+			return User{}, ErrSessionExpired
+		}
+		if time.Now().UTC().After(t) {
 			return User{}, ErrSessionExpired
 		}
 	}

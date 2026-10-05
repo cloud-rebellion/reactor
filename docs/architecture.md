@@ -17,9 +17,11 @@ reactor serve
  |   +-- /audit             aggregated credential audit
  |   +-- /generate          AI codegen prompt bar (gated on ANTHROPIC_API_KEY)
  |   +-- /mcp               Streamable HTTP MCP transport
+ |   +-- /command-webhook/{tok} command-automation ingress (HMAC verified)
  |   +-- /metrics           Prometheus text exposition
  |   +-- /webhook/{tok}     dispatcher entry point (HMAC verified)
  |   +-- /signal/{tok}      AwaitSignal delivery (capability token)
+ |   +-- /dlq               bounded dead-letter triage page
  |   +-- /dlq/{id}/retry    one-click failed-DLQ retry
  |   +-- /login + /logout   session-cookie auth
  |   +-- /tokens            per-user API tokens (Bearer auth)
@@ -27,6 +29,7 @@ reactor serve
  |   +-- /docs              embedded markdown viewer
  |
  +-- cron driver            polling reconcile + (postgres) LISTEN/NOTIFY
+ +-- command schedule      fires receipt-bound command automation schedules
  +-- scheduler              fires due Sleep/AwaitSignal schedules
  +-- rotation runner        hourly tick + manual rotate via dashboard
  +-- post-mortem gen        optional failed_dlq AI egress; explicit opt-in + key
@@ -38,12 +41,12 @@ Every long-running goroutine runs under `runDaemonComponent` with a deferred pan
 
 ## Per-run lifecycle
 
-1. **Trigger arrives.** Webhook receiver (`POST /webhook/{token}`), cron driver tick, manual dispatch via `POST /workflows/{slug}/run`, or chain trigger fired from another workflow's terminal event.
+1. **Trigger arrives.** Workflow webhook receiver (`POST /webhook/{token}`), command webhook receiver (`POST /command-webhook/{token_id}`), cron driver tick, command schedule tick, manual dispatch via `POST /workflows/{slug}/run`, or chain trigger fired from another workflow's terminal event.
 2. **Dispatch.** `dispatcher.Dispatch` resolves the current workflow version to its immutable SHA-256 artifact, verifies the bytes, and creates the run with `workflow_version` plus `workflow_artifact_sha256` in the same INSERT. It then spawns a `supervisor.Supervisor` (or leaves the row queued in distributed mode). The dispatch fires `IncRunsStarted` on the metrics counter.
-3. **Supervise.** `supervisor.Run` exec's the verified content-addressed binary at `<root>/workflows/<slug>/artifacts/sha256/<digest>/workflow`; the mutable `<slug>/workflow` path is compatibility/status state and is never selected for a pinned run. On Linux it applies cgroup v2 limits + prlimit before the child gets to user code; on macOS it uses prlimit only.
+3. **Supervise.** `supervisor.Run` exec's the verified content-addressed binary at the tenant-owned `<root>/workflows/<slug>/artifacts/sha256/<digest>/workflow` path, or at the hashed `<root>/workflows/tenants/<tenant-hash>/<slug>/artifacts/sha256/<digest>/workflow` path for a same-slug tenant. The mutable `workflow` path in either namespace is compatibility/status state and is never selected for a pinned run. On Linux it applies cgroup v2 limits + prlimit before the child gets to user code; on macOS it uses prlimit only.
 4. **Pipe.** The supervisor talks to the child over a JSON-lines pipe. Frames: `Hello`, `StepStart/End/Reply`, `Sleep`, `AwaitSignal`, `SignalDeliver`, `SecretFetch/Reply`, `Log`, `Cancel`, `Error`. Sleep up to `SuspendThreshold` (default 30s) blocks; longer sleeps suspend the run + write a schedules row, the scheduler re-spawns at wake using the recorded `wake_at` (not the workflow body's recomputed value).
 5. **Journal.** Every Step boundary writes to the steps table. A restart-mid-run replays `Run()` from the top; the journal's `FindCachedOutputForInput` short-circuits previously-succeeded steps so closures don't re-execute. The `input_hash` filter catches workflow-author changes to a Step's input shape (input drift triggers re-execution in live mode and `ErrReplayDivergence` in replay mode).
-6. **Terminal.** `supervisor.Run` returns `succeeded`, `failed`, `failed_dlq`, or `suspended`. The dispatcher's `OnTerminal` hook fires three things in order: (a) `runlogs.Buffer.Close(runID)` so the SSE tail finishes, (b) `notifier.Notify(event)` for failure/success alerts, (c) `fireChainedWorkflows(event)` for run-after-another-workflow chain triggers. The metrics `IncRunsTerminal` bumps the right gauge.
+6. **Terminal.** `supervisor.Run` returns `succeeded`, `failed`, `failed_dlq`, or `suspended`. Terminal status and a `terminal_effects` receipt commit together. The dispatcher's `OnTerminal` hook closes `runlogs.Buffer`, sends notifications, fires workflow-complete chains through the trusted terminal admission path, then acknowledges the receipt. The leader retries unacknowledged receipts after a crash with at-least-once semantics. The metrics `IncRunsTerminal` bumps the right gauge.
 
 ## Wire protocol
 
@@ -58,13 +61,20 @@ See `sdk/wire/wire.go` for the frame struct definitions. The supervisor is the a
 ```text
 master.key                # 32-byte hex; required to start the daemon
 reactor.db                # sqlite (or use a postgres URL via REACTOR_DB_URL)
-reactor.env               # operator-generated; sourceable env vars
+reactor.env               # operator-generated; systemd/shell env assignments
 workflows/                # one subdir per registered workflow
   <slug>/
+    .tenant-owner          # immutable tenant binding for the executable namespace
     workflow              # mutable compatibility pointer; never used for pinned execution
     candidate.sha256      # atomic pointer to the latest split CLI build candidate
     artifacts/sha256/
       <digest>/workflow   # immutable exact bytes retained for queued/resumed/DLQ runs
+  tenants/                # same-slug tenant-isolated namespaces
+    <tenant-hash>/<slug>/
+      .tenant-owner
+      workflow
+      candidate.sha256
+      artifacts/sha256/<digest>/workflow
 knowledge/                # markdown corpus, frontmatter at the top
   <topic>/<id>.md
 graph.json                # serialised runtime graph (cache only)
@@ -81,6 +91,18 @@ never the mutable compatibility copy. Run
 execution re-hashes the artifact on every resolution. Artifact cleanup must not
 remove any digest referenced by a queued, running, suspended, or DLQ run; the
 current release performs no automatic artifact garbage collection.
+
+The `.tenant-owner` manifest is created before a new executable namespace is
+compiled and is never rewritten for another tenant. Existing pre-manifest
+directories can only be claimed when the journal proves the same tenant already
+owns the slug. A same-slug workflow in another tenant uses the hashed
+`tenants/<tenant-hash>/<slug>` namespace, so candidate/source/compatibility
+state cannot overwrite the legacy owner. A digest alone never carries tenant
+identity; authenticated namespace reclamation remains required after deletion.
+
+The split CLI registration path is kept disabled because it imports an
+artifact without retaining the complete source manifest. MCP/dashboard builds
+retain and validate source before an operator can enable execution.
 
 ### Migration 0031 cutover
 
@@ -100,7 +122,7 @@ Three credential shapes resolve in priority order on every request:
 2. **`Authorization: Bearer <token>`** → `auth.Store.ResolveAPIToken`. Same hashing strategy.
 3. **`Authorization: Basic <user>:<pw>`** → `auth.Store.Authenticate` against the users table, with a fallback to the env-var BasicAuth when no users exist yet.
 
-The session middleware short-circuits the legacy BasicAuth middleware when it resolves a user, so the two compose cleanly. Unauthenticated requests redirect to `/login?next=<path>` for HTML clients, `401` for JSON. Public routes (`/healthz`, `/login`, `/webhook/*`, `/signal/*`, `/assets/*`, `/mcp*`, `/docs/*`) bypass auth entirely.
+The session middleware short-circuits the legacy BasicAuth middleware when it resolves a user, so the two compose cleanly. Unauthenticated requests redirect to `/login?next=<path>` for HTML clients, `401` for JSON. Public routes (`/healthz`, `/readyz`, `/login`, `/webhook/*`, `/command-webhook/*`, `/signal/*`, `/assets/*`, `/docs/*`) bypass auth. `/mcp` is authenticated and admin-gated; only its CSRF check is exempt because MCP clients send JSON-RPC bodies rather than browser form submissions.
 
 See [Teams, users, sessions, API tokens](/docs/teams).
 

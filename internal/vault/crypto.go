@@ -12,7 +12,8 @@
 //	[version(1)] [salt(32)] [nonce(12)] [ciphertext(...)]
 //
 // The version byte enables transparent re-encryption on read after a master-key
-// rotation: future v2 blobs co-exist with v1 blobs and migrate lazily.
+// rotation: v2 blobs authenticate the credential identity as AES-GCM
+// associated data, while legacy v1 blobs remain readable and migrate lazily.
 package vault
 
 import (
@@ -30,9 +31,15 @@ import (
 const (
 	// VersionV1 is the format byte for the v1 blob layout.
 	VersionV1 byte = 0x01
+	// VersionV2 binds a blob to its credential identifier through AES-GCM's
+	// associated-data field. The v1 format remains readable for lazy migration,
+	// but new vault writes use v2 so copying an encrypted row to another
+	// credential cannot make the value decrypt there.
+	VersionV2 byte = 0x02
 
 	saltLen     = 32
 	nonceLen    = 12
+	gcmTagLen   = 16
 	keyLen      = 32 // AES-256
 	pbkdf2Iters = 600_000
 )
@@ -47,8 +54,26 @@ var ErrInvalidMasterKey = errors.New("secrets: master key must be 32 bytes")
 // Encrypt encrypts plaintext with a unique salt + nonce and returns
 // the v1 blob layout: [version][salt][nonce][ciphertext].
 func Encrypt(masterKey, plaintext []byte) ([]byte, error) {
+	return encrypt(masterKey, plaintext, VersionV1, nil)
+}
+
+// EncryptForID seals a credential value and binds it to id. A ciphertext
+// copied between credential rows will fail authentication when read under a
+// different identifier. The id is authenticated as associated data and is not
+// included in the ciphertext payload.
+func EncryptForID(masterKey []byte, id string, plaintext []byte) ([]byte, error) {
+	if id == "" {
+		return nil, errors.New("secrets: credential id required")
+	}
+	return encrypt(masterKey, plaintext, VersionV2, []byte(id))
+}
+
+func encrypt(masterKey, plaintext []byte, version byte, aad []byte) ([]byte, error) {
 	if len(masterKey) != keyLen {
 		return nil, ErrInvalidMasterKey
+	}
+	if len(plaintext) > MaxSecretBytes {
+		return nil, ErrSecretTooLarge
 	}
 
 	salt := make([]byte, saltLen)
@@ -71,10 +96,10 @@ func Encrypt(masterKey, plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secrets: gcm: %w", err)
 	}
-	ct := gcm.Seal(nil, nonce, plaintext, nil)
+	ct := gcm.Seal(nil, nonce, plaintext, aad)
 
 	out := make([]byte, 0, 1+saltLen+nonceLen+len(ct))
-	out = append(out, VersionV1)
+	out = append(out, version)
 	out = append(out, salt...)
 	out = append(out, nonce...)
 	out = append(out, ct...)
@@ -85,15 +110,41 @@ func Encrypt(masterKey, plaintext []byte) ([]byte, error) {
 // or layout is wrong, or any underlying GCM error if the key is wrong
 // or the data was tampered with.
 func Decrypt(masterKey, blob []byte) ([]byte, error) {
+	return decrypt(masterKey, blob, nil)
+}
+
+// DecryptForID opens a credential-bound v2 blob under the exact id used when
+// it was sealed. v1 blobs are accepted for compatibility and migration, but
+// are intentionally not treated as id-bound because they carry no identity
+// in their authenticated data.
+func DecryptForID(masterKey []byte, id string, blob []byte) ([]byte, error) {
+	if id == "" {
+		return nil, errors.New("secrets: credential id required")
+	}
+	return decrypt(masterKey, blob, []byte(id))
+}
+
+func decrypt(masterKey, blob, aad []byte) ([]byte, error) {
 	if len(masterKey) != keyLen {
 		return nil, ErrInvalidMasterKey
 	}
 	if len(blob) < 1+saltLen+nonceLen {
 		return nil, ErrInvalidBlob
 	}
+	// Reject an oversized ciphertext before GCM allocates and authenticates a
+	// potentially attacker-controlled plaintext buffer. Store reads already
+	// enforce the same bound; keeping it here protects direct decrypt callers.
+	if len(blob) > 1+saltLen+nonceLen+gcmTagLen+MaxSecretBytes {
+		return nil, ErrSecretTooLarge
+	}
+	openAAD := []byte(nil)
 	switch blob[0] {
 	case VersionV1:
-		// fallthrough
+	case VersionV2:
+		if len(aad) == 0 {
+			return nil, fmt.Errorf("%w: credential id required for version 0x%02x", ErrInvalidBlob, blob[0])
+		}
+		openAAD = aad
 	default:
 		return nil, fmt.Errorf("%w: unsupported version 0x%02x", ErrInvalidBlob, blob[0])
 	}
@@ -112,7 +163,7 @@ func Decrypt(masterKey, blob []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secrets: gcm: %w", err)
 	}
-	return gcm.Open(nil, nonce, ct, nil)
+	return gcm.Open(nil, nonce, ct, openAAD)
 }
 
 // deriveKey runs PBKDF2-HMAC-SHA256 with the locked-in iteration count.

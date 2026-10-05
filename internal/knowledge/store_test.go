@@ -2,6 +2,8 @@ package knowledge
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -130,6 +132,47 @@ func TestRedactorBlocksApiKey(t *testing.T) {
 	}
 }
 
+func TestRedactorBlocksSensitiveMetadata(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	for _, tc := range []struct {
+		name  string
+		front Frontmatter
+	}{
+		{name: "title email", front: Frontmatter{Topic: "safe", Title: "Owner customer@example.com"}},
+		{name: "source token", front: Frontmatter{Topic: "safe", Title: "Reference", Sources: []string{"access_token=" + strings.Repeat("a", 24)}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.Add(context.Background(), Entry{Frontmatter: tc.front, Body: "safe body"})
+			if err == nil {
+				t.Fatal("sensitive metadata unexpectedly accepted")
+			}
+			if _, ok := err.(*ErrRedacted); !ok {
+				t.Fatalf("error = %T %v, want ErrRedacted", err, err)
+			}
+		})
+	}
+}
+
+func TestAddRejectsControlCharactersInMetadata(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	for _, tc := range []struct {
+		name  string
+		front Frontmatter
+	}{
+		{name: "title", front: Frontmatter{Topic: "safe", Title: "line\nforged"}},
+		{name: "topic", front: Frontmatter{Topic: "safe/escape", Title: "title"}},
+		{name: "tag", front: Frontmatter{Topic: "safe", Title: "title", Tags: []string{"tag\nforged"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := s.Add(context.Background(), Entry{Frontmatter: tc.front, Body: "safe body"}); err == nil {
+				t.Fatal("control/path metadata unexpectedly accepted")
+			}
+		})
+	}
+}
+
 func TestSearchRanksRelevance(t *testing.T) {
 	t.Parallel()
 	s := freshStore(t)
@@ -155,6 +198,107 @@ func TestSearchReturnsEmptyOnNoMatch(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Fatalf("expected zero hits for nonsense query, got %d", len(hits))
+	}
+}
+
+func TestAddRejectsOversizedDurableEntry(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	_, err := s.Add(context.Background(), Entry{
+		Frontmatter: Frontmatter{Topic: "bounded", Title: "large"},
+		Body:        strings.Repeat("x", maxEntryBodyBytes+1),
+	})
+	if err == nil || !strings.Contains(err.Error(), "body exceeds") {
+		t.Fatalf("oversized knowledge body error = %v", err)
+	}
+}
+
+func TestAddRejectsOversizedSupersedesList(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	supersedes := make([]string, maxEntryListItems+1)
+	for i := range supersedes {
+		supersedes[i] = fmt.Sprintf("old_%d", i)
+	}
+	_, err := s.Add(context.Background(), Entry{
+		Frontmatter: Frontmatter{Topic: "bounded", Title: "supersession chain", Supersedes: supersedes},
+		Body:        "safe body",
+	})
+	if err == nil || !strings.Contains(err.Error(), "supersedes allow at most") {
+		t.Fatalf("oversized supersedes list error = %v", err)
+	}
+}
+
+func TestListRejectsTopicPathTraversal(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	for _, topic := range []string{"../", "../../tmp"} {
+		if _, err := s.List(context.Background(), topic); err == nil {
+			t.Fatalf("List(%q) unexpectedly walked outside the knowledge root", topic)
+		}
+	}
+}
+
+func TestListRejectsOversizedDurableFile(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	path := filepath.Join(s.Root, "oversized.md")
+	if err := os.WriteFile(path, make([]byte, maxEntryFileBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized durable file error = %v", err)
+	}
+}
+
+func TestListRejectsSymlinkEntry(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	target := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(target, []byte("outside corpus"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(s.Root, "linked.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := s.List(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlink entry was followed or silently ignored: %v", err)
+	}
+}
+
+func TestListMetadataReadsFrontmatterWithoutRetainingBody(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	want, err := s.Add(context.Background(), Entry{
+		Frontmatter: Frontmatter{Topic: "large", Title: "metadata only"},
+		Body:        strings.Repeat("body ", 20<<10),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := s.ListMetadata(context.Background(), "large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 1 || metadata[0].ID != want.Frontmatter.ID || metadata[0].Title != "metadata only" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestListMetadataRejectsSymlinkEntry(t *testing.T) {
+	t.Parallel()
+	s := freshStore(t)
+	target := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(target, []byte("outside corpus"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(s.Root, "linked.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := s.ListMetadata(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("metadata list followed or silently ignored symlink: %v", err)
 	}
 }
 

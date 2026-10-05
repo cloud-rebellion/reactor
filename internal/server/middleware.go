@@ -1,10 +1,14 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -38,12 +42,12 @@ func SecurityHeaders(next http.Handler) http.Handler {
 				"frame-ancestors 'none'; "+
 				"base-uri 'none'")
 		// HSTS only fires when the request actually arrived over TLS, OR
-		// when X-Forwarded-Proto: https was set by a trusted proxy
-		// (loopback / RFC1918 / RFC4193). Honoring XFP from arbitrary
+		// when X-Forwarded-Proto: https was set by an explicitly trusted
+		// proxy peer (or loopback). Honoring XFP from arbitrary
 		// sources lets any attacker pin a domain to HTTPS-only via a
 		// plain-HTTP request, which can wedge a misconfigured site for
 		// the entire max-age window (here: 2 years).
-		if r.TLS != nil || (r.Header.Get("X-Forwarded-Proto") == "https" && isTrustedProxyRequest(r)) {
+		if r.TLS != nil || (forwardedProto(r) == "https" && isTrustedProxyRequest(r)) {
 			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)
@@ -91,8 +95,10 @@ type BasicAuthConfig struct {
 // Skips auth on the routes that have their own auth gate:
 //
 //	POST /webhook/{token}    HMAC verified at the journal layer
+//	POST /command-webhook/{token} dedicated command-plan HMAC + trigger fence
 //	POST /signal/{token}     128-bit token capability
 //	GET  /healthz            liveness probes need to be unauthenticated
+//	GET  /readyz             readiness probes need to be unauthenticated
 func BasicAuth(cfg BasicAuthConfig) func(http.Handler) http.Handler {
 	credsMissing := cfg.User == "" || cfg.PasswordSHA256 == ""
 	allowNoAuth := credsMissing && cfg.AllowNoAuth
@@ -144,11 +150,23 @@ func isPublicRoute(path string) bool {
 	switch {
 	case path == "/healthz":
 		return true
+	case path == "/readyz":
+		return true
+	case path == "/oauth/callback":
+		// OAuth providers redirect the browser here without a Reactor
+		// session. CompleteAuth authenticates the callback with the short-lived,
+		// single-use state + PKCE verifier recorded when consent started; a
+		// dashboard cookie is neither required nor reliable after a cross-site
+		// provider round trip (and MCP consent may be started for a user who has
+		// no dashboard session at all).
+		return true
 	case path == "/login":
 		// Login is by definition reached without a session; exempt so
 		// the BasicAuth fail-closed branch does not pre-empt the form.
 		return true
 	case strings.HasPrefix(path, "/webhook/"):
+		return true
+	case strings.HasPrefix(path, "/command-webhook/"):
 		return true
 	case strings.HasPrefix(path, "/signal/"):
 		return true
@@ -188,7 +206,7 @@ func sha256Hex(s string) string {
 // requests + any path where SameSite was not honoured.
 //
 // Skipped methods: GET, HEAD, OPTIONS (idempotent / read-only).
-// Skipped paths: webhook + signal + healthz + mcp (those have their
+// Skipped paths: webhook + signal + healthz + readyz + mcp (those have their
 // own auth + are explicitly cross-origin by design).
 //
 // The "expected" scheme://host is computed from r.Host + r.TLS so
@@ -237,7 +255,11 @@ func isCSRFExempt(path string) bool {
 	switch {
 	case path == "/healthz":
 		return true
+	case path == "/readyz":
+		return true
 	case strings.HasPrefix(path, "/webhook/"):
+		return true
+	case strings.HasPrefix(path, "/command-webhook/"):
 		return true
 	case strings.HasPrefix(path, "/signal/"):
 		return true
@@ -254,10 +276,10 @@ func expectedOrigin(r *http.Request) string {
 	}
 	host := r.Host
 	if isTrustedProxyRequest(r) {
-		if v := r.Header.Get("X-Forwarded-Proto"); v != "" {
+		if v := forwardedProto(r); v != "" {
 			scheme = v
 		}
-		if v := r.Header.Get("X-Forwarded-Host"); v != "" {
+		if v := forwardedHost(r); v != "" {
 			host = v
 		}
 	}
@@ -315,10 +337,88 @@ func RateLimit(burst int, refill float64) func(http.Handler) http.Handler {
 	}
 }
 
-// clientIP extracts the source IP. X-Forwarded-For is honoured ONLY
-// when the request looks like it came from a trusted proxy (loopback
-// + RFC1918 / RFC4193 private ranges), to avoid the spoofing footgun
-// the security rules flag.
+// TrustedProxyPolicy lists socket peers allowed to supply forwarded headers.
+// Loopback is trusted by default for local reverse-proxy deployments; private
+// network peers are not trusted unless an operator names their IP or CIDR.
+type TrustedProxyPolicy struct {
+	prefixes []netip.Prefix
+}
+
+// ParseTrustedProxyCIDRs parses a comma-separated list of exact proxy IPs or
+// CIDRs. The policy is immutable after construction and scoped to one server.
+func ParseTrustedProxyCIDRs(raw string) (TrustedProxyPolicy, error) {
+	var p TrustedProxyPolicy
+	if strings.TrimSpace(raw) == "" {
+		return p, nil
+	}
+	if len(raw) > 4096 {
+		return TrustedProxyPolicy{}, fmt.Errorf("trusted proxy CIDRs: configuration exceeds 4096 bytes")
+	}
+	entries := strings.Split(raw, ",")
+	if len(entries) > 32 {
+		return TrustedProxyPolicy{}, fmt.Errorf("trusted proxy CIDRs: more than 32 entries")
+	}
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return TrustedProxyPolicy{}, fmt.Errorf("trusted proxy CIDRs: empty entry")
+		}
+		if ip, err := netip.ParseAddr(entry); err == nil {
+			if ip.Zone() != "" {
+				return TrustedProxyPolicy{}, fmt.Errorf("trusted proxy CIDRs: zone is not allowed in %q", entry)
+			}
+			ip = ip.Unmap()
+			p.prefixes = append(p.prefixes, netip.PrefixFrom(ip, ip.BitLen()))
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil || prefix.Addr().Zone() != "" || prefix.Addr().Is4In6() {
+			return TrustedProxyPolicy{}, fmt.Errorf("trusted proxy CIDRs: invalid IP or CIDR %q", entry)
+		}
+		if prefix.Bits() == 0 {
+			return TrustedProxyPolicy{}, fmt.Errorf("trusted proxy CIDRs: all-address range %q is not allowed", entry)
+		}
+		p.prefixes = append(p.prefixes, prefix.Masked())
+	}
+	return p, nil
+}
+
+func (p TrustedProxyPolicy) trusted(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, prefix := range p.prefixes {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+type trustedProxyPolicyKey struct{}
+
+// TrustedProxyContext makes one server's proxy policy available to all
+// forwarded-header consumers without process-global mutable configuration.
+func TrustedProxyContext(policy TrustedProxyPolicy) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := context.WithValue(r.Context(), trustedProxyPolicyKey{}, policy)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func requestTrustedProxyPolicy(r *http.Request) TrustedProxyPolicy {
+	p, _ := r.Context().Value(trustedProxyPolicyKey{}).(TrustedProxyPolicy)
+	return p
+}
+
+// clientIP extracts the source IP. X-Forwarded-For is honoured only when the
+// socket peer is trusted, and only as a bounded chain of valid IP addresses.
+// The nearest untrusted hop (walking from right to left) is the client; this
+// prevents a caller-supplied leftmost value from bypassing rate limits when
+// a real proxy appends rather than replaces X-Forwarded-For.
 //
 // Uses net.SplitHostPort so IPv6 addresses like "[::1]:8080" parse
 // correctly (LastIndex on ":" mangles them).
@@ -329,27 +429,49 @@ func clientIP(r *http.Request) string {
 		// transports / tests) -- fall back to the raw value.
 		host = r.RemoteAddr
 	}
-	if isTrustedProxy(host) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if comma := strings.Index(xff, ","); comma > 0 {
-				return strings.TrimSpace(xff[:comma])
+	peer, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	peer = peer.Unmap()
+	if !requestTrustedProxyPolicy(r).trusted(peer) {
+		return peer.String()
+	}
+	const maxXFFBytes, maxXFFHops = 4096, 32
+	var hops []netip.Addr
+	var total int
+	for _, value := range r.Header.Values("X-Forwarded-For") {
+		total += len(value)
+		if total > maxXFFBytes {
+			return peer.String()
+		}
+		for _, part := range strings.Split(value, ",") {
+			if len(hops) >= maxXFFHops {
+				return peer.String()
 			}
-			return strings.TrimSpace(xff)
+			ip, err := netip.ParseAddr(strings.TrimSpace(part))
+			if err != nil || ip.Zone() != "" {
+				return peer.String()
+			}
+			hops = append(hops, ip.Unmap())
 		}
 	}
-	return host
+	policy := requestTrustedProxyPolicy(r)
+	for i := len(hops) - 1; i >= 0; i-- {
+		if !policy.trusted(hops[i]) {
+			return hops[i].String()
+		}
+	}
+	return peer.String()
 }
 
-// isTrustedProxy returns true when host is loopback (v4 or v6) or in a
-// private range. Uses net.IP.IsPrivate which correctly bounds the
-// 172.16.0.0/12 subnet (the previous strings-prefix check trusted all
-// of 172.0.0.0/8, opening X-Forwarded-For spoofing from any 172.x).
+// isTrustedProxy reports the safe default used without explicit policy.
 func isTrustedProxy(host string) bool {
-	ip := net.ParseIP(host)
-	if ip == nil {
+	ip, err := netip.ParseAddr(host)
+	if err != nil || ip.Zone() != "" {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate()
+	return (TrustedProxyPolicy{}).trusted(ip)
 }
 
 // isTrustedProxyRequest is the *http.Request convenience wrapper. Pulls
@@ -360,7 +482,33 @@ func isTrustedProxyRequest(r *http.Request) bool {
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	return isTrustedProxy(host)
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Zone() == "" && requestTrustedProxyPolicy(r).trusted(ip)
+}
+
+// Forwarded origin values must be singular and syntactically usable. Multiple
+// values or comma-joined proxy chains have ambiguous meaning, so ignore them.
+func forwardedProto(r *http.Request) string {
+	values := r.Header.Values("X-Forwarded-Proto")
+	if len(values) != 1 {
+		return ""
+	}
+	if values[0] == "http" || values[0] == "https" {
+		return values[0]
+	}
+	return ""
+}
+
+func forwardedHost(r *http.Request) string {
+	values := r.Header.Values("X-Forwarded-Host")
+	if len(values) != 1 || values[0] == "" || strings.ContainsAny(values[0], ", \t\r\n\\/?#@") || strings.HasSuffix(values[0], ":") {
+		return ""
+	}
+	u, err := url.Parse("http://" + values[0])
+	if err != nil || u.Host != values[0] || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	return values[0]
 }
 
 // ipLimiter is a refill-bucket per IP. Burst tokens fill at refill/sec.

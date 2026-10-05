@@ -6,15 +6,14 @@
 //  1. The operator "auto-add" UI: OAuth services become one-click providers,
 //     API-key services become one-click vault credentials, both pre-filled.
 //  2. The codegen Environment Lens: RenderForAI emits the base URL, auth
-//     scheme, and canonical operations for every service, so the AI never
-//     guesses an endpoint or auth header. It writes the call through sdk/http
-//     against verified metadata.
+//     scheme, and example operations for every service, so the AI has a
+//     documented starting point for sdk/http calls.
 //  3. Tests that keep the catalog well-formed as it grows.
 //
-// This is the design that beats the n8n node treadmill: data plus an AI that
-// composes robust typed Go, not hundreds of frozen hand-built nodes. Adding a
-// service is a struct literal here, not a new package. Every entry carries a
-// Docs link so the AI (and operators) can confirm details that drift.
+// Catalog entries are authoring templates, not provider contract tests or
+// production-certified adapters. Every entry carries a Docs link so the AI
+// and operators can confirm details that drift. An integration is client-ready
+// only after its auth, pagination, throttling, and write semantics are tested.
 package catalog
 
 import "sort"
@@ -29,6 +28,13 @@ const (
 	// APIKey is a static secret stored in the vault (referenced by name).
 	APIKey Auth = "api_key"
 )
+
+// CredentialAccess describes how workflow code can use a connected OAuth
+// account. An empty value means the ordinary vault-backed path. A brokered
+// account never releases its raw token to workflow code.
+type CredentialAccess string
+
+const BrokeredGET CredentialAccess = "brokered_get"
 
 // Op is one canonical operation: an HTTP method + path (relative to BaseURL)
 // plus a one-line summary. These are starting points the AI adapts.
@@ -55,6 +61,11 @@ type Service struct {
 	Docs    string // docs URL
 	Ops     []Op
 	SDK     string // non-empty when a first-class sdk/<pkg> already exists
+	// CredentialAccess overrides the default vault-backed OAuth path when the
+	// host owns the request and token. BrokerPathPrefix is relative to the
+	// validated account origin and precedes each listed operation path.
+	CredentialAccess CredentialAccess
+	BrokerPathPrefix string
 	// OAuth-only:
 	AuthURL  string
 	TokenURL string
@@ -78,7 +89,7 @@ var services = []Service{
 		SDK:      "sdk/email (Gmail)",
 		AuthURL:  "https://accounts.google.com/o/oauth2/v2/auth",
 		TokenURL: "https://oauth2.googleapis.com/token",
-		Scopes:   "openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly",
+		Scopes:   "openid email profile https://www.googleapis.com/auth/gmail.send",
 		Ops: []Op{
 			{"POST", "/gmail/v1/users/me/messages/send", "send an email (prefer sdk/email)"},
 		},
@@ -90,10 +101,9 @@ var services = []Service{
 		SDK:      "sdk/email (Outlook)",
 		AuthURL:  "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
 		TokenURL: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-		Scopes:   "openid email profile offline_access https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/Mail.Read",
+		Scopes:   "openid email profile offline_access https://graph.microsoft.com/Mail.Send",
 		Ops: []Op{
 			{"POST", "/me/sendMail", "send mail (prefer sdk/email)"},
-			{"GET", "/me/messages", "list messages"},
 		},
 	},
 	{
@@ -143,15 +153,15 @@ var services = []Service{
 	},
 	{
 		ID: "salesforce", Name: "Salesforce", Category: "crm", Auth: OAuth,
-		BaseURL: "<instance_url from token>/services/data/v60.0", AuthScheme: "Authorization: Bearer <token>; base is the token response instance_url",
+		BaseURL: "<validated OAuth instance_url>/services/data", AuthScheme: "GET via sdk/http.ConnectorGet with oauth:<connection-id>; host attaches Bearer token only to validated Salesforce org origin; raw token fetch is denied",
+		CredentialAccess: BrokeredGET, BrokerPathPrefix: "/services/data",
 		Docs:     "https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/",
 		AuthURL:  "https://login.salesforce.com/services/oauth2/authorize",
 		TokenURL: "https://login.salesforce.com/services/oauth2/token",
-		Scopes:   "api refresh_token offline_access",
+		Scopes:   "api id refresh_token offline_access",
 		Ops: []Op{
-			{"POST", "/sobjects/Contact", "create a contact"},
-			{"POST", "/sobjects/Lead", "create a lead"},
-			{"GET", "/query?q=...", "SOQL query"},
+			{"GET", "/v60.0/query?q=...", "SOQL query (GET-only broker; review fields and pagination)"},
+			{"GET", "/v60.0/sobjects/Account/{id}", "read one account (GET-only broker)"},
 		},
 	},
 	{
@@ -441,7 +451,9 @@ var services = []Service{
 // All returns every service, sorted by category then name (stable for UI).
 func All() []Service {
 	out := make([]Service, len(services))
-	copy(out, services)
+	for i, service := range services {
+		out[i] = cloneService(service)
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Category != out[j].Category {
 			return out[i].Category < out[j].Category
@@ -455,10 +467,24 @@ func All() []Service {
 func ByID(id string) (Service, bool) {
 	for _, s := range services {
 		if s.ID == id {
-			return s, true
+			return cloneService(s), true
 		}
 	}
 	return Service{}, false
+}
+
+// Catalog entries are shared source data for the UI, OAuth setup, and AI
+// authoring lens. Never expose their nested slices or maps for caller mutation.
+func cloneService(s Service) Service {
+	s.Ops = append([]Op(nil), s.Ops...)
+	if s.AuthParams != nil {
+		params := make(map[string]string, len(s.AuthParams))
+		for key, value := range s.AuthParams {
+			params[key] = value
+		}
+		s.AuthParams = params
+	}
+	return s
 }
 
 // HasOAuth reports whether a service can be connected via OAuth (the

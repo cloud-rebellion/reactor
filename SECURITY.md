@@ -30,9 +30,11 @@ trust boundaries matter:
   from an explicit allowlist, so `REACTOR_MASTER_KEY` and `REACTOR_DB_URL`
   are never inherited.
 - **Build sandbox.** Generated/uploaded workflow code is statically
-  checked against an import allowlist (standard library plus the Reactor
-  SDK) and compiled with `CGO_ENABLED=0` and a pinned toolchain before it
-  can run.
+  checked against an import allowlist (approved standard-library packages
+  plus the Reactor SDK). Filesystem, process, and raw-network wrappers such as
+  `io/ioutil`, `go/parser`, `text/template`, debug object readers, and
+  `log/syslog` are denied as well as their direct transports. It is compiled
+  with `CGO_ENABLED=0` and a pinned toolchain before it can run.
 - **RBAC.** The dashboard distinguishes admin and member roles. Every
   privileged mutation (workflow code, credentials, triggers, notification
   channels, codegen, uploads) is admin-only.

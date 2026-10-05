@@ -47,10 +47,11 @@ func TestRoundTrip(t *testing.T) {
 
 func TestDecodeRejectsTrash(t *testing.T) {
 	t.Parallel()
-	r := strings.NewReader("not json\n")
+	const childOutput = "private-access-token-not-json"
+	r := strings.NewReader(childOutput + "\n")
 	dec := NewDecoder(r)
-	if _, err := dec.Decode(); err == nil {
-		t.Fatal("expected error on garbage input")
+	if _, err := dec.Decode(); !errors.Is(err, ErrMalformedFrame) || strings.Contains(err.Error(), childOutput) {
+		t.Fatalf("malformed child output was reflected or misclassified: %v", err)
 	}
 }
 
@@ -89,6 +90,22 @@ func TestDecodeSkipsBlankLines(t *testing.T) {
 	}
 }
 
+func TestDecodeSkipsManyBlankLinesWithoutRecursion(t *testing.T) {
+	t.Parallel()
+	// Workflow stdout is untrusted. Keep a large blank-line run bounded to
+	// ensure a noisy child cannot grow the host call stack while Decode skips
+	// empty frames.
+	r := strings.NewReader(strings.Repeat("\n", 200_000) + `{"id":1,"kind":"ack"}` + "\n")
+	dec := NewDecoder(r)
+	f, err := dec.Decode()
+	if err != nil {
+		t.Fatalf("Decode() error after blank-line run: %v", err)
+	}
+	if f.Kind != KindAck || f.ID != 1 {
+		t.Fatalf("got %+v after blank-line run", f)
+	}
+}
+
 func TestUnwrap(t *testing.T) {
 	t.Parallel()
 	f, err := Wrap(1, 0, KindStepStart, StepStart{StepName: "x", Attempt: 2})
@@ -101,6 +118,17 @@ func TestUnwrap(t *testing.T) {
 	}
 	if got.StepName != "x" || got.Attempt != 2 {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestUnwrapDoesNotReflectChildBody(t *testing.T) {
+	const privateField = "oauth-access-token-in-field-name"
+	f := Frame{Body: json.RawMessage(`{"` + privateField + `":"bad"}`)}
+	var body struct {
+		Value int `json:"oauth-access-token-in-field-name"`
+	}
+	if err := Unwrap(f, &body); !errors.Is(err, ErrMalformedBody) || strings.Contains(err.Error(), privateField) {
+		t.Fatalf("malformed child body was reflected or misclassified: %v", err)
 	}
 }
 

@@ -117,13 +117,26 @@ type workflowRegistrarAdapter struct {
 }
 
 func (a workflowRegistrarAdapter) RegisterFromDir(ctx context.Context, slug, src, tenantID string) (string, error) {
+	return a.registerFromDir(ctx, slug, src, tenantID, 0)
+}
+
+// RegisterFromDirExpected is the revision-fenced editor path. The legacy
+// RegisterFromDir method remains for first registration and callers that do
+// not have a reviewed baseline (for example knowledge uploads).
+func (a workflowRegistrarAdapter) RegisterFromDirExpected(ctx context.Context, slug, src, tenantID string, expectedVersion int) (string, error) {
+	return a.registerFromDir(ctx, slug, src, tenantID, expectedVersion)
+}
+
+func (a workflowRegistrarAdapter) registerFromDir(ctx context.Context, slug, src, tenantID string, expectedVersion int) (string, error) {
 	res, err := codegen.BuildAndRegister(ctx, a.journal, codegen.BuildAndRegisterRequest{
-		Slug:         slug,
-		SrcDir:       src,
-		StateRoot:    a.root,
-		SDKVersion:   "0.1.0",
-		SkipIfExists: true,
-		TenantID:     tenantID,
+		Slug:            slug,
+		SrcDir:          src,
+		StateRoot:       a.root,
+		SDKVersion:      "0.1.0",
+		SkipIfExists:    true,
+		TenantID:        tenantID,
+		ExpectedVersion: expectedVersion,
+		RetainSource:    true,
 	})
 	if err != nil {
 		return "", err

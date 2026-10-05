@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"net/http"
 	"strings"
 )
@@ -32,8 +34,27 @@ func (s *Server) assets(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(name, ".css"):
 		w.Header().Set("Content-Type", "text/css")
 	}
-	// Cache aggressively; the assets only change when the binary
-	// rebuilds, so a long max-age is safe.
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	// Asset URLs are stable across binary rebuilds, so immutable caching would
+	// pin a browser to stale editor/security JavaScript forever. Keep caching
+	// efficient with a content ETag while requiring a cheap revalidation when
+	// the binary changes.
+	digest := sha256.Sum256(body)
+	etag := `"` + hex.EncodeToString(digest[:]) + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
+	if assetETagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	_, _ = w.Write(body)
+}
+
+func assetETagMatches(header, current string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == current || strings.TrimPrefix(candidate, "W/") == current {
+			return true
+		}
+	}
+	return false
 }

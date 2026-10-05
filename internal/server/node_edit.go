@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"path/filepath"
 
 	"github.com/bright-interaction/reactor/internal/codeedit"
+	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -41,8 +41,22 @@ func (s *Server) workflowNodeCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir := filepath.Join(s.WorkflowsRoot, slug)
-	codeBytes, codePath := readFirstAvailable(dir, "main.go", "workflow.go")
+	dir, err := s.workflowSourceDir(r.Context(), slug, editTenantScope(r))
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(err, errWorkflowSourceUnavailable) {
+			http.Error(w, "workflow source snapshot unavailable; rebuild and re-register this workflow before editing", http.StatusConflict)
+		} else {
+			http.Error(w, "could not resolve workflow source", http.StatusInternalServerError)
+		}
+		return
+	}
+	codeBytes, codePath, codeTruncated := readFirstAvailableBounded(dir, maxFlowSourceBytes, "main.go", "workflow.go", "source/main.go")
+	if codeTruncated {
+		http.Error(w, "workflow source exceeds the dashboard projection limit; use the bounded MCP source resource or rebuild before editing", http.StatusConflict)
+		return
+	}
 	if len(codeBytes) == 0 {
 		http.Error(w, "workflow source not bundled", http.StatusNotFound)
 		return
@@ -59,7 +73,11 @@ func (s *Server) workflowNodeCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, downstream, runID := s.nodeDataflow(r.Context(), slug, dir, step, viewerScope(r))
+	// Keep the sample-run projection on the same tenant selector used to
+	// resolve the source workspace. Global admins can inspect duplicate slugs
+	// with ?tenant=; using viewerScope alone would be empty for them and could
+	// silently attach another tenant's latest sample to this editor drawer.
+	upstream, downstream, runID := s.nodeDataflow(r.Context(), slug, dir, step, editTenantScope(r))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -99,8 +117,33 @@ func (s *Server) workflowSaveNodeCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir := filepath.Join(s.WorkflowsRoot, slug)
-	codeBytes, _ := readFirstAvailable(dir, "main.go", "workflow.go")
+	expectedVersion, err := s.workflowEditVersion(r.Context(), r, slug, editTenantScope(r))
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(err, errWorkflowExpectedVersionInvalid) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		} else {
+			http.Error(w, "could not resolve workflow version", http.StatusInternalServerError)
+		}
+		return
+	}
+	dir, err := s.workflowSourceDir(r.Context(), slug, editTenantScope(r))
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			http.Error(w, "workflow not registered", http.StatusNotFound)
+		} else if errors.Is(err, errWorkflowSourceUnavailable) {
+			http.Error(w, "workflow source snapshot unavailable; rebuild and re-register this workflow before editing", http.StatusConflict)
+		} else {
+			http.Error(w, "could not resolve workflow source", http.StatusInternalServerError)
+		}
+		return
+	}
+	codeBytes, _, codeTruncated := readFirstAvailableBounded(dir, maxFlowSourceBytes, "main.go", "workflow.go", "source/main.go")
+	if codeTruncated {
+		http.Error(w, "workflow source exceeds the dashboard projection limit; rebuild before editing", http.StatusConflict)
+		return
+	}
 	if len(codeBytes) == 0 {
 		http.Error(w, "workflow source not bundled", http.StatusNotFound)
 		return
@@ -117,8 +160,12 @@ func (s *Server) workflowSaveNodeCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dagBytes, _ := os.ReadFile(filepath.Join(dir, "dag.json"))
-	if status, err := s.writeValidatedCode(r.Context(), slug, dir, viewerScope(r), []byte(merged), dagBytes); err != nil {
+	dagBytes, _, dagTruncated := readFirstAvailableBounded(dir, maxFlowDAGBytes, "dag.json", "source/dag.json")
+	if dagTruncated {
+		http.Error(w, "workflow DAG exceeds the dashboard projection limit; rebuild before editing node code", http.StatusConflict)
+		return
+	}
+	if status, err := s.writeValidatedCode(r.Context(), slug, dir, editTenantScope(r), expectedVersion, []byte(merged), dagBytes); err != nil {
 		http.Error(w, err.Error(), status)
 		return
 	}

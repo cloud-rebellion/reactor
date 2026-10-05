@@ -18,7 +18,7 @@ platform: linux
 version: ${REACTOR_VERSION}
 section: utils
 priority: optional
-maintainer: Bright Interaction <hello@brightinteraction.com>
+maintainer: Bright Interaction <tom@cloudrebellion.se>
 description: |
   AI-built workflow automation. Self-hosted. Single Go binary.
   Code-as-artifact (generated Go committed to reactor-workflows/),
@@ -34,11 +34,18 @@ contents:
     dst: /usr/bin/reactor
     file_info:
       mode: 0755
+  # The daemon compiles MCP-authored Go workflows offline. This release-matched
+  # module contains the SDK and its local safehttp dependency; the unit pins
+  # REACTOR_SDK_REPLACE to this root-owned path.
+  - src: dist/reactor-sdk/
+    dst: /usr/lib/reactor-sdk
+    type: tree
   - src: deploy/reactor.service
     dst: /lib/systemd/system/reactor.service
     file_info:
       mode: 0644
-    type: config|noreplace
+    # Vendor unit upgrades with the package. Operator overrides belong in
+    # /etc/systemd/system/reactor.service.d/, not in this packaged file.
   - src: deploy/README.md
     dst: /usr/share/doc/reactor/DEPLOY.md
     file_info:

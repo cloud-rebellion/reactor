@@ -17,6 +17,7 @@ import (
 	"github.com/bright-interaction/reactor/internal/auth"
 	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/oauth"
+	"github.com/go-chi/chi/v5"
 )
 
 func serverWithOAuth(t *testing.T) *Server {
@@ -92,5 +93,23 @@ func TestConnectionsFlow(t *testing.T) {
 	if !strings.HasPrefix(loc, "https://accounts.google.com/o/oauth2/v2/auth") ||
 		!strings.Contains(loc, "code_challenge=") || !strings.Contains(loc, "state=") {
 		t.Fatalf("authorize redirect malformed: %s", loc)
+	}
+}
+
+func TestOAuthCallbackIsReachableWithoutDashboardSession(t *testing.T) {
+	t.Parallel()
+	s := serverWithOAuth(t)
+	// Use a fully configured legacy auth gate so the assertion proves the
+	// callback is explicitly public rather than merely passing because auth is
+	// absent. Provider error callbacks do not need a state exchange and still
+	// exercise the production callback route and HTML response.
+	s.BasicAuth = BasicAuthConfig{User: "admin", PasswordSHA256: hashPass("secret")}
+	r := chi.NewRouter()
+	s.Mount(r)
+	req := httptest.NewRequest(http.MethodGet, "/oauth/callback?error=access_denied", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Connection failed") {
+		t.Fatalf("OAuth callback status=%d body=%q; want public callback page", rec.Code, rec.Body.String())
 	}
 }

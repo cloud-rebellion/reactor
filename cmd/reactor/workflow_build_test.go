@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -46,6 +48,9 @@ func TestHashESignScaffoldBuildsFromFreshDirectory(t *testing.T) {
 	}
 	if _, err := registry.New(filepath.Join(stateRoot, "workflows")).BuildArtifact(slug); err != nil {
 		t.Fatalf("immutable build candidate missing: %v", err)
+	}
+	if owner, err := registry.New(filepath.Join(stateRoot, "workflows")).TenantOwner(slug); err != nil || owner != journal.DefaultTenant {
+		t.Fatalf("CLI build owner = %q, err=%v; want %q", owner, err, journal.DefaultTenant)
 	}
 	if _, err := os.Stat(filepath.Join(source, "go.mod")); !os.IsNotExist(err) {
 		t.Fatalf("build modified fresh scaffold source with go.mod: %v", err)
@@ -165,6 +170,9 @@ func TestWorkflowRegisterArtifactFlagPinsExactBuildAcrossCandidateChange(t *test
 	dbURL, j := newSeededDB(t)
 	stateRoot := t.TempDir()
 	reg := registry.New(filepath.Join(stateRoot, "workflows"))
+	if err := reg.ClaimTenant("exact-build", journal.DefaultTenant); err != nil {
+		t.Fatalf("claim CLI artifact namespace: %v", err)
+	}
 	publish := func(body string) registry.Artifact {
 		t.Helper()
 		source := filepath.Join(t.TempDir(), "workflow")
@@ -219,5 +227,43 @@ func TestWorkflowRegisterArtifactFlagPinsExactBuildAcrossCandidateChange(t *test
 	}
 	if candidate.Digest != newerCandidate.Digest {
 		t.Fatalf("registration mutated candidate pointer: got %s want %s", candidate.Digest, newerCandidate.Digest)
+	}
+}
+
+func TestWorkflowRegisterRejectsCrossTenantArtifactNamespace(t *testing.T) {
+	ctx := context.Background()
+	dbURL, j := newSeededDB(t)
+	if err := j.UpsertTenant(ctx, journal.Tenant{TenantID: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CreateWorkflowInTenant(ctx, "wf_other_cli", "cli-shared", "h", "0.1.0", json.RawMessage(`{}`), "other"); err != nil {
+		t.Fatal(err)
+	}
+
+	stateRoot := t.TempDir()
+	reg := registry.New(filepath.Join(stateRoot, "workflows"))
+	source := filepath.Join(t.TempDir(), "workflow")
+	if err := os.WriteFile(source, []byte("foreign tenant artifact"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := reg.PublishArtifact("cli-shared", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = cmdWorkflowRegister(ctx, discardLogger(), []string{
+		"--db=" + dbURL,
+		"--root=" + stateRoot,
+		"--slug=cli-shared",
+		"--artifact-sha256=" + artifact.Digest,
+	})
+	if err == nil || !strings.Contains(err.Error(), "executable filesystem namespace is shared") {
+		t.Fatalf("cross-tenant CLI registration error = %v, want namespace refusal", err)
+	}
+	if _, err := j.WorkflowIDBySlugInTenant(ctx, "cli-shared", journal.DefaultTenant); !errors.Is(err, journal.ErrNotFound) {
+		t.Fatalf("cross-tenant CLI registration created default workflow: %v", err)
+	}
+	if _, err := reg.BinaryPath("cli-shared"); err == nil {
+		t.Fatal("cross-tenant CLI registration activated compatibility binary")
 	}
 }

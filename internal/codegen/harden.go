@@ -44,6 +44,7 @@ func StageWorkflowSource(src string) (string, func(), error) {
 		return "", nil, err
 	}
 
+	var totalBytes int64
 	err = filepath.WalkDir(src, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -83,16 +84,31 @@ func StageWorkflowSource(src string) (string, func(), error) {
 			}
 			return fmt.Errorf("stage workflow source: file %q changed while staging", rel)
 		}
+		if openedInfo.Size() > maxRetainedSourceFileBytes {
+			_ = input.Close()
+			return fmt.Errorf("stage workflow source: file %q exceeds %d-byte limit", rel, maxRetainedSourceFileBytes)
+		}
+		if totalBytes+openedInfo.Size() > maxRetainedSourceTotalBytes {
+			_ = input.Close()
+			return fmt.Errorf("stage workflow source exceeds %d-byte total limit", maxRetainedSourceTotalBytes)
+		}
 		output, err := os.OpenFile(filepath.Join(stage, rel), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			_ = input.Close()
 			return err
 		}
-		if _, err := io.Copy(output, input); err != nil {
+		written, err := io.Copy(output, io.LimitReader(input, maxRetainedSourceFileBytes+1))
+		if err != nil {
 			_ = input.Close()
 			_ = output.Close()
 			return err
 		}
+		if written > maxRetainedSourceFileBytes {
+			_ = input.Close()
+			_ = output.Close()
+			return fmt.Errorf("stage workflow source: file %q changed beyond %d-byte limit", rel, maxRetainedSourceFileBytes)
+		}
+		totalBytes += written
 		if err := input.Close(); err != nil {
 			_ = output.Close()
 			return err
@@ -106,12 +122,12 @@ func StageWorkflowSource(src string) (string, func(), error) {
 }
 
 // AllowedImportPrefixes is the set of non-stdlib import path prefixes a
-// generated or uploaded workflow may use. Everything in the standard
-// library (import paths whose first segment contains no dot) is allowed
-// implicitly; everything else must match one of these prefixes. This is
-// the gate that stops a hostile brief or saved edit from pulling an
-// arbitrary third-party module that could run attacker-controlled code
-// (cgo directives, linker flags) at `go build` time.
+// generated or uploaded workflow may use. Standard-library imports (paths
+// whose first segment contains no dot) are allowed implicitly except for the
+// denied packages and subpackages below; everything else must match one of
+// these prefixes. This is the gate that stops a hostile brief or saved edit
+// from pulling an arbitrary third-party module that could run attacker-
+// controlled code (cgo directives, linker flags) at `go build` time.
 var AllowedImportPrefixes = []string{
 	"github.com/bright-interaction/reactor",
 }
@@ -124,19 +140,57 @@ var AllowedImportPrefixes = []string{
 // have. Checked in EVERY scanned file, not just main.go, so a subdir file
 // cannot smuggle them past the lint pass.
 //
-// NB this list is NOT containment, and denying os/exec does not by itself deny
-// process spawning: plain "os" is allowlisted as stdlib and os.StartProcess
-// spawns a process just as well, so `reactor lint` bans that call separately.
+// NB this list is an authoring boundary, not a full OS sandbox. Runtime
+// resource limits and the daemon's service-account boundary remain necessary.
 // Assembly (.s) files are not scanned either, since this walk parses only .go.
 // See docs/security.md Layer 4: the real boundary is the OS user the daemon
 // runs as.
 var deniedImports = map[string]struct{}{
-	"C":         {},
-	"unsafe":    {},
-	"plugin":    {},
-	"os/exec":   {},
-	"syscall":   {},
-	"os/signal": {},
+	"C":       {},
+	"unsafe":  {},
+	"plugin":  {},
+	"os/exec": {},
+	"os":      {},
+	// These standard-library wrappers reach the filesystem without importing
+	// os directly. A workflow can otherwise use ioutil.ReadFile, template's
+	// ParseFiles, or parser.ParseFile(filename, nil, ...) to read the daemon's
+	// state and master.key after discovering its executable path.
+	"io/ioutil":      {},
+	"go/parser":      {},
+	"text/template":  {},
+	"html/template":  {},
+	"debug/elf":      {},
+	"debug/macho":    {},
+	"debug/pe":       {},
+	"debug/plan9obj": {},
+	// syslog opens a network or Unix-domain socket internally, so it is an
+	// egress bypass even when net and net/http are denied.
+	"log/syslog":      {},
+	"syscall":         {},
+	"os/signal":       {},
+	"net":             {},
+	"net/http":        {},
+	"net/smtp":        {},
+	"net/rpc":         {},
+	"net/rpc/jsonrpc": {},
+	"crypto/tls":      {},
+}
+
+// deniedImportPrefixes closes the subpackage bypass around deniedImports. Go's
+// standard library exposes useful (and dangerous) functionality below a
+// package path, for example net/http/httptest and os/user. Checking only the
+// exact parent import lets a workflow pull those packages in while the
+// recursive AST scan reports a clean result. Prefix matching is deliberately
+// segment-aware so a future package such as net/httpx is not rejected merely
+// because its name starts with a denied package.
+var deniedImportPrefixes = []string{
+	"crypto/tls/",
+	"net/http/",
+	"net/rpc/",
+	"net/smtp/",
+	"os/",
+	"plugin/",
+	"syscall/",
 }
 
 // CheckAllowedImports parses every .go file under dir (RECURSIVELY, including
@@ -160,6 +214,14 @@ func CheckAllowedImports(dir string) error {
 			return nil
 		}
 		name := d.Name()
+		// Native source and assembly are outside the workflow authoring
+		// contract. Even with CGO disabled, assembly can make raw syscalls or
+		// otherwise evade the Go AST/import checks; C/C++ can reintroduce a
+		// compiler/linker execution path. Reject these files before go build.
+		switch strings.ToLower(filepath.Ext(name)) {
+		case ".s", ".asm", ".c", ".h", ".cc", ".cpp", ".cxx", ".m", ".mm", ".syso":
+			return fmt.Errorf("import allowlist: native source or assembly file %q is not allowed in a workflow", path)
+		}
 		if !strings.HasSuffix(name, ".go") {
 			return nil
 		}
@@ -212,6 +274,11 @@ func CheckAllowedImports(dir string) error {
 func importAllowed(path string) bool {
 	if _, denied := deniedImports[path]; denied {
 		return false
+	}
+	for _, prefix := range deniedImportPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return false
+		}
 	}
 	first := path
 	if i := strings.IndexByte(path, '/'); i >= 0 {

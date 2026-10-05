@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -20,17 +22,29 @@ type Notifier interface {
 	TestChannel(ctx context.Context, channelID string) error
 }
 
+const notificationPageSize = 100
+
+// Channel inventories are bounded on both dashboard surfaces. Invalid page
+// numbers return the first page rather than allowing an unbounded SQL offset.
+func notificationPageIndex(r *http.Request, key string) int {
+	page, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil || page < 0 || page > 10000 {
+		return 0
+	}
+	return page
+}
+
 // notifications renders the channels list + the add-channel form.
 //
-// The UNSCOPED list is deliberate here and must stay. Every route in
+// The unscoped metadata page is deliberate here. Every route in
 // mountNotificationsRoutes sits inside the requireAdminMW group, and admin is a
 // global role (viewerScope returns "" for it), so the only viewer who reaches
 // this page is one entitled to the whole install. The member-facing workflow
-// detail page had to switch to ListNotificationChannelsByTenant because it is
-// NOT admin-gated; that asymmetry is the point, not an oversight.
+// detail page uses a tenant-scoped metadata page because it is not admin-gated.
 func (s *Server) notifications(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	channels, err := s.Journal.ListNotificationChannels(ctx)
+	pageIndex := notificationPageIndex(r, "page")
+	channels, hasMore, err := s.Journal.ListNotificationChannelMetadataPage(ctx, notificationPageSize, pageIndex*notificationPageSize)
 	if err != nil {
 		s.errorPage(w, "list notification channels", err)
 		return
@@ -39,7 +53,7 @@ func (s *Server) notifications(w http.ResponseWriter, r *http.Request) {
 	s.renderPage(w, r, page{
 		Title:   "Notifications",
 		Heading: "Notifications",
-		Body:    template.HTML(notificationsBody(channels, "", tenants, current)),
+		Body:    template.HTML(notificationsBodyPage(channels, "", tenants, current, pageIndex, hasMore)),
 	})
 }
 
@@ -56,7 +70,7 @@ func (s *Server) notificationsCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := parseChannelConfig(kind, r)
+	cfg, credentialID, err := parseChannelConfig(kind, r)
 	if err != nil {
 		s.notificationsError(w, r, err.Error())
 		return
@@ -65,6 +79,19 @@ func (s *Server) notificationsCreate(w http.ResponseWriter, r *http.Request) {
 	tenantID := strings.TrimSpace(r.PostFormValue("tenant_id"))
 	if scope := viewerScope(r); scope != "" {
 		tenantID = scope
+	}
+	if tenantID == "" {
+		tenantID = journal.DefaultTenant
+	}
+	if credentialID != "" {
+		if s.Credentials == nil {
+			s.notificationsError(w, r, "credential repository unavailable")
+			return
+		}
+		if _, err := s.Credentials.GetMetadataByTenant(r.Context(), credentialID, tenantID); err != nil {
+			s.notificationsError(w, r, "credential must exist in the channel's tenant")
+			return
+		}
 	}
 	if _, err := s.Journal.CreateNotificationChannelInTenant(r.Context(), tenantID, name, kind, cfg); err != nil {
 		if errors.Is(err, journal.ErrChannelNameTaken) {
@@ -145,7 +172,7 @@ func (s *Server) workflowNotificationRouteCreate(w http.ResponseWriter, r *http.
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	http.Redirect(w, r, "/workflows/"+slug, http.StatusSeeOther)
+	http.Redirect(w, r, workflowHrefFromRequest(r, slug), http.StatusSeeOther)
 }
 
 // workflowNotificationRouteDelete handles POST /workflows/{slug}/notifications/{channel_id}/delete.
@@ -168,50 +195,65 @@ func (s *Server) workflowNotificationRouteDelete(w http.ResponseWriter, r *http.
 		s.errorPage(w, "delete notification route", err)
 		return
 	}
-	http.Redirect(w, r, "/workflows/"+slug, http.StatusSeeOther)
+	http.Redirect(w, r, workflowHrefFromRequest(r, slug), http.StatusSeeOther)
 }
 
 // notificationsError renders the notifications page with an inline
 // error pill above the form so the operator does not lose context.
 func (s *Server) notificationsError(w http.ResponseWriter, r *http.Request, msg string) {
-	channels, _ := s.Journal.ListNotificationChannels(r.Context())
+	pageIndex := notificationPageIndex(r, "page")
+	channels, hasMore, _ := s.Journal.ListNotificationChannelMetadataPage(r.Context(), notificationPageSize, pageIndex*notificationPageSize)
 	tenants, current := s.availableTenants(r)
 	w.WriteHeader(http.StatusUnprocessableEntity)
 	s.renderPage(w, r, page{
 		Title:   "Notifications",
 		Heading: "Notifications",
-		Body:    template.HTML(notificationsBody(channels, msg, tenants, current)),
+		Body:    template.HTML(notificationsBodyPage(channels, msg, tenants, current, pageIndex, hasMore)),
 	})
 }
 
-// parseChannelConfig validates + serialises the per-kind form fields.
-func parseChannelConfig(kind string, r *http.Request) (json.RawMessage, error) {
+// parseChannelConfig validates and serialises non-secret form fields. Secret
+// values are referenced by credential ID and checked against the selected
+// tenant before the channel is created.
+func parseChannelConfig(kind string, r *http.Request) (json.RawMessage, string, error) {
 	switch kind {
 	case journal.ChannelKindSlackWebhook:
-		url := strings.TrimSpace(r.PostFormValue("slack_url"))
-		if !strings.HasPrefix(url, "https://hooks.slack.com/") {
-			return nil, errors.New("slack webhook URL must start with https://hooks.slack.com/")
+		if strings.TrimSpace(r.PostFormValue("slack_url")) != "" {
+			return nil, "", errors.New("store the Slack webhook URL in the vault; plaintext URLs are not accepted")
 		}
-		return json.Marshal(map[string]any{"url": url})
+		credentialID := strings.TrimSpace(r.PostFormValue("slack_url_credential_id"))
+		if credentialID == "" || len(credentialID) > 256 {
+			return nil, "", errors.New("Slack webhook URL credential id is required and must be at most 256 bytes")
+		}
+		cfg, err := json.Marshal(map[string]string{"url_credential_id": credentialID})
+		return cfg, credentialID, err
 	case journal.ChannelKindGenericWebhook:
-		url := strings.TrimSpace(r.PostFormValue("webhook_url"))
-		if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
-			return nil, errors.New("webhook URL must be http(s)")
+		endpoint := strings.TrimSpace(r.PostFormValue("webhook_url"))
+		parsed, parseErr := url.Parse(endpoint)
+		if parseErr != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || len(endpoint) > 2048 {
+			return nil, "", errors.New("webhook URL must be an absolute http(s) URL without userinfo and at most 2048 bytes")
 		}
 		headerName := strings.TrimSpace(r.PostFormValue("webhook_header_name"))
 		headerValue := strings.TrimSpace(r.PostFormValue("webhook_header_value"))
 		headerCredID := strings.TrimSpace(r.PostFormValue("webhook_header_credential_id"))
-		cfg := map[string]any{"url": url}
-		switch {
-		case headerName != "" && headerCredID != "":
+		if len(headerName) > 128 || len(headerCredID) > 256 {
+			return nil, "", errors.New("webhook header name or credential id is too long")
+		}
+		if headerValue != "" {
+			return nil, "", errors.New("store the webhook auth header in the vault; plaintext header values are not accepted")
+		}
+		if (headerName == "") != (headerCredID == "") {
+			return nil, "", errors.New("webhook auth header name and credential id must be supplied together")
+		}
+		cfg := map[string]any{"url": endpoint}
+		if headerName != "" {
 			// Reference a vault credential for the header value; the secret
 			// is resolved at send time and never stored in config_json.
 			cfg["header_name"] = headerName
 			cfg["header_credential_id"] = headerCredID
-		case headerName != "" && headerValue != "":
-			cfg["headers"] = map[string]string{headerName: headerValue}
 		}
-		return json.Marshal(cfg)
+		encoded, err := json.Marshal(cfg)
+		return encoded, headerCredID, err
 	case journal.ChannelKindEmailSMTP:
 		host := strings.TrimSpace(r.PostFormValue("smtp_host"))
 		port := strings.TrimSpace(r.PostFormValue("smtp_port"))
@@ -221,13 +263,27 @@ func parseChannelConfig(kind string, r *http.Request) (json.RawMessage, error) {
 		pass := r.PostFormValue("smtp_password")
 		passCredID := strings.TrimSpace(r.PostFormValue("smtp_password_credential_id"))
 		if host == "" || from == "" || to == "" {
-			return nil, errors.New("smtp host, from, and to are required")
+			return nil, "", errors.New("smtp host, from, and to are required")
+		}
+		if pass != "" {
+			return nil, "", errors.New("store the SMTP password in the vault; plaintext passwords are not accepted")
+		}
+		if passCredID == "" {
+			return nil, "", errors.New("SMTP password credential id is required")
+		}
+		if len(passCredID) > 256 || len(host) > 255 || len(from) > 320 || len(to) > 4096 || len(user) > 320 {
+			return nil, "", errors.New("SMTP field is too long")
 		}
 		portInt := 587
 		if port != "" {
-			if _, err := fmt.Sscanf(port, "%d", &portInt); err != nil {
-				return nil, errors.New("smtp port must be an integer")
+			var err error
+			portInt, err = strconv.Atoi(port)
+			if err != nil {
+				return nil, "", errors.New("smtp port must be an integer")
 			}
+		}
+		if portInt < 1 || portInt > 65535 {
+			return nil, "", errors.New("smtp port must be between 1 and 65535")
 		}
 		cfg := map[string]any{
 			"host":     host,
@@ -236,20 +292,19 @@ func parseChannelConfig(kind string, r *http.Request) (json.RawMessage, error) {
 			"to":       to,
 			"username": user,
 		}
-		// Prefer a vault credential reference; fall back to a plaintext
-		// password only when no credential id is given (legacy path).
-		if passCredID != "" {
-			cfg["password_credential_id"] = passCredID
-		} else {
-			cfg["password"] = pass
-		}
-		return json.Marshal(cfg)
+		cfg["password_credential_id"] = passCredID
+		encoded, err := json.Marshal(cfg)
+		return encoded, passCredID, err
 	}
-	return nil, fmt.Errorf("unknown channel kind %q", kind)
+	return nil, "", fmt.Errorf("unknown channel kind %q", kind)
 }
 
 // notificationsBody renders the page contents.
-func notificationsBody(channels []journal.NotificationChannel, errMsg string, tenants []journal.Tenant, currentTenant string) string {
+func notificationsBody(channels []journal.NotificationChannelMetadata, errMsg string, tenants []journal.Tenant, currentTenant string) string {
+	return notificationsBodyPage(channels, errMsg, tenants, currentTenant, 0, false)
+}
+
+func notificationsBodyPage(channels []journal.NotificationChannelMetadata, errMsg string, tenants []journal.Tenant, currentTenant string, pageIndex int, hasMore bool) string {
 	var b strings.Builder
 	if errMsg != "" {
 		b.WriteString(`<div class="err" style="background:#fff;border:1px solid var(--err);padding:12px 16px;margin:0 0 16px;border-radius:3px;">` +
@@ -257,7 +312,11 @@ func notificationsBody(channels []journal.NotificationChannel, errMsg string, te
 	}
 	b.WriteString(`<h2>Channels</h2>`)
 	if len(channels) == 0 {
-		b.WriteString(`<p class="empty">No channels configured. Use the form below to add one, then attach it to a workflow on the workflow detail page.</p>`)
+		if pageIndex > 0 {
+			b.WriteString(`<p class="empty">No channels on this page.</p>`)
+		} else {
+			b.WriteString(`<p class="empty">No channels configured. Use the form below to add one, then attach it to a workflow on the workflow detail page.</p>`)
+		}
 	} else {
 		b.WriteString(`<table><thead><tr><th>Name</th><th>Kind</th><th>Created</th><th></th></tr></thead><tbody>`)
 		for _, c := range channels {
@@ -276,6 +335,17 @@ func notificationsBody(channels []journal.NotificationChannel, errMsg string, te
 		}
 		b.WriteString(`</tbody></table>`)
 	}
+	if pageIndex > 0 || hasMore {
+		b.WriteString(`<nav aria-label="Channel pages">`)
+		if pageIndex > 0 {
+			fmt.Fprintf(&b, `<a href="/notifications?page=%d">Previous</a> `, pageIndex-1)
+		}
+		fmt.Fprintf(&b, `<span>Page %d</span>`, pageIndex+1)
+		if hasMore {
+			fmt.Fprintf(&b, ` <a href="/notifications?page=%d">Next</a>`, pageIndex+1)
+		}
+		b.WriteString(`</nav>`)
+	}
 
 	b.WriteString(`<h2>Add channel</h2>`)
 	b.WriteString(`<form method="POST" action="/notifications" class="form">
@@ -291,14 +361,13 @@ func notificationsBody(channels []journal.NotificationChannel, errMsg string, te
   </label>
   <fieldset id="fields-slack_webhook" class="kind-fields js-reveal-target" hidden>
     <legend>Slack</legend>
-    <label>Webhook URL <input type="url" name="slack_url" placeholder="https://hooks.slack.com/services/..."></label>
+    <label>Webhook URL credential id <input type="text" name="slack_url_credential_id" placeholder="cred_..." autocomplete="off"></label>
   </fieldset>
   <fieldset id="fields-generic_webhook" class="kind-fields js-reveal-target" hidden>
     <legend>Generic webhook</legend>
     <label>Webhook URL <input type="url" name="webhook_url" placeholder="https://example.com/reactor"></label>
     <label>Optional auth header name <input type="text" name="webhook_header_name" placeholder="X-Auth-Token"></label>
-    <label>Auth header value <input type="text" name="webhook_header_value" placeholder="plaintext (stored in config)"></label>
-    <label>...or vault credential id <input type="text" name="webhook_header_credential_id" placeholder="cred_... (recommended; secret stays in the vault)"></label>
+    <label>Auth header credential id <input type="text" name="webhook_header_credential_id" placeholder="cred_..." autocomplete="off"></label>
   </fieldset>
   <fieldset id="fields-email_smtp" class="kind-fields js-reveal-target" hidden>
     <legend>Email (SMTP)</legend>
@@ -307,9 +376,9 @@ func notificationsBody(channels []journal.NotificationChannel, errMsg string, te
     <label>From <input type="email" name="smtp_from" placeholder="alerts@example.com"></label>
     <label>To <input type="text" name="smtp_to" placeholder="ops@example.com[, oncall@example.com]"></label>
     <label>Username <input type="text" name="smtp_username" autocomplete="off"></label>
-    <label>Password <input type="password" name="smtp_password" autocomplete="new-password" placeholder="plaintext (stored in config)"></label>
-    <label>...or vault credential id <input type="text" name="smtp_password_credential_id" placeholder="cred_... (recommended; password stays in the vault)"></label>
+    <label>Password credential id <input type="text" name="smtp_password_credential_id" placeholder="cred_..." autocomplete="off"></label>
   </fieldset>
+  <p class="muted">Store Slack webhook URLs, SMTP passwords, and webhook auth headers as <a href="/credentials/new">vault credentials</a> in the selected tenant before creating a channel. Reactor resolves them only when sending.</p>
   <p class="muted">After creating, attach the channel to specific workflows on the workflow detail page. By default, channels fire on <code>failed</code> + <code>failed_dlq</code> terminal status; you can broaden to <code>succeeded</code> per workflow.</p>
   <button type="submit" class="btn-primary">Create channel</button>
 </form>`)
@@ -318,7 +387,19 @@ func notificationsBody(channels []journal.NotificationChannel, errMsg string, te
 
 // renderNotificationRoutesSection draws the per-workflow notification
 // routes on the workflow detail page (called by workflowDetailBody).
-func renderNotificationRoutesSection(slug string, routes []journal.NotificationRouteWithChannel, allChannels []journal.NotificationChannel) string {
+func renderNotificationRoutesSection(slug string, routes []journal.NotificationRouteWithChannel, allChannels []journal.NotificationChannelMetadata, readOnly bool) string {
+	return renderNotificationRoutesSectionForTenant(slug, routes, allChannels, readOnly, "")
+}
+
+// renderNotificationRoutesSectionForTenant is the tenant-aware variant used
+// by the dashboard. A global admin may view a duplicate slug with ?tenant=;
+// every attach/detach form must preserve that selector or the POST can target
+// another tenant's workflow.
+func renderNotificationRoutesSectionForTenant(slug string, routes []journal.NotificationRouteWithChannel, allChannels []journal.NotificationChannelMetadata, readOnly bool, actionQuery string) string {
+	return renderNotificationRoutesSectionForTenantPage(slug, routes, allChannels, readOnly, actionQuery, 0, false)
+}
+
+func renderNotificationRoutesSectionForTenantPage(slug string, routes []journal.NotificationRouteWithChannel, allChannels []journal.NotificationChannelMetadata, readOnly bool, actionQuery string, pageIndex int, hasMore bool) string {
 	var b strings.Builder
 	b.WriteString(`<h2>Notifications</h2>`)
 	if len(routes) == 0 {
@@ -326,16 +407,17 @@ func renderNotificationRoutesSection(slug string, routes []journal.NotificationR
 	} else {
 		b.WriteString(`<table><thead><tr><th>Channel</th><th>Kind</th><th>Fires on</th><th></th></tr></thead><tbody>`)
 		for _, r := range routes {
-			fmt.Fprintf(&b, `<tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>
-<form method="POST" action="/workflows/%s/notifications/%s/delete" class="form-inline" data-confirm="Detach %s from this workflow?"><button type="submit" class="btn-link">detach</button></form>
-</td></tr>`,
+			actions := ""
+			if !readOnly {
+				actions = fmt.Sprintf(`<form method="POST" action="/workflows/%s/notifications/%s/delete%s" class="form-inline" data-confirm="Detach %s from this workflow?"><button type="submit" class="btn-link">detach</button></form>`,
+					template.URLQueryEscaper(slug), template.URLQueryEscaper(r.ChannelID), actionQuery, template.HTMLEscapeString(r.ChannelName))
+			}
+			fmt.Fprintf(&b, `<tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>`,
+
 				template.HTMLEscapeString(r.ChannelName),
 				template.HTMLEscapeString(r.ChannelKind),
 				template.HTMLEscapeString(r.OnStatuses),
-				template.URLQueryEscaper(slug),
-				template.URLQueryEscaper(r.ChannelID),
-				// data-confirm is an HTML attribute now, so HTMLEscapeString.
-				template.HTMLEscapeString(r.ChannelName),
+				actions,
 			)
 		}
 		b.WriteString(`</tbody></table>`)
@@ -343,31 +425,57 @@ func renderNotificationRoutesSection(slug string, routes []journal.NotificationR
 
 	// Add form (only when at least one channel exists; otherwise point
 	// the operator at /notifications to create one first).
-	if len(allChannels) == 0 {
+	if readOnly {
+		b.WriteString(`<p class="muted">Notification routing is admin-only.</p>`)
+		return b.String()
+	}
+	if len(allChannels) == 0 && pageIndex == 0 {
 		b.WriteString(`<p class="muted">No channels exist yet. <a href="/notifications">Create a channel</a> first.</p>`)
 		return b.String()
 	}
-	fmt.Fprintf(&b, `<h3>Attach channel</h3>
-<form method="POST" action="/workflows/%s/notifications" class="form">
-  <label>Channel <select name="channel_id" required>`, template.URLQueryEscaper(slug))
-	routed := map[string]bool{}
-	for _, r := range routes {
-		routed[r.ChannelID] = true
-	}
-	for _, c := range allChannels {
-		if routed[c.ID] {
-			continue
+	if len(allChannels) == 0 {
+		b.WriteString(`<p class="muted">No channels on this page.</p>`)
+	} else {
+		fmt.Fprintf(&b, `<h3>Attach channel</h3>
+<form method="POST" action="/workflows/%s/notifications%s" class="form">
+  <label>Channel <select name="channel_id" required>`, template.URLQueryEscaper(slug), actionQuery)
+		routed := map[string]bool{}
+		for _, r := range routes {
+			routed[r.ChannelID] = true
 		}
-		fmt.Fprintf(&b, `<option value="%s">%s (%s)</option>`,
-			template.HTMLEscapeString(c.ID),
-			template.HTMLEscapeString(c.Name),
-			template.HTMLEscapeString(c.Kind),
-		)
-	}
-	b.WriteString(`</select></label>
+		for _, c := range allChannels {
+			if routed[c.ID] {
+				continue
+			}
+			fmt.Fprintf(&b, `<option value="%s">%s (%s)</option>`,
+				template.HTMLEscapeString(c.ID),
+				template.HTMLEscapeString(c.Name),
+				template.HTMLEscapeString(c.Kind),
+			)
+		}
+		b.WriteString(`</select></label>
   <label>Fire on (comma-separated) <input type="text" name="on_statuses" value="failed,failed_dlq" placeholder="failed,failed_dlq[,succeeded]"></label>
   <p class="muted">Defaults to <code>failed,failed_dlq</code>. Add <code>succeeded</code> if you want positive confirmation alerts too.</p>
   <button type="submit" class="btn-primary">Attach</button>
 </form>`)
+	}
+	if pageIndex > 0 || hasMore {
+		b.WriteString(`<nav aria-label="Channel picker pages">`)
+		pageHref := func(page int) string {
+			separator := "?"
+			if actionQuery != "" {
+				separator = "&"
+			}
+			return fmt.Sprintf("/workflows/%s%s%schannel_page=%d", template.URLQueryEscaper(slug), actionQuery, separator, page)
+		}
+		if pageIndex > 0 {
+			fmt.Fprintf(&b, `<a href="%s">Previous</a> `, pageHref(pageIndex-1))
+		}
+		fmt.Fprintf(&b, `<span>Channel page %d</span>`, pageIndex+1)
+		if hasMore {
+			fmt.Fprintf(&b, ` <a href="%s">Next</a>`, pageHref(pageIndex+1))
+		}
+		b.WriteString(`</nav>`)
+	}
 	return b.String()
 }

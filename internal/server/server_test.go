@@ -201,6 +201,119 @@ func TestRunWithTLSServesHTTPS(t *testing.T) {
 	<-done
 }
 
+func TestRunWithTLSRejectsPartialCertificatePair(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tls  TLSConfig
+	}{
+		{name: "certificate only", tls: TLSConfig{CertFile: "/tmp/reactor-cert.pem"}},
+		{name: "key only", tls: TLSConfig{KeyFile: "/tmp/reactor-key.pem"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := (&Server{}).RunWithTLS(context.Background(), "127.0.0.1:0", tc.tls); err == nil || !strings.Contains(err.Error(), "certificate and key") {
+				t.Fatalf("RunWithTLS error = %v, want partial TLS pair refusal", err)
+			}
+		})
+	}
+}
+
+// TestRunWithTLSCancelsInFlightMCPRequests ties the HTTP request lifecycle to
+// the daemon context. MCP wait tools may hold a handler for up to two minutes;
+// a shutdown must cancel that handler before RunWithTLS returns so the daemon
+// cannot close its journal underneath an active request.
+func TestRunWithTLSCancelsInFlightMCPRequests(t *testing.T) {
+	t.Parallel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	listener.Close()
+
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	srv := &Server{
+		Log:       slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
+		Version:   "shutdown-test",
+		BasicAuth: BasicAuthConfig{AllowNoAuth: true},
+		MCPHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(started)
+			<-r.Context().Done()
+			close(finished)
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.RunWithTLS(ctx, addr, TLSConfig{}) }()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	requestDone := make(chan error, 1)
+	go func() {
+		// RunWithTLS owns listener creation, so the first request can race the
+		// listen call. Retry connection failures until the handler proves the
+		// server is ready; otherwise this lifecycle regression test flakes before
+		// it reaches the cancellation assertion.
+		deadline := time.Now().Add(2 * time.Second)
+		var reqErr error
+		for time.Now().Before(deadline) {
+			var resp *http.Response
+			resp, reqErr = client.Post("http://"+addr+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`))
+			if resp != nil {
+				resp.Body.Close()
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		requestDone <- reqErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP handler never started")
+	}
+	cancel()
+
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight MCP handler did not observe daemon cancellation")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunWithTLS returned error after cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunWithTLS did not shut down after cancelling an in-flight MCP request")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP request client did not receive a terminal response")
+	}
+}
+
+func TestHTTPServerBoundsRequestAndResponse(t *testing.T) {
+	t.Parallel()
+	srv := newHTTPServer("127.0.0.1:7777", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if got, want := srv.ReadHeaderTimeout, 10*time.Second; got != want {
+		t.Fatalf("ReadHeaderTimeout = %s, want %s", got, want)
+	}
+	if got, want := srv.ReadTimeout, 60*time.Second; got != want {
+		t.Fatalf("ReadTimeout = %s, want %s", got, want)
+	}
+	if got, want := srv.IdleTimeout, 120*time.Second; got != want {
+		t.Fatalf("IdleTimeout = %s, want %s", got, want)
+	}
+	if got, want := srv.WriteTimeout, 180*time.Second; got != want {
+		t.Fatalf("WriteTimeout = %s, want %s", got, want)
+	}
+}
+
 // newTestServer wires the same components the daemon uses so the
 // integration test exercises the production assembly. Webhook receiver
 // is omitted because that path needs a vault.Store + Dispatcher; the
@@ -261,6 +374,145 @@ func TestHealthzReturnsOK(t *testing.T) {
 	}
 }
 
+func newReadinessTestServer(t *testing.T, withMCP bool) (*httptest.Server, *sql.DB) {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "ready.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := journal.New(db, journal.EngineSQLite)
+	s := &Server{
+		Journal:   j,
+		Registry:  registry.New(filepath.Join(dir, "workflows")),
+		Version:   "ready-test",
+		BasicAuth: BasicAuthConfig{User: "alice", PasswordSHA256: hashPass("secret")},
+	}
+	if withMCP {
+		s.MCPHandler = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	}
+	r := chi.NewRouter()
+	s.Mount(r)
+	srv := httptest.NewServer(r)
+	t.Cleanup(func() {
+		srv.Close()
+		_ = db.Close()
+	})
+	return srv, db
+}
+
+func TestReadyzReturnsOKWhenDurableDependenciesAreAvailable(t *testing.T) {
+	t.Parallel()
+	srv, _ := newReadinessTestServer(t, true)
+	resp, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		OK      bool              `json:"ok"`
+		Version string            `json:"version"`
+		Checks  map[string]string `json:"checks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.OK || body.Version != "ready-test" {
+		t.Fatalf("unexpected readiness body: %+v", body)
+	}
+	for _, key := range []string{"database", "artifact_store", "mcp_http", "runtime"} {
+		if body.Checks[key] != "ok" {
+			t.Fatalf("check %s = %q, want ok; body = %+v", key, body.Checks[key], body)
+		}
+	}
+}
+
+func TestReadyzFailsWhenRuntimeComponentIsUnavailable(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "ready-runtime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := journal.New(db, journal.EngineSQLite)
+	s := &Server{
+		Journal:      j,
+		Registry:     registry.New(filepath.Join(dir, "workflows")),
+		MCPHandler:   http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+		RuntimeReady: func() bool { return false },
+		Version:      "ready-runtime-test",
+	}
+	r := chi.NewRouter()
+	s.Mount(r)
+	t.Cleanup(func() { _ = db.Close() })
+	recorder := httptest.NewRecorder()
+	r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	var body struct {
+		OK     bool              `json:"ok"`
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.OK || body.Checks["runtime"] != "unavailable" {
+		t.Fatalf("runtime failure was not reported safely: %+v", body)
+	}
+}
+
+func TestReadyzFailsWhenDatabaseIsUnavailable(t *testing.T) {
+	t.Parallel()
+	srv, db := newReadinessTestServer(t, true)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var body struct {
+		OK     bool              `json:"ok"`
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.OK || body.Checks["database"] != "unavailable" {
+		t.Fatalf("database failure was not reported safely: %+v", body)
+	}
+}
+
+func TestReadyzFailsClosedWithoutHTTPMCP(t *testing.T) {
+	t.Parallel()
+	srv, _ := newReadinessTestServer(t, false)
+	resp, err := http.Get(srv.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	var body struct {
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Checks["mcp_http"] != "missing" {
+		t.Fatalf("missing MCP was not reported: %+v", body)
+	}
+}
+
 func TestHomePageRedirectsToOnboardingOnFirstBoot(t *testing.T) {
 	t.Parallel()
 	srv, _, _ := newTestServer(t)
@@ -290,6 +542,19 @@ func TestOnboardingPageRendersFiveSteps(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("missing %q in onboarding body", want)
 		}
+	}
+}
+
+func TestOnboardingMCPRecipeRequiresBearerBeforeRemoteInstall(t *testing.T) {
+	t.Parallel()
+	body := onboardingBody(false, false, false)
+	token := strings.Index(body, "export REACTOR_MCP_TOKEN")
+	install := strings.Index(body, "reactor mcp install --client claude-code --token-env REACTOR_MCP_TOKEN")
+	if token < 0 || install < 0 || token > install {
+		t.Fatalf("onboarding must establish the bearer environment before printing the remote install recipe")
+	}
+	if !strings.Contains(body, "installer refuses to print an unauthenticated remote registration") {
+		t.Fatal("onboarding does not explain the remote bearer guard")
 	}
 }
 

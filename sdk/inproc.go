@@ -32,6 +32,7 @@ type InProcFlow struct {
 type StepRecord struct {
 	Name           string
 	IdempotencyKey string
+	InputHash      string
 	StartedAt      time.Time
 	FinishedAt     time.Time
 	Output         any
@@ -73,14 +74,14 @@ func (f *InProcFlow) Steps() []StepRecord {
 func (f *InProcFlow) Logger() *slog.Logger { return f.log }
 
 // Step runs fn with retry semantics applied. Idempotency replay is implemented
-// via the (run, name, key) cache: the first successful (or permanent-failure)
-// result for a (name, key) pair is returned on subsequent calls. The host
-// runtime in week 3 owns this cache durably; here it lives in the Flow.
+// via the (run, name, key, input-hash) cache: the first successful (or
+// permanent-failure) result for an exact identity is returned on subsequent
+// calls. The host runtime owns this cache durably; here it lives in the Flow.
 func (f *InProcFlow) Step(ctx context.Context, name string, opts StepOpts, fn func(context.Context) (any, error)) (any, error) {
 	if name == "" {
 		return nil, errors.New("reactor: step name required")
 	}
-	if cached, ok := f.cachedOutput(name, opts.IdempotencyKey); ok {
+	if cached, ok := f.cachedOutput(name, opts.IdempotencyKey, opts.InputHash); ok {
 		return cached, nil
 	}
 
@@ -90,6 +91,7 @@ func (f *InProcFlow) Step(ctx context.Context, name string, opts StepOpts, fn fu
 	rec := StepRecord{
 		Name:           name,
 		IdempotencyKey: opts.IdempotencyKey,
+		InputHash:      opts.InputHash,
 		StartedAt:      f.now(),
 	}
 
@@ -117,6 +119,10 @@ func (f *InProcFlow) Step(ctx context.Context, name string, opts StepOpts, fn fu
 			break
 		}
 		delay, retry := policy.NextDelay(attempt)
+		if !retry {
+			break
+		}
+		delay, retry = RespectRetryAfter(lastErr, delay)
 		if !retry {
 			break
 		}
@@ -218,16 +224,17 @@ func (f *InProcFlow) SendSignal(name string, data []byte) {
 	}
 }
 
-// cachedOutput returns a previously recorded successful output for the
-// (name, idempotency-key) pair, if any. Empty key disables caching.
-func (f *InProcFlow) cachedOutput(name, key string) (any, bool) {
+// cachedOutput returns a previously recorded successful output for the exact
+// (name, idempotency-key, input-hash) identity, if any. Empty key disables
+// caching; an empty input hash remains a valid legacy identity.
+func (f *InProcFlow) cachedOutput(name, key, inputHash string) (any, bool) {
 	if key == "" {
 		return nil, false
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, r := range f.steps {
-		if r.Name == name && r.IdempotencyKey == key && r.Err == nil {
+		if r.Name == name && r.IdempotencyKey == key && r.InputHash == inputHash && r.Err == nil {
 			return r.Output, true
 		}
 	}

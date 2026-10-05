@@ -194,11 +194,17 @@ func TestCredentialDetailWarnsBeforeDestructiveRotate(t *testing.T) {
 	if !strings.Contains(destructive, "cannot be recovered") {
 		t.Fatal("the confirmation should name the consequence, not just ask 'are you sure'")
 	}
+	if !strings.Contains(destructive, `name="allow_local_mint"`) || !strings.Contains(destructive, "required") {
+		t.Fatal("a value-replacing rotation must require a server-visible acknowledgement")
+	}
 
 	safe := credentialDetailBody(c, nil, nil, "",
 		rotateView{hint: "rolls the credential at its source", mintsLocally: false})
 	if strings.Contains(safe, "data-confirm=\"Provider") {
 		t.Fatal("a roll-at-source rotation should not nag; confirmations lose meaning if everything has one")
+	}
+	if strings.Contains(safe, `name="allow_local_mint"`) {
+		t.Fatal("roll-at-source rotation should not show a local-mint acknowledgement")
 	}
 }
 

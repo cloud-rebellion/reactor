@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -116,16 +117,18 @@ func (t Target) Validate() error {
 
 // AuditEntry is a single row from credential_audit.
 type AuditEntry struct {
-	ID           int64           `json:"id"`
-	CredentialID string          `json:"credential_id"`
-	Action       string          `json:"action"`
-	ActorKind    string          `json:"actor_kind"`
-	ActorID      string          `json:"actor_id,omitempty"`
-	WorkflowID   string          `json:"workflow_id,omitempty"`
-	RunID        string          `json:"run_id,omitempty"`
-	StepID       string          `json:"step_id,omitempty"`
-	Detail       json.RawMessage `json:"detail"`
-	At           time.Time       `json:"at"`
+	ID              int64           `json:"id"`
+	CredentialID    string          `json:"credential_id"`
+	Action          string          `json:"action"`
+	ActorKind       string          `json:"actor_kind"`
+	ActorID         string          `json:"actor_id,omitempty"`
+	WorkflowID      string          `json:"workflow_id,omitempty"`
+	RunID           string          `json:"run_id,omitempty"`
+	StepID          string          `json:"step_id,omitempty"`
+	Detail          json.RawMessage `json:"detail"`
+	At              time.Time       `json:"at"`
+	DetailBytes     int             `json:"-"`
+	DetailTruncated bool            `json:"-"`
 }
 
 // CreateParams captures the rotation-aware fields the test seed + admin
@@ -140,10 +143,15 @@ type CreateParams struct {
 	// matter what the caller intended. Combined with CreateWorkflow omitting the
 	// column, both sides of the cross-tenant grant guard were permanently equal,
 	// which made that guard vacuous: it could never fire.
-	TenantID             string
-	Service              string
-	Provider             string
-	ProviderMeta         map[string]string
+	TenantID     string
+	Service      string
+	Provider     string
+	ProviderMeta map[string]string
+	// AllowLocalMint records an explicit operator acknowledgement that a
+	// provider which mints values inside Reactor may replace the stored value.
+	// It is persisted in provider_meta so scheduled rotations cannot silently
+	// perform a destructive local mint after the create request is gone.
+	AllowLocalMint       bool
 	AutoRotate           bool
 	RotationIntervalDays int
 	RotationTargets      []Target
@@ -152,6 +160,19 @@ type CreateParams struct {
 // DefaultTenant is the tenant a resource lands in when no tenant is specified.
 // It matches the schema default, so existing rows and new unscoped writes agree.
 const DefaultTenant = "default"
+
+// LocalMintAcknowledgementKey is an internal provider_meta marker. It is
+// deliberately namespaced so provider-specific metadata cannot accidentally
+// satisfy the rotation safety gate.
+const LocalMintAcknowledgementKey = "_reactor_allow_local_mint"
+
+// LocalMintAcknowledged reports whether an operator explicitly approved a
+// provider that generates replacement values locally. Callers must still
+// verify that the selected provider actually has this capability; this helper
+// only answers the acknowledgement half of that policy.
+func LocalMintAcknowledged(meta map[string]string) bool {
+	return strings.EqualFold(strings.TrimSpace(meta[LocalMintAcknowledgementKey]), "true")
+}
 
 // Create inserts a credentials row with rotation metadata. The
 // encrypted blob lives in vault.Store; we persist a sentinel here so
@@ -168,7 +189,14 @@ func (r *Repo) Create(ctx context.Context, p CreateParams) error {
 	if p.TenantID == "" {
 		p.TenantID = DefaultTenant
 	}
-	meta := encodeJSON(p.ProviderMeta)
+	providerMeta := make(map[string]string, len(p.ProviderMeta)+1)
+	for k, v := range p.ProviderMeta {
+		providerMeta[k] = v
+	}
+	if p.AllowLocalMint {
+		providerMeta[LocalMintAcknowledgementKey] = "true"
+	}
+	meta := encodeJSON(providerMeta)
 	targets := encodeJSON(p.RotationTargets)
 	const q = `INSERT INTO credentials
 		(id, tenant_id, name, service, blob, metadata,
@@ -202,6 +230,30 @@ func (r *Repo) Get(ctx context.Context, id string) (Credential, error) {
 	return c, nil
 }
 
+// GetMetadataByTenant returns only the small identity/provider projection
+// needed by control-plane ownership and compatibility checks. It deliberately
+// does not select provider_meta, rotation_targets, or rotation errors: those
+// fields can contain provider URLs, vault references, operator notes, and
+// arbitrarily large legacy values. The tenant predicate is part of the SQL
+// lookup so a cross-tenant id is indistinguishable from a missing credential
+// to MCP callers and the oversized columns never cross this read boundary.
+func (r *Repo) GetMetadataByTenant(ctx context.Context, id, tenantID string) (Credential, error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(tenantID) == "" {
+		return Credential{}, ErrNotFound
+	}
+	const q = `SELECT id, tenant_id, name, service, provider
+		FROM credentials WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`
+	var c Credential
+	if err := r.db.QueryRowContext(ctx, r.bind(q), id, tenantID).
+		Scan(&c.ID, &c.TenantID, &c.Name, &c.Service, &c.Provider); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Credential{}, ErrNotFound
+		}
+		return Credential{}, fmt.Errorf("credentials: get metadata by tenant: %w", err)
+	}
+	return c, nil
+}
+
 // List returns every non-deleted credential, name-sorted for stable CLI output.
 func (r *Repo) List(ctx context.Context) ([]Credential, error) {
 	const q = `SELECT id, tenant_id, name, service, provider, provider_meta,
@@ -222,6 +274,166 @@ func (r *Repo) List(ctx context.Context) ([]Credential, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// ListByTenant returns live credential metadata for one tenant. An explicit
+// tenant predicate keeps callers such as MCP from turning a metadata list into
+// a cross-tenant inventory.
+func (r *Repo) ListByTenant(ctx context.Context, tenantID string) ([]Credential, error) {
+	if tenantID == "" {
+		return nil, errors.New("credentials: tenant required")
+	}
+	const q = `SELECT id, tenant_id, name, service, provider, provider_meta,
+		rotation_policy, auto_rotate, rotation_interval_days,
+		last_rotated_at, last_rotation_error, rotation_targets, created_at, updated_at
+		FROM credentials WHERE deleted_at IS NULL AND tenant_id = $1 ORDER BY name ASC`
+	rows, err := r.db.QueryContext(ctx, r.bind(q), tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("credentials: list tenant: %w", err)
+	}
+	defer rows.Close()
+	var out []Credential
+	for rows.Next() {
+		c, err := r.scanCredential(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListByTenantPage returns one bounded tenant-scoped metadata page and a
+// lookahead flag. Rotation targets remain available to internal callers but
+// are redacted by MCP before crossing the control-plane boundary.
+func (r *Repo) ListByTenantPage(ctx context.Context, tenantID string, limit, offset int) ([]Credential, bool, error) {
+	if tenantID == "" {
+		return nil, false, errors.New("credentials: tenant required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		return nil, false, errors.New("credentials: negative offset")
+	}
+	q := fmt.Sprintf(`SELECT id, tenant_id, name, service, provider, provider_meta,
+		rotation_policy, auto_rotate, rotation_interval_days,
+		last_rotated_at, last_rotation_error, rotation_targets, created_at, updated_at
+		FROM credentials WHERE deleted_at IS NULL AND tenant_id = $1 ORDER BY name ASC LIMIT %d OFFSET %d`, limit+1, offset)
+	rows, err := r.db.QueryContext(ctx, r.bind(q), tenantID)
+	if err != nil {
+		return nil, false, fmt.Errorf("credentials: list tenant page: %w", err)
+	}
+	defer rows.Close()
+	var out []Credential
+	for rows.Next() {
+		c, err := r.scanCredential(rows.Scan)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// ListMetadataByTenantPage returns the projection needed by control-plane
+// inventories without selecting provider_meta or rotation_targets. Those JSON
+// columns can contain provider URLs, vault references, and operator notes; MCP
+// redacts them from its response, so loading them first would still create a
+// needless secret-bearing allocation. The rotation error is clipped to a
+// short prefix because MCP only needs its stable error code.
+func (r *Repo) ListMetadataByTenantPage(ctx context.Context, tenantID string, limit, offset int) ([]Credential, bool, error) {
+	if tenantID == "" {
+		return nil, false, errors.New("credentials: tenant required")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		return nil, false, errors.New("credentials: negative offset")
+	}
+	errorExpr := "substr(last_rotation_error, 1, 512)"
+	if r.engine != EngineSQLite {
+		errorExpr = "left(last_rotation_error, 512)"
+	}
+	q := fmt.Sprintf(`SELECT id, tenant_id, name, service, provider,
+		rotation_policy, auto_rotate, rotation_interval_days,
+		last_rotated_at, %s, created_at, updated_at
+		FROM credentials WHERE deleted_at IS NULL AND tenant_id = $1 ORDER BY name ASC LIMIT %d OFFSET %d`, errorExpr, limit+1, offset)
+	rows, err := r.db.QueryContext(ctx, r.bind(q), tenantID)
+	if err != nil {
+		return nil, false, fmt.Errorf("credentials: list metadata tenant page: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Credential, 0, limit)
+	for rows.Next() {
+		c, err := r.scanCredentialMetadata(rows.Scan)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
+// ListMetadataPage returns one bounded estate-wide metadata page. It is for
+// control-plane projections such as the graph builder, where a tenant is not
+// known up front. Provider metadata and rotation targets are deliberately
+// omitted: those columns may contain vault references, URLs, operator notes,
+// or other secret-adjacent values that a topology rebuild does not need.
+// Rotation errors are clipped to the same bounded diagnostic projection used
+// by ListMetadataByTenantPage.
+func (r *Repo) ListMetadataPage(ctx context.Context, limit, offset int) ([]Credential, bool, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		return nil, false, errors.New("credentials: negative offset")
+	}
+	errorExpr := "substr(last_rotation_error, 1, 512)"
+	if r.engine != EngineSQLite {
+		errorExpr = "left(last_rotation_error, 512)"
+	}
+	q := fmt.Sprintf(`SELECT id, tenant_id, name, service, provider,
+		rotation_policy, auto_rotate, rotation_interval_days,
+		last_rotated_at, %s, created_at, updated_at
+		FROM credentials WHERE deleted_at IS NULL
+		ORDER BY tenant_id ASC, name ASC, id ASC LIMIT %d OFFSET %d`, errorExpr, limit+1, offset)
+	rows, err := r.db.QueryContext(ctx, r.bind(q))
+	if err != nil {
+		return nil, false, fmt.Errorf("credentials: list metadata page: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Credential, 0, limit)
+	for rows.Next() {
+		c, err := r.scanCredentialMetadata(rows.Scan)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }
 
 // ListNeedingRotation returns credentials whose auto_rotate is true and
@@ -400,9 +612,22 @@ func (r *Repo) ListAudit(ctx context.Context, credentialID string, limit int) ([
 	if limit <= 0 {
 		limit = 50
 	}
+	return r.ListAuditPage(ctx, credentialID, limit, 0)
+}
+
+// ListAuditPage returns a bounded newest-first page for a credential. The MCP
+// surface requests one lookahead row so it can expose continuation without a
+// count query.
+func (r *Repo) ListAuditPage(ctx context.Context, credentialID string, limit, offset int) ([]AuditEntry, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		return nil, errors.New("credentials: audit offset must be non-negative")
+	}
 	const q = `SELECT id, credential_id, action, actor_kind, actor_id, workflow_id, run_id, step_id, detail, at
-		FROM credential_audit WHERE credential_id = $1 ORDER BY at DESC, id DESC LIMIT $2`
-	rows, err := r.db.QueryContext(ctx, r.bind(q), credentialID, limit)
+		FROM credential_audit WHERE credential_id = $1 ORDER BY at DESC, id DESC LIMIT $2 OFFSET $3`
+	rows, err := r.db.QueryContext(ctx, r.bind(q), credentialID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("credentials: audit list: %w", err)
 	}
@@ -441,6 +666,79 @@ func (r *Repo) ListAudit(ctx context.Context, credentialID string, limit int) ([
 	return out, rows.Err()
 }
 
+// ListAuditPageBounded is the control-plane projection of the audit log. The
+// detail JSON can contain provider URLs, response bodies, or imported legacy
+// blobs, so the database returns only a bounded prefix while reporting the
+// durable byte count. This keeps an oversized row out of the MCP process even
+// when the caller only needs a redacted status view.
+func (r *Repo) ListAuditPageBounded(ctx context.Context, credentialID string, limit, offset, maxDetailBytes int) ([]AuditEntry, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		return nil, errors.New("credentials: audit page limit exceeds 1000")
+	}
+	if offset < 0 {
+		return nil, errors.New("credentials: audit offset must be non-negative")
+	}
+	if maxDetailBytes <= 0 || maxDetailBytes > 16<<20 {
+		return nil, errors.New("credentials: audit detail bound must be between 1 byte and 16 MiB")
+	}
+	var sizeExpr, valueExpr string
+	if r.engine == EnginePostgres {
+		sizeExpr = "octet_length(detail::text)"
+		valueExpr = fmt.Sprintf("CASE WHEN %s <= %d THEN detail::text ELSE left(detail::text, %d) END", sizeExpr, maxDetailBytes, maxDetailBytes)
+	} else {
+		sizeExpr = "length(CAST(detail AS BLOB))"
+		valueExpr = fmt.Sprintf("CASE WHEN %s <= %d THEN detail ELSE substr(detail, 1, %d) END", sizeExpr, maxDetailBytes, maxDetailBytes)
+	}
+	q := fmt.Sprintf(`SELECT id, credential_id, action, actor_kind, actor_id, workflow_id, run_id, step_id,
+		%s, %s, at FROM credential_audit
+		WHERE credential_id = $1 ORDER BY at DESC, id DESC LIMIT %d OFFSET %d`, valueExpr, sizeExpr, limit, offset)
+	rows, err := r.db.QueryContext(ctx, r.bind(q), credentialID)
+	if err != nil {
+		return nil, fmt.Errorf("credentials: bounded audit list: %w", err)
+	}
+	defer rows.Close()
+	out := make([]AuditEntry, 0, limit)
+	for rows.Next() {
+		var (
+			e           AuditEntry
+			actorID     sql.NullString
+			workflowID  sql.NullString
+			runID       sql.NullString
+			stepID      sql.NullString
+			detail      []byte
+			detailBytes sql.NullInt64
+			at          sql.NullString
+		)
+		if err := rows.Scan(&e.ID, &e.CredentialID, &e.Action, &e.ActorKind,
+			&actorID, &workflowID, &runID, &stepID, &detail, &detailBytes, &at); err != nil {
+			return nil, fmt.Errorf("credentials: bounded audit scan: %w", err)
+		}
+		e.ActorID = nullableString(actorID)
+		e.WorkflowID = nullableString(workflowID)
+		e.RunID = nullableString(runID)
+		e.StepID = nullableString(stepID)
+		if len(detail) > 0 {
+			e.Detail = append(json.RawMessage(nil), detail...)
+		} else {
+			e.Detail = json.RawMessage("{}")
+		}
+		if detailBytes.Valid && detailBytes.Int64 >= 0 {
+			e.DetailBytes = int(detailBytes.Int64)
+			e.DetailTruncated = e.DetailBytes > len(detail)
+		}
+		if at.Valid {
+			if t, err := r.parseTime(at.String); err == nil {
+				e.At = t
+			}
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // scanCredential is shared by Get / List / ListNeedingRotation.
 func (r *Repo) scanCredential(scan func(...any) error) (Credential, error) {
 	var (
@@ -467,6 +765,45 @@ func (r *Repo) scanCredential(scan func(...any) error) (Credential, error) {
 	c.LastRotationError = nullableString(lastErr)
 	c.ProviderMeta = decodeStringMap(providerMeta)
 	c.RotationTargets = decodeTargets(targets)
+	if lastRotated.Valid {
+		if t, err := r.parseTime(lastRotated.String); err == nil {
+			c.LastRotatedAt = t
+		}
+	}
+	if createdAt.Valid {
+		if t, err := r.parseTime(createdAt.String); err == nil {
+			c.CreatedAt = t
+		}
+	}
+	if updatedAt.Valid {
+		if t, err := r.parseTime(updatedAt.String); err == nil {
+			c.UpdatedAt = t
+		}
+	}
+	return c, nil
+}
+
+func (r *Repo) scanCredentialMetadata(scan func(...any) error) (Credential, error) {
+	var (
+		c            Credential
+		tenantID     sql.NullString
+		policy       sql.NullString
+		autoRotate   any
+		intervalDays sql.NullInt64
+		lastRotated  sql.NullString
+		lastErr      sql.NullString
+		createdAt    sql.NullString
+		updatedAt    sql.NullString
+	)
+	if err := scan(&c.ID, &tenantID, &c.Name, &c.Service, &c.Provider,
+		&policy, &autoRotate, &intervalDays, &lastRotated, &lastErr, &createdAt, &updatedAt); err != nil {
+		return Credential{}, err
+	}
+	c.TenantID = nullableString(tenantID)
+	c.RotationPolicy = nullableString(policy)
+	c.AutoRotate = parseBool(autoRotate)
+	c.RotationIntervalDays = int(intervalDays.Int64)
+	c.LastRotationError = nullableString(lastErr)
 	if lastRotated.Valid {
 		if t, err := r.parseTime(lastRotated.String); err == nil {
 			c.LastRotatedAt = t

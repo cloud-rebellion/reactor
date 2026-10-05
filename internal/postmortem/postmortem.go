@@ -17,6 +17,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/bright-interaction/reactor/internal/codegen"
 	"github.com/bright-interaction/reactor/internal/knowledge"
@@ -49,6 +51,22 @@ var ErrAnthropicMissing = errors.New("postmortem: anthropic client not configure
 // new knowledge entry under topic "post-mortems". Returns the entry id
 // on success.
 func (g *Generator) Generate(ctx context.Context, runID string) (string, error) {
+	return g.generate(ctx, runID, "")
+}
+
+// GenerateForTenant is the tenant-scoped MCP entry point. The caller may have
+// already performed an authorization check, but the journal predicates below
+// repeat it in the same read path so a post-mortem cannot race a lookup and
+// send another tenant's run diagnostics to an external model.
+func (g *Generator) GenerateForTenant(ctx context.Context, runID, tenantID string) (string, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return "", errors.New("postmortem: tenant is required")
+	}
+	return g.generate(ctx, runID, tenantID)
+}
+
+func (g *Generator) generate(ctx context.Context, runID, tenantID string) (string, error) {
 	if g.Anthropic == nil {
 		return "", ErrAnthropicMissing
 	}
@@ -62,11 +80,25 @@ func (g *Generator) Generate(ctx context.Context, runID string) (string, error) 
 		g.Now = time.Now
 	}
 
-	run, err := g.Journal.GetRun(ctx, runID)
+	var run journal.RunInfo
+	var err error
+	if tenantID == "" {
+		run, err = g.Journal.GetRun(ctx, runID)
+	} else {
+		run, err = g.Journal.GetRunForTenant(ctx, runID, tenantID)
+	}
 	if err != nil {
 		return "", fmt.Errorf("postmortem: get run: %w", err)
 	}
-	steps, err := g.Journal.ListSteps(ctx, runID)
+	var steps []journal.StepRow
+	if tenantID == "" {
+		steps, err = g.Journal.ListSteps(ctx, runID)
+	} else {
+		// A tenant can create arbitrarily many step attempts. Keep the external
+		// request bounded while preserving the chronological prefix needed for a
+		// useful failure lesson.
+		steps, err = g.Journal.ListStepsPageForTenant(ctx, runID, tenantID, 256, 0)
+	}
 	if err != nil {
 		return "", fmt.Errorf("postmortem: list steps: %w", err)
 	}
@@ -108,6 +140,13 @@ func (g *Generator) Generate(ctx context.Context, runID string) (string, error) 
 	}
 
 	body := renderBody(pm, run, slug)
+	entryTenant := run.TenantID
+	if tenantID != "" {
+		// Legacy rows may have an empty tenant column. A tenant-scoped request
+		// must still stamp the generated knowledge entry to the caller's scope;
+		// otherwise this run's workflow and failure lesson becomes global.
+		entryTenant = tenantID
+	}
 	entry, err := g.Knowledge.Add(ctx, knowledge.Entry{
 		Frontmatter: knowledge.Frontmatter{
 			Topic: "post-mortems",
@@ -115,7 +154,7 @@ func (g *Generator) Generate(ctx context.Context, runID string) (string, error) 
 			// slug and may describe its step metadata, so an
 			// unstamped post-mortem is readable by every tenant on /knowledge.
 			// Empty stays global, which is right for a single-tenant install.
-			Tenant:    run.TenantID,
+			Tenant:    entryTenant,
 			Title:     pm.Title,
 			CreatedBy: "claude",
 			Sources:   []string{"run:" + runID, "workflow:" + slug},
@@ -155,11 +194,11 @@ var postmortemTool = codegen.Tool{
 		"required": ["title", "summary", "root_cause", "lesson", "recommendation"],
 		"properties": {
 			"title":          {"type": "string", "maxLength": 100},
-			"summary":        {"type": "string"},
-			"root_cause":     {"type": "string"},
-			"lesson":         {"type": "string"},
-			"recommendation": {"type": "string"},
-			"tags":           {"type": "array", "items": {"type": "string"}}
+			"summary":        {"type": "string", "maxLength": 16384},
+			"root_cause":     {"type": "string", "maxLength": 16384},
+			"lesson":         {"type": "string", "maxLength": 16384},
+			"recommendation": {"type": "string", "maxLength": 16384},
+			"tags":           {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 128}}
 		}
 	}`),
 }
@@ -171,6 +210,9 @@ func extractPostmortem(resp *codegen.MessagesResponse) (Postmortem, error) {
 			if err := json.Unmarshal(c.Input, &pm); err != nil {
 				return Postmortem{}, fmt.Errorf("postmortem: parse tool_use: %w", err)
 			}
+			if err := validatePostmortem(pm); err != nil {
+				return Postmortem{}, err
+			}
 			if pm.Title == "" || pm.Lesson == "" {
 				return Postmortem{}, errors.New("postmortem: model returned empty title or lesson")
 			}
@@ -178,6 +220,41 @@ func extractPostmortem(resp *codegen.MessagesResponse) (Postmortem, error) {
 		}
 	}
 	return Postmortem{}, errors.New("postmortem: no tool_use block in response")
+}
+
+// validatePostmortem is the hard boundary after model tool use. JSON Schema is
+// advisory at the API edge, and a fake/provider response can still contain
+// controls, huge strings, or an unbounded tag list. The corpus redactor is a
+// separate PII control; these checks keep the durable entry and every future
+// prompt assembly bounded and structurally safe.
+func validatePostmortem(pm Postmortem) error {
+	limits := map[string]string{
+		"title": pm.Title, "summary": pm.Summary, "root_cause": pm.RootCause,
+		"lesson": pm.Lesson, "recommendation": pm.Recommendation,
+	}
+	for field, value := range limits {
+		if len(value) > 16<<10 {
+			if field == "title" && len(value) <= 100 {
+				continue
+			}
+			return fmt.Errorf("postmortem: %s exceeds 16384 bytes", field)
+		}
+		if !utf8.ValidString(value) || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return fmt.Errorf("postmortem: %s contains invalid/control text", field)
+		}
+	}
+	if len(pm.Title) > 100 {
+		return errors.New("postmortem: title exceeds 100 characters")
+	}
+	if len(pm.Tags) > 16 {
+		return errors.New("postmortem: at most 16 tags are allowed")
+	}
+	for _, tag := range pm.Tags {
+		if len(tag) == 0 || len(tag) > 128 || !utf8.ValidString(tag) || strings.IndexFunc(tag, unicode.IsControl) >= 0 {
+			return errors.New("postmortem: invalid tag")
+		}
+	}
+	return nil
 }
 
 // buildPrompt constructs the user message Claude sees. Includes the
@@ -191,10 +268,10 @@ func buildPrompt(run journal.RunInfo, steps []journal.StepRow, slug string) stri
 	b.WriteString("Your job: write a post-mortem in the structured shape so the lesson lands in the Reactor knowledge corpus and benefits every future generated workflow.\n\n")
 
 	b.WriteString("## Run\n\n")
-	fmt.Fprintf(&b, "- workflow: %s\n", sanitizer.scrub(slug))
-	fmt.Fprintf(&b, "- run_id: %s\n", sanitizer.scrub(run.ID))
-	fmt.Fprintf(&b, "- trigger_kind: %s\n", sanitizer.scrub(run.TriggerKind))
-	fmt.Fprintf(&b, "- status: %s\n", sanitizer.scrub(run.Status))
+	fmt.Fprintf(&b, "- workflow: %s\n", sanitizer.promptField(slug))
+	fmt.Fprintf(&b, "- run_id: %s\n", sanitizer.promptField(run.ID))
+	fmt.Fprintf(&b, "- trigger_kind: %s\n", sanitizer.promptField(run.TriggerKind))
+	fmt.Fprintf(&b, "- status: %s\n", sanitizer.promptField(run.Status))
 	if !run.StartedAt.IsZero() {
 		fmt.Fprintf(&b, "- started_at: %s\n", run.StartedAt.UTC().Format(time.RFC3339))
 	}
@@ -206,7 +283,7 @@ func buildPrompt(run journal.RunInfo, steps []journal.StepRow, slug string) stri
 		b.WriteString("(no steps recorded; the workflow likely failed before its first Step)\n")
 	}
 	for _, s := range steps {
-		fmt.Fprintf(&b, "- step %s attempt=%d status=%s", sanitizer.scrub(s.StepName), s.Attempt, sanitizer.scrub(s.Status))
+		fmt.Fprintf(&b, "- step %s attempt=%d status=%s", sanitizer.promptField(s.StepName), s.Attempt, sanitizer.promptField(s.Status))
 		if s.ErrorText != "" {
 			// Never place raw or transformed error text on the external request.
 			// Provider errors may contain arbitrary customer/document metadata

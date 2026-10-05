@@ -32,6 +32,7 @@ func TestGraphJSONIsAdminGated(t *testing.T) {
 		Journal:     &journal.Journal{},
 		Credentials: &credentials.Repo{},
 		Graph:       &graph.Graph{},
+		MCPHandler:  http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	r := chi.NewRouter()
@@ -53,6 +54,10 @@ func TestGraphJSONIsAdminGated(t *testing.T) {
 	if !ok {
 		t.Fatal("/audit is not registered; it is the admin-gated reference route")
 	}
+	mcpDepth, ok := depth["POST /mcp"]
+	if !ok {
+		t.Fatal("/mcp is not registered; wire MCPHandler in this test")
+	}
 	memberDepth, ok := depth["GET /runs"]
 	if !ok {
 		t.Fatal("/runs is not registered; it is the member reference route")
@@ -62,6 +67,9 @@ func TestGraphJSONIsAdminGated(t *testing.T) {
 	}
 	if graphDepth <= memberDepth {
 		t.Fatalf("/graph.json depth %d must exceed member-route depth %d", graphDepth, memberDepth)
+	}
+	if mcpDepth != adminDepth {
+		t.Fatalf("/mcp middleware depth = %d, want %d (same as admin-gated /audit)", mcpDepth, adminDepth)
 	}
 }
 

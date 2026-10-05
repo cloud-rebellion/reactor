@@ -22,7 +22,7 @@ func renderAnalyticsStrip(a journal.Analytics) string {
 	b.WriteString(`<section class="analytics">`)
 	b.WriteString(renderTiles(a))
 	b.WriteString(renderDailyChart(a.DailyRuns))
-	b.WriteString(renderPerWorkflowTable(a.PerWorkflow))
+	b.WriteString(renderPerWorkflowTable(a.PerWorkflow, a.PerWorkflowHasMore))
 	b.WriteString(`</section>`)
 	b.WriteString(analyticsCSS)
 	return b.String()
@@ -33,13 +33,14 @@ func renderTiles(a journal.Analytics) string {
 	succeeded := a.RunsByStatus[journal.StatusSucceeded]
 	failed := a.RunsByStatus["failed"] + a.RunsByStatus["failed_dlq"]
 	successRate := 0.0
-	if a.TotalRuns > 0 {
-		successRate = float64(succeeded) / float64(a.TotalRuns) * 100
+	completed := succeeded + failed
+	if completed > 0 {
+		successRate = float64(succeeded) / float64(completed) * 100
 	}
 	var b strings.Builder
 	b.WriteString(`<div class="tiles">`)
 	tile(&b, "Total runs", fmt.Sprintf("%d", a.TotalRuns), "")
-	tile(&b, "Succeeded", fmt.Sprintf("%d", succeeded), fmt.Sprintf("%.1f%% success", successRate))
+	tile(&b, "Succeeded", fmt.Sprintf("%d", succeeded), fmt.Sprintf("%.1f%% of completed runs", successRate))
 	tile(&b, "Failed", fmt.Sprintf("%d", failed), "includes DLQ")
 	tile(&b, "Avg duration", formatDuration(a.AvgDurationMs), fmt.Sprintf("p95 %s", formatDuration(a.P95DurationMs)))
 	tile(&b, "Time saved", formatMinutesSaved(a.TotalMinutesSaved), "set per workflow")
@@ -125,7 +126,7 @@ func renderDailyChart(daily []journal.DailyRunCount) string {
 // computed minutes-saved-total. Sorted by total impact descending
 // (see journal.AnalyticsSummary). Caps at 10 rows; the workflow
 // detail page is the drill-down for the rest.
-func renderPerWorkflowTable(rows []journal.WorkflowAnalytics) string {
+func renderPerWorkflowTable(rows []journal.WorkflowAnalytics, hasMore bool) string {
 	if len(rows) == 0 {
 		return ""
 	}
@@ -163,7 +164,7 @@ func renderPerWorkflowTable(rows []journal.WorkflowAnalytics) string {
 		)
 	}
 	b.WriteString(`</tbody></table>`)
-	if len(rows) > limit {
+	if hasMore || len(rows) > limit {
 		fmt.Fprintf(&b, `<p class="muted">Showing top %d by impact. Workflow detail pages have full per-workflow numbers.</p>`, limit)
 	}
 	b.WriteString(`</details>`)

@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,11 +12,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
+	"github.com/bright-interaction/reactor/internal/runtime/wire"
 	"github.com/bright-interaction/reactor/internal/vault"
 	_ "modernc.org/sqlite"
 )
@@ -38,6 +41,11 @@ func buildTestWorkflow(t *testing.T) string {
 const supervisorTestArtifactSHA256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func newTestSupervisorEnv(t *testing.T, runID string) (*Supervisor, *journal.Journal, func()) {
+	sup, j, _, cleanup := newTestSupervisorEnvWithDB(t, runID)
+	return sup, j, cleanup
+}
+
+func newTestSupervisorEnvWithDB(t *testing.T, runID string) (*Supervisor, *journal.Journal, *sql.DB, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
@@ -54,6 +62,16 @@ func newTestSupervisorEnv(t *testing.T, runID string) (*Supervisor, *journal.Jou
 	j := journal.New(db, journal.EngineSQLite)
 	if err := j.CreateWorkflowWithArtifact(context.Background(), "wf_test", "test-replay", "h", "0.1.0", supervisorTestArtifactSHA256, json.RawMessage(`{}`)); err != nil {
 		t.Fatalf("create wf: %v", err)
+	}
+	// The supervisor now enforces credential tenant identity even when the
+	// legacy permissive ACL mode is enabled. Seed the test credential row that
+	// backs the matching in-memory vault entry; without this row the fixture
+	// would intentionally exercise an unknown-credential denial rather than
+	// the durable execution path these tests cover.
+	if _, err := db.ExecContext(context.Background(),
+		`INSERT INTO credentials (id, tenant_id, name, service, blob) VALUES (?,?,?,?,?)`,
+		"never-used", journal.DefaultTenant, "test credential", "test", []byte("fixture")); err != nil {
+		t.Fatalf("seed test credential: %v", err)
 	}
 	if err := j.CreateRunPinned(context.Background(), runID, "wf_test", "manual", json.RawMessage(`{}`), 1, supervisorTestArtifactSHA256); err != nil {
 		t.Fatalf("create run: %v", err)
@@ -94,7 +112,7 @@ func newTestSupervisorEnv(t *testing.T, runID string) (*Supervisor, *journal.Jou
 		// acl_test.go cover the strict default.
 		ACLPermissive: true,
 	}
-	return sup, j, func() { db.Close() }
+	return sup, j, db, func() { db.Close() }
 }
 
 func TestSupervisorStartFailurePersistsTerminal(t *testing.T) {
@@ -107,6 +125,47 @@ func TestSupervisorStartFailurePersistsTerminal(t *testing.T) {
 	}
 	if run, getErr := j.GetRun(context.Background(), "run_start_failure"); getErr != nil || run.Status != "failed" || run.FinishedAt.IsZero() {
 		t.Fatalf("start failure state = %+v, %v", run, getErr)
+	}
+}
+
+func TestSupervisorLocalTerminalWriteFailureParksRecovery(t *testing.T) {
+	binary := buildTestWorkflow(t)
+	sup, j, db, cleanup := newTestSupervisorEnvWithDB(t, "run_local_terminal_write_failure")
+	defer cleanup()
+	sup.BinaryPath = binary
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Make only the terminal transition fail. Step rows still commit, which
+	// models a transient/uncertain final transaction after the workflow has
+	// completed. A local run has no lease expiry to recover it; the supervisor
+	// must park a due recovery schedule while this daemon is still alive.
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_local_terminal
+		BEFORE UPDATE OF status ON runs
+		WHEN OLD.id = 'run_local_terminal_write_failure' AND NEW.status IN ('succeeded', 'failed')
+		BEGIN SELECT RAISE(ABORT, 'forced terminal failure'); END`); err != nil {
+		t.Fatalf("create terminal failure trigger: %v", err)
+	}
+	status, err := sup.Run(ctx)
+	if status != "suspended" || err == nil {
+		t.Fatalf("terminal write failure = status %q err %v; want suspended recovery with original error", status, err)
+	}
+	if run, getErr := j.GetRun(ctx, "run_local_terminal_write_failure"); getErr != nil || run.Status != "suspended" || !run.FinishedAt.IsZero() {
+		t.Fatalf("parked local recovery state = %+v, %v", run, getErr)
+	}
+	due, err := j.FindDueSchedules(ctx, time.Now().Add(time.Minute), 10)
+	if err != nil {
+		t.Fatalf("find parked recovery schedule: %v", err)
+	}
+	var found bool
+	for _, schedule := range due {
+		if schedule.RunID == "run_local_terminal_write_failure" && schedule.Kind == journal.KindRecovery && !schedule.Fired {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("terminal write failure did not create a due local recovery schedule: %+v", due)
 	}
 }
 
@@ -737,6 +796,65 @@ func TestReplayDivergenceDoesNotMutateHistoricalRun(t *testing.T) {
 	afterAttempts, _ := j.AttemptCountSeq(ctx, "run_readonly_divergence", "fetch", 1)
 	if after.Status != before.Status || !after.FinishedAt.Equal(before.FinishedAt) || afterAttempts != beforeAttempts {
 		t.Fatalf("divergent replay mutated history: before=%+v/%d after=%+v/%d", before, beforeAttempts, after, afterAttempts)
+	}
+}
+
+func TestOrdinalReplayRejectsIdentityDrift(t *testing.T) {
+	sup, j, cleanup := newTestSupervisorEnv(t, "run_ordinal_identity")
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := j.RecordStepStartSeq(ctx, sup.RunID, "send", 1, 1, "idem-v1", "hash-v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordStepEndSeq(ctx, sup.RunID, "send", 1, 1, json.RawMessage(`{"sent":true}`), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// A resumed workflow reached the same ordinal and name, but its operation
+	// identity changed. The cached side effect must not be handed back to it.
+	var response bytes.Buffer
+	d := &dispatcher{sup: sup, enc: wire.NewEncoder(&response), writeMu: &sync.Mutex{}}
+	frame, err := wire.Wrap(1, 0, wire.KindStepStart, wire.StepStart{
+		StepName: "send", Seq: 1, Attempt: 1, IdempotencyKey: "idem-v2", InputHash: "hash-v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.handleStepStart(ctx, frame); !errors.Is(err, ErrReplayDivergence) {
+		t.Fatalf("ordinal identity drift error = %v, want ErrReplayDivergence", err)
+	}
+	if response.Len() != 0 {
+		t.Fatalf("identity drift wrote a replay response: %s", response.Bytes())
+	}
+}
+
+func TestOrdinalLiveResumeRejectsNameDriftAfterFailedAttempt(t *testing.T) {
+	sup, j, cleanup := newTestSupervisorEnv(t, "run_ordinal_failed_drift")
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := j.RecordStepStartSeq(ctx, sup.RunID, "charge", 1, 1, "idem-v1", "hash-v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordStepEndSeq(ctx, sup.RunID, "charge", 1, 1, json.RawMessage(`null`), "provider unavailable"); err != nil {
+		t.Fatal(err)
+	}
+
+	// This models a live scheduler/worker resume after the first attempt
+	// failed. There is no successful cache row, so the old check would have
+	// opened a new row for the renamed step and executed it.
+	var response bytes.Buffer
+	d := &dispatcher{sup: sup, enc: wire.NewEncoder(&response), writeMu: &sync.Mutex{}}
+	frame, err := wire.Wrap(1, 0, wire.KindStepStart, wire.StepStart{
+		StepName: "charge-v2", Seq: 1, Attempt: 1, IdempotencyKey: "idem-v2", InputHash: "hash-v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.handleStepStart(ctx, frame); !errors.Is(err, ErrReplayDivergence) {
+		t.Fatalf("failed-attempt name drift error = %v, want ErrReplayDivergence", err)
+	}
+	if response.Len() != 0 {
+		t.Fatalf("failed-attempt name drift wrote a response: %s", response.Bytes())
 	}
 }
 

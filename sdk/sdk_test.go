@@ -161,6 +161,36 @@ func TestStepIdempotencyReplay(t *testing.T) {
 	}
 }
 
+func TestStepInputHashPreventsStaleInProcReplay(t *testing.T) {
+	t.Parallel()
+	f := newTestFlow()
+	var calls int
+	run := func(inputHash, value string) string {
+		out, err := Step(f, context.Background(), "send", StepOpts{
+			IdempotencyKey: "customer-1", InputHash: inputHash,
+		}, func(context.Context) (string, error) {
+			calls++
+			return value, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if got := run("input-v1", "first"); got != "first" {
+		t.Fatalf("first output = %q", got)
+	}
+	if got := run("input-v1", "ignored"); got != "first" {
+		t.Fatalf("same input replay = %q, want first", got)
+	}
+	if got := run("input-v2", "second"); got != "second" {
+		t.Fatalf("changed input output = %q, want second", got)
+	}
+	if calls != 2 {
+		t.Fatalf("closure calls = %d, want 2", calls)
+	}
+}
+
 func TestStepRetryOnTransientError(t *testing.T) {
 	t.Parallel()
 	f := newTestFlow()
@@ -223,6 +253,46 @@ func TestExpBackoffRespectsMax(t *testing.T) {
 	}
 	if _, ok := b.NextDelay(3); ok {
 		t.Fatal("attempt 3 should not retry past Max=3")
+	}
+}
+
+type providerWindowError struct {
+	delay   time.Duration
+	allowed bool
+}
+
+func (e providerWindowError) Error() string { return "provider rate limited" }
+func (e providerWindowError) RetryAfterDelay() (time.Duration, bool) {
+	return e.delay, e.allowed
+}
+
+func TestInProcStepRespectsProviderWindow(t *testing.T) {
+	f := newTestFlow()
+	var sleeps []time.Duration
+	f.SetSleep(func(d time.Duration) { sleeps = append(sleeps, d) })
+	tries := 0
+	_, err := f.Step(context.Background(), "provider-read", StepOpts{
+		RetryPolicy: ExpBackoff{Max: 2, Base: time.Millisecond, Cap: time.Millisecond},
+	}, func(context.Context) (any, error) {
+		tries++
+		if tries == 1 {
+			return nil, providerWindowError{delay: 3 * time.Second, allowed: true}
+		}
+		return "ok", nil
+	})
+	if err != nil || tries != 2 || len(sleeps) != 1 || sleeps[0] != 3*time.Second {
+		t.Fatalf("provider retry: tries=%d sleeps=%v err=%v", tries, sleeps, err)
+	}
+
+	tries = 0
+	_, err = f.Step(context.Background(), "provider-long-window", StepOpts{
+		RetryPolicy: ExpBackoff{Max: 2, Base: time.Millisecond, Cap: time.Millisecond},
+	}, func(context.Context) (any, error) {
+		tries++
+		return nil, providerWindowError{delay: time.Hour, allowed: false}
+	})
+	if err == nil || tries != 1 || len(sleeps) != 1 {
+		t.Fatalf("long provider window: tries=%d sleeps=%v err=%v", tries, sleeps, err)
 	}
 }
 

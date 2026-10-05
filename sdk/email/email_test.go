@@ -4,12 +4,52 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	ahttp "github.com/bright-interaction/reactor/sdk/http"
 )
+
+func TestDryRunBlocksEmailConnectorsBeforeNetwork(t *testing.T) {
+	t.Setenv("REACTOR_MODE", "dry_run")
+	msg := Message{From: "me@example.com", To: []string{"customer@example.com"}, Subject: "Review", Text: "fixture"}
+	if _, err := SendGmail(context.Background(), "token", msg); !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("gmail dry-run error = %v, want ErrDryRun", err)
+	}
+	if err := SendOutlook(context.Background(), "token", msg); !errors.Is(err, ahttp.ErrDryRun) {
+		t.Fatalf("outlook dry-run error = %v, want ErrDryRun", err)
+	}
+}
+
+func TestSendConnectedUsesBoundHostWithoutRawTokenFallback(t *testing.T) {
+	msg := Message{From: "me@example.com", To: []string{"customer@example.com"}, Text: "hello"}
+	if _, err := SendConnected(context.Background(), "oauth:conn_1", msg); !errors.Is(err, ErrMailBrokerUnavailable) {
+		t.Fatalf("unbound mail send = %v", err)
+	}
+	calls := 0
+	restore := BindMailSender(func(_ context.Context, ref string, got Message) (string, error) {
+		calls++
+		if ref != "oauth:conn_1" || got.Text != msg.Text {
+			t.Errorf("mail request = %q %+v", ref, got)
+		}
+		return "msg_1", nil
+	})
+	defer restore()
+	if id, err := SendConnected(context.Background(), "oauth:conn_1", msg); err != nil || id != "msg_1" || calls != 1 {
+		t.Fatalf("connected mail result = %q, %v; calls=%d", id, err, calls)
+	}
+	if _, err := SendConnected(context.Background(), "conn_1", msg); err == nil || calls != 1 {
+		t.Fatalf("invalid ref reached host: %v; calls=%d", err, calls)
+	}
+	t.Setenv("REACTOR_MODE", "dry_run")
+	if _, err := SendConnected(context.Background(), "oauth:conn_1", msg); !errors.Is(err, ahttp.ErrDryRun) || calls != 1 {
+		t.Fatalf("dry-run mail = %v; calls=%d", err, calls)
+	}
+}
 
 func TestRFC822_TextOnly(t *testing.T) {
 	m := Message{From: "me@x.com", To: []string{"a@y.com", "b@y.com"}, Subject: "Hi", Text: "hello"}
@@ -55,6 +95,21 @@ func TestRFC822_RequiresFromToBody(t *testing.T) {
 	} {
 		if _, err := m.rfc822(); err == nil {
 			t.Fatalf("expected error for %+v", m)
+		}
+	}
+}
+
+func TestRFC822RejectsHeaderInjection(t *testing.T) {
+	t.Parallel()
+	cases := []Message{
+		{From: "me@example.com\r\nBcc: attacker@example.com", To: []string{"customer@example.com"}, Text: "body"},
+		{From: "me@example.com", To: []string{"customer@example.com\nBcc: attacker@example.com"}, Text: "body"},
+		{From: "me@example.com", To: []string{"customer@example.com"}, Cc: []string{"copy@example.com\r\nBcc: attacker@example.com"}, Text: "body"},
+		{From: "me@example.com", To: []string{"customer@example.com"}, Subject: "hello\r\nBcc: attacker@example.com", Text: "body"},
+	}
+	for _, msg := range cases {
+		if _, err := msg.rfc822(); err == nil || !strings.Contains(err.Error(), "forbidden header") {
+			t.Fatalf("header injection message returned %v", err)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -15,10 +16,27 @@ import (
 // reads the denormalized tenant + timing off the run and counts its steps.
 // Idempotent via ON CONFLICT so a replay or re-finalize does not double count.
 func (j *Journal) RecordRunUsage(ctx context.Context, runID, status string) error {
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("journal: begin usage record: %w", err)
+	}
+	defer tx.Rollback()
+	// Tenant erasure deletes the run and its usage in one transaction. Lock the
+	// exact run before reading its timing/steps and keep that lock through the
+	// usage INSERT, so a late best-effort meter cannot recreate an orphaned
+	// usage row after erasure commits.
+	if j.engine == EngineSQLite {
+		if _, err := tx.ExecContext(ctx, j.bind(`UPDATE runs SET id = id WHERE id = $1`), runID); err != nil {
+			return fmt.Errorf("journal: lock usage run: %w", err)
+		}
+	}
 	var tenantID, workflowID string
 	var startedAny, finishedAny any
-	row := j.db.QueryRowContext(ctx,
-		j.bind(`SELECT tenant_id, workflow_id, started_at, finished_at FROM runs WHERE id = $1`), runID)
+	q := `SELECT tenant_id, workflow_id, started_at, finished_at FROM runs WHERE id = $1`
+	if j.engine == EnginePostgres {
+		q += ` FOR UPDATE`
+	}
+	row := tx.QueryRowContext(ctx, j.bind(q), runID)
 	if err := row.Scan(&tenantID, &workflowID, &startedAny, &finishedAny); err != nil {
 		return fmt.Errorf("journal: usage read run: %w", err)
 	}
@@ -28,21 +46,24 @@ func (j *Journal) RecordRunUsage(ctx context.Context, runID, status string) erro
 	if !started.IsZero() && !finished.IsZero() && finished.After(started) {
 		secs = finished.Sub(started).Seconds()
 	}
-	steps, activeSecs, err := j.stepStats(ctx, runID)
+	steps, activeSecs, err := j.stepStatsTx(ctx, tx, runID)
 	if err != nil {
 		return err
 	}
-	const q = `INSERT INTO run_usage
+	const usageQ = `INSERT INTO run_usage
 		(run_id, tenant_id, workflow_id, status, run_seconds, active_seconds, step_count, started_at, finished_at, recorded_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (run_id) DO UPDATE SET
 			status = excluded.status, run_seconds = excluded.run_seconds,
 			active_seconds = excluded.active_seconds, step_count = excluded.step_count,
 			finished_at = excluded.finished_at, recorded_at = excluded.recorded_at`
-	if _, err := j.db.ExecContext(ctx, j.bind(q),
+	if _, err := tx.ExecContext(ctx, j.bind(usageQ),
 		runID, tenantID, workflowID, status, secs, activeSecs, steps,
 		j.timeArg(started), j.timeArg(finished), j.now()); err != nil {
 		return fmt.Errorf("journal: record usage: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("journal: commit usage record: %w", err)
 	}
 	return nil
 }
@@ -52,8 +73,8 @@ func (j *Journal) RecordRunUsage(ctx context.Context, runID, status string) erro
 // meter -- it excludes time the run spent suspended (a long Sleep exits the
 // subprocess and opens no step), so a workflow that waits days is not billed
 // for the wait. Summed in Go to stay engine-portable (no EXTRACT/julianday).
-func (j *Journal) stepStats(ctx context.Context, runID string) (count int, activeSeconds float64, err error) {
-	rows, err := j.db.QueryContext(ctx,
+func (j *Journal) stepStatsTx(ctx context.Context, tx *sql.Tx, runID string) (count int, activeSeconds float64, err error) {
+	rows, err := tx.QueryContext(ctx,
 		j.bind(`SELECT started_at, finished_at FROM steps WHERE run_id = $1`), runID)
 	if err != nil {
 		return 0, 0, fmt.Errorf("journal: step stats: %w", err)

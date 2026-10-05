@@ -307,6 +307,19 @@ func buildSpec(t journal.Trigger) (string, error) {
 // fire dispatches one cron run. Errors are logged + stamped on the trigger
 // row; one bad fire never kills the cron loop.
 func (d *Driver) fire(ctx context.Context, t journal.Trigger) {
+	// The cron callback captures a trigger snapshot when its entry is
+	// registered. A disable, tenant repair, or other authoring mutation can
+	// race the reload loop, so never dispatch that stale snapshot. Resolve the
+	// active row at the dispatch boundary; a missing/disabled row is an expected
+	// no-op while a database failure is logged and left for the next tick.
+	fresh, err := d.Journal.GetActiveCronTrigger(ctx, t.ID)
+	if err != nil {
+		if !errors.Is(err, journal.ErrNotFound) {
+			d.Log.Warn("cron: resolve trigger before dispatch failed", "trigger_id", t.ID, "err", err)
+		}
+		return
+	}
+	t = fresh
 	payload, _ := json.Marshal(map[string]any{
 		"trigger_id": t.ID,
 		"fired_at":   time.Now().UTC().Format(time.RFC3339),

@@ -252,3 +252,42 @@ func TestListRunsFilters(t *testing.T) {
 		t.Fatalf("wf_2 total = %d, want 3", wf2Total)
 	}
 }
+
+func TestListRunsPaginationUsesStableTieBreaker(t *testing.T) {
+	t.Parallel()
+	j, cleanup := newTestJournal(t)
+	defer cleanup()
+	ctx := context.Background()
+	if err := j.CreateWorkflow(ctx, "wf_tie", "tie", "hash-tie", "0.1.0", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"run_tie_a", "run_tie_b", "run_tie_c"}
+	for _, id := range ids {
+		if err := j.CreateRun(ctx, id, "wf_tie", "manual", json.RawMessage(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.ExecContext(ctx, j.bind(`UPDATE runs SET started_at = $1 WHERE id = $2`), "2026-01-01T00:00:00.000000Z", id); err != nil {
+			t.Fatalf("set tied timestamp for %s: %v", id, err)
+		}
+	}
+
+	// Every row has the same started_at. The secondary id ordering should make
+	// each offset page repeatable and cover each run exactly once.
+	want := []string{"run_tie_c", "run_tie_b", "run_tie_a"}
+	for offset, wantID := range want {
+		page, err := j.ListRuns(ctx, RunFilter{WorkflowID: "wf_tie", Limit: 1, Offset: offset})
+		if err != nil {
+			t.Fatalf("page %d: %v", offset, err)
+		}
+		if len(page) != 1 || page[0].ID != wantID {
+			t.Fatalf("page %d = %+v, want %s", offset, page, wantID)
+		}
+	}
+	pageAgain, err := j.ListRuns(ctx, RunFilter{WorkflowID: "wf_tie", Limit: 1, Offset: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pageAgain) != 1 || pageAgain[0].ID != want[0] {
+		t.Fatalf("repeated first page = %+v, want %s", pageAgain, want[0])
+	}
+}
