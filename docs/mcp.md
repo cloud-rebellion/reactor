@@ -1354,7 +1354,9 @@ Preflight a proposed workflow without persisting anything. Reactor validates
 the DAG shape, dependency references, cycle-free bounded graph, import
 allowlist, lint, `go vet`, and `go build`. A successful response means the
 proposal is buildable; it does not create a workflow row or artifact.
-`main_go` must directly call `sdk/runtime.Serve` from `main()`.
+`main_go` must make a direct `sdk/runtime.Serve` call the only statement in
+`main()`. Setup before it could exit without starting Reactor, and work after it
+would run outside the workflow's durable execution path.
 Pass `expected_version` from `reactor_review_workflow` when validating a
 revision. The response includes `authoring_admission`, a tenant-scoped,
 point-in-time view of whether the slug is new, ready for a fenced revision,

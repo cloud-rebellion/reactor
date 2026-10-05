@@ -150,12 +150,13 @@ func (c *CommandSpawner) probeTarget() (probeTarget, bool) {
 			}
 		}
 	}
-	if len(spawn) == 8 && len(stop) == 6 && spawn[0] == stop[0] &&
+	if len(spawn) == 8 && len(stop) == 8 && spawn[0] == stop[0] &&
 		filepath.Base(spawn[0]) == "kubectl" &&
 		spawn[1] == "create" && spawn[2] == "--namespace" && spawn[3] != "" &&
 		spawn[4] == "-f" && spawn[5] == "-" && spawn[6] == "-o" && spawn[7] == "name" &&
 		stop[1] == "delete" && stop[2] == "--namespace" && stop[3] == spawn[3] &&
-		stop[4] == "--ignore-not-found" && stop[5] == idPlaceholder {
+		stop[4] == "--ignore-not-found" && stop[5] == "--cascade=foreground" &&
+		stop[6] == "--wait=true" && stop[7] == idPlaceholder {
 		return probeTarget{command: spawn[0], namespace: spawn[3], kind: "kubernetes"}, true
 	}
 	return probeTarget{}, false

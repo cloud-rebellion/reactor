@@ -383,7 +383,9 @@ their artifact copy is ready.
 
 **kubernetes.** Each scale-up `kubectl create`s a `Job` (`generateName:
 reactor-worker-`, `ttlSecondsAfterFinished` so finished Jobs are collected);
-scale-down deletes it. Set `REACTOR_AUTOSCALE_K8S_NAMESPACE` (default
+scale-down deletes it with foreground cascading deletion and waits for its
+Pod to disappear before releasing the capacity slot. A timed-out delete keeps
+the Job tracked for reconciliation. Set `REACTOR_AUTOSCALE_K8S_NAMESPACE` (default
 `default`). Point `REACTOR_AUTOSCALE_K8S_DB_SECRET` at an existing Secret
 (key `REACTOR_AUTOSCALE_K8S_DB_SECRET_KEY`, default `db-url`) and
 `REACTOR_AUTOSCALE_K8S_MASTER_KEY_SECRET` at a Secret holding the 64-hex vault

@@ -213,6 +213,13 @@ func (s *Server) latestStepOutputs(ctx context.Context, slug, tenantID string, d
 // entry with sample output from the latest run when available.
 func (s *Server) nodeDataflow(ctx context.Context, slug, dir, step, tenantID string) (upstream, downstream []nodeConn, runID string) {
 	dagBytes, _, _ := readFirstAvailableBounded(dir, maxFlowDAGBytes, "dag.json", "source/dag.json")
+	return s.nodeDataflowFromDAG(ctx, slug, step, tenantID, dagBytes)
+}
+
+// nodeDataflowFromDAG lets the browser drawer use the same immutable DAG
+// version as its code read, even if another author publishes a revision while
+// the page is open. The workspace reader above remains for legacy callers.
+func (s *Server) nodeDataflowFromDAG(ctx context.Context, slug, step, tenantID string, dagBytes []byte) (upstream, downstream []nodeConn, runID string) {
 	upstream, downstream = dagConnections(dagBytes, step)
 	outputs, runID := s.latestStepOutputs(ctx, slug, tenantID, dagBytes)
 	for i := range upstream {

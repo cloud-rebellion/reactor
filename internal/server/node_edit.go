@@ -1,10 +1,14 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/bright-interaction/reactor/internal/codeedit"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
@@ -40,6 +44,15 @@ func (s *Server) workflowNodeCode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	requestedVersion := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("expected_version")); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 1 {
+			http.Error(w, "expected_version must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		requestedVersion = parsed
+	}
 
 	dir, err := s.workflowSourceDir(r.Context(), slug, editTenantScope(r))
 	if err != nil {
@@ -52,6 +65,29 @@ func (s *Server) workflowNodeCode(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	var pinnedDAG []byte
+	var pinnedCodeHash string
+	if requestedVersion > 0 && s.Journal != nil {
+		// The page's canvas is pinned to its displayed version. If MCP or CLI
+		// published another version after page load, returning this drawer's
+		// newer code and dependencies beside the old canvas is misleading.
+		wfID, lookupErr := s.Journal.WorkflowIDBySlugInTenant(r.Context(), slug, editTenantScope(r))
+		if lookupErr != nil {
+			http.Error(w, "could not resolve workflow version", http.StatusInternalServerError)
+			return
+		}
+		version, versionErr := s.Journal.CurrentWorkflowVersionRecordBounded(r.Context(), wfID, maxFlowDAGBytes)
+		if versionErr != nil {
+			http.Error(w, "could not resolve workflow version", http.StatusInternalServerError)
+			return
+		}
+		if version.Version != requestedVersion || version.DAGTruncated || len(version.CodeHash) != 16 {
+			http.Error(w, "workflow version changed; reload before inspecting this node", http.StatusConflict)
+			return
+		}
+		pinnedDAG = version.DAG
+		pinnedCodeHash = version.CodeHash
+	}
 	codeBytes, codePath, codeTruncated := readFirstAvailableBounded(dir, maxFlowSourceBytes, "main.go", "workflow.go", "source/main.go")
 	if codeTruncated {
 		http.Error(w, "workflow source exceeds the dashboard projection limit; use the bounded MCP source resource or rebuild before editing", http.StatusConflict)
@@ -60,6 +96,13 @@ func (s *Server) workflowNodeCode(w http.ResponseWriter, r *http.Request) {
 	if len(codeBytes) == 0 {
 		http.Error(w, "workflow source not bundled", http.StatusNotFound)
 		return
+	}
+	if pinnedCodeHash != "" {
+		sum := sha256.Sum256(codeBytes)
+		if hex.EncodeToString(sum[:])[:16] != pinnedCodeHash {
+			http.Error(w, "workflow source changed; reload before inspecting this node", http.StatusConflict)
+			return
+		}
 	}
 
 	snippet, err := codeedit.ExtractStep(string(codeBytes), step)
@@ -77,7 +120,13 @@ func (s *Server) workflowNodeCode(w http.ResponseWriter, r *http.Request) {
 	// resolve the source workspace. Global admins can inspect duplicate slugs
 	// with ?tenant=; using viewerScope alone would be empty for them and could
 	// silently attach another tenant's latest sample to this editor drawer.
-	upstream, downstream, runID := s.nodeDataflow(r.Context(), slug, dir, step, editTenantScope(r))
+	var upstream, downstream []nodeConn
+	var runID string
+	if pinnedDAG != nil {
+		upstream, downstream, runID = s.nodeDataflowFromDAG(r.Context(), slug, step, editTenantScope(r), pinnedDAG)
+	} else {
+		upstream, downstream, runID = s.nodeDataflow(r.Context(), slug, dir, step, editTenantScope(r))
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{

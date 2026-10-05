@@ -16,7 +16,9 @@ const workflowRuntimeImport = "github.com/bright-interaction/reactor/sdk/runtime
 // and reporting success while its main function never starts the Reactor pipe
 // runtime. Source/DAG matching proves that durable calls occur in compiled Go
 // files; it does not prove those calls are reachable from the executable.
-// The MCP contract requires the documented direct Serve call in main.go.
+// The MCP contract requires main to consist only of the documented direct
+// Serve call. Statements before it can exit without starting the runtime;
+// statements after it can run outside the workflow's durable execution path.
 func requireMCPWorkflowEntrypoint(mainGo string) error {
 	if len(mainGo) > maxMCPWorkflowAuthoringSourceBytes {
 		return fmt.Errorf("%w: main_go exceeds %d-byte limit", errInvalidParamsErr, maxMCPWorkflowAuthoringSourceBytes)
@@ -53,18 +55,20 @@ func requireMCPWorkflowEntrypoint(mainGo string) error {
 		if !ok || fn.Recv != nil || fn.Name == nil || fn.Name.Name != "main" || fn.Body == nil {
 			continue
 		}
-		for _, stmt := range fn.Body.List {
-			expr, ok := stmt.(*ast.ExprStmt)
-			if !ok {
-				continue
-			}
-			call, ok := expr.X.(*ast.CallExpr)
-			if ok && isMCPWorkflowServeCall(call.Fun, aliases, dotImported) {
-				return nil
-			}
+		if len(fn.Body.List) != 1 {
+			break
 		}
+		expr, ok := fn.Body.List[0].(*ast.ExprStmt)
+		if !ok {
+			break
+		}
+		call, ok := expr.X.(*ast.CallExpr)
+		if ok && isMCPWorkflowServeCall(call.Fun, aliases, dotImported) {
+			return nil
+		}
+		break
 	}
-	return fmt.Errorf("%w: main_go must directly call sdk/runtime.Serve(...) from main(); otherwise the executable can exit without running its declared workflow", errInvalidParamsErr)
+	return fmt.Errorf("%w: main_go main() must contain only a direct sdk/runtime.Serve(...) call; other statements can bypass durable workflow execution", errInvalidParamsErr)
 }
 
 func isMCPWorkflowServeCall(fun ast.Expr, aliases map[string]struct{}, dotImported bool) bool {

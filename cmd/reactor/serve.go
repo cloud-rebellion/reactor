@@ -2001,7 +2001,10 @@ func buildSpawner(log *slog.Logger, cfg *serveConfig) (autoscale.Spawner, error)
 		}
 		ns := envFirstOr("default", "REACTOR_AUTOSCALE_K8S_NAMESPACE")
 		spawn := []string{"kubectl", "create", "--namespace", ns, "-f", "-", "-o", "name"}
-		stop := []string{"kubectl", "delete", "--namespace", ns, "--ignore-not-found", "{id}"}
+		// A background Job deletion can remove the inventory handle while its
+		// Pod is still draining. Keep the Job (and the autoscaler capacity slot)
+		// until Kubernetes has removed the dependent Pod.
+		stop := []string{"kubectl", "delete", "--namespace", ns, "--ignore-not-found", "--cascade=foreground", "--wait=true", "{id}"}
 		sp := autoscale.NewCommandSpawner(spawn, stop, os.Environ(), log)
 		sp.SpawnStdin = []byte(k8sWorkerJobManifest(image, ns, cfg, concurrency, artifactPVC, artifactRoot, resources, workerDrain, graceSeconds))
 		sp.StopTimeout = workerDrain + 15*time.Second

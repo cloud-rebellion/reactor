@@ -18,6 +18,11 @@
     // Admin workflow pages carry ?tenant= when duplicate slugs exist. Keep
     // the node editor on that same tenant for both reads and writes.
     var actionQuery = editor.getAttribute("data-action-query") || "";
+    // A page's canvas is tied to one immutable workflow version. A newer
+    // version must make a stale node tap ask for a reload, not pair old
+    // arrows with newly published source and sample data.
+    var nodeReadQuery = actionQuery + (expectedVersion ?
+        (actionQuery ? "&" : "?") + "expected_version=" + encodeURIComponent(expectedVersion) : "");
 
     // --- view toggle ---------------------------------------------------------
     var tabs = editor.querySelectorAll(".wf-tab");
@@ -268,7 +273,7 @@
         openDrawer();
         renderBlockFlow(step);
 
-        fetch("/workflows/" + encodeURIComponent(slug) + "/node/" + encodeURIComponent(step) + "/code" + actionQuery, {
+        fetch("/workflows/" + encodeURIComponent(slug) + "/node/" + encodeURIComponent(step) + "/code" + nodeReadQuery, {
             headers: { "Accept": "application/json" }
         }).then(function (r) {
             if (r.status === 404) {

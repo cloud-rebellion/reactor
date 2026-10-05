@@ -330,7 +330,8 @@ get)
   esac
   ;;
 delete)
-  printf '%s\n' "$5" >> "$TEST_STOPS"
+  if [ "$5" != '--cascade=foreground' ] || [ "$6" != '--wait=true' ]; then exit 7; fi
+  printf '%s\n' "$7" >> "$TEST_STOPS"
   ;;
 *) exit 2 ;;
 esac
@@ -342,9 +343,31 @@ func kubectlProbeSpawner(t *testing.T) (*CommandSpawner, string, string) {
 	env := append(os.Environ(), "TEST_STATE="+state, "TEST_SEQUENCE="+sequence, "TEST_STOPS="+stops, "REACTOR_AUTOSCALE_FLEET_ID=unit")
 	sp := NewCommandSpawner(
 		[]string{bin, "create", "--namespace", "tenant", "-f", "-", "-o", "name"},
-		[]string{bin, "delete", "--namespace", "tenant", "--ignore-not-found", "{id}"}, env, quietLog())
+		[]string{bin, "delete", "--namespace", "tenant", "--ignore-not-found", "--cascade=foreground", "--wait=true", "{id}"}, env, quietLog())
 	sp.SpawnStdin = []byte("kind: Job\nmetadata:\n  labels:\n    app: reactor-worker\nspec:\n")
 	return sp, state, stops
+}
+
+func TestKubernetesPresetRejectsStopThatCanReleaseJobBeforePod(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		index int
+		value string
+	}{
+		{"background cascade", 5, "--cascade=background"},
+		{"no wait", 6, "--wait=false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sp, _, _ := kubectlProbeSpawner(t)
+			sp.StopArgv[tc.index] = tc.value
+			if _, err := sp.Spawn(context.Background()); err == nil || sp.Running() != 0 {
+				t.Fatalf("unsafe Job deletion launched a worker: err=%v count=%d", err, sp.Running())
+			}
+			if err := sp.Reconcile(context.Background()); err == nil {
+				t.Fatal("unsafe Job deletion was accepted as a managed fleet")
+			}
+		})
+	}
 }
 
 func TestKubernetesReconcileTerminalAndMissingJobs(t *testing.T) {

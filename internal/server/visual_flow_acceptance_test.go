@@ -113,6 +113,10 @@ func Run(ctx context.Context, flow r.Flow) error {
 	if err := j.MarkRunFinished(ctx, runID, "succeeded"); err != nil {
 		t.Fatal(err)
 	}
+	originalDrawer := visualAcceptanceGET(t, r, "/workflows/"+slug+"/node/process/code?expected_version=1")
+	if !strings.Contains(originalDrawer, `"step":"process"`) || !strings.Contains(originalDrawer, "b.Split") {
+		t.Fatalf("current-version node drawer did not show its pinned source: %s", originalDrawer)
+	}
 
 	const secondSource = `package main
 import (
@@ -128,6 +132,17 @@ func Run(ctx context.Context, flow r.Flow) error {
 	secondArtifact, secondHash, secondManifest := publishVisualAcceptanceArtifact(t, reg, slug, secondSource, secondDAG, "v2")
 	if version, err := j.RecordWorkflowVersionWithArtifact(ctx, workflowID, "0.2.0", secondHash, secondArtifact, secondDAG, secondManifest); err != nil || version != 2 {
 		t.Fatalf("record replacement version = %d, %v", version, err)
+	}
+	staleDrawer := httptest.NewRecorder()
+	r.ServeHTTP(staleDrawer, httptest.NewRequest(http.MethodGet,
+		"/workflows/"+slug+"/node/process/code?expected_version=1", nil))
+	if staleDrawer.Code != http.StatusConflict || !strings.Contains(staleDrawer.Body.String(), "reload") ||
+		strings.Contains(staleDrawer.Body.String(), "b.Split") {
+		t.Fatalf("stale canvas could inspect another version's node: status %d, body %s", staleDrawer.Code, staleDrawer.Body.String())
+	}
+	currentDrawer := visualAcceptanceGET(t, r, "/workflows/"+slug+"/node/replacement/code?expected_version=2")
+	if !strings.Contains(currentDrawer, `"step":"replacement"`) || strings.Contains(currentDrawer, "b.Split") {
+		t.Fatalf("new drawer did not follow the current version: %s", currentDrawer)
 	}
 	current = visualAcceptanceGET(t, r, "/workflows/"+slug)
 	visualAcceptanceIsland(t, current, "dag-data", &canvasDAG)

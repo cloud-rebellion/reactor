@@ -375,6 +375,9 @@ func TestKubernetesAutoscalerHonorsWorkerDrainGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	sp := spawner.(*autoscale.CommandSpawner)
+	if want := []string{"kubectl", "delete", "--namespace", "default", "--ignore-not-found", "--cascade=foreground", "--wait=true", "{id}"}; !reflect.DeepEqual(sp.StopArgv, want) {
+		t.Fatalf("Kubernetes stop argv = %v, want foreground deletion of the worker Pod", sp.StopArgv)
+	}
 	manifest := string(sp.SpawnStdin)
 	for _, want := range []string{
 		"terminationGracePeriodSeconds: 56",
