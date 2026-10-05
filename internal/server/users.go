@@ -430,13 +430,17 @@ func (s *Server) tokens(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tokensCreate mints a new token, stashes the raw value in the flash
-// store so it surfaces on the next page load exactly once, then
-// redirects.
+// tokensCreate requires a resolved browser session before minting a token.
+// It stashes the raw value in the flash store so it surfaces on the next page
+// load exactly once, then redirects.
 func (s *Server) tokensCreate(w http.ResponseWriter, r *http.Request) {
 	me, ok := UserFromContext(r.Context())
 	if !ok {
 		http.Error(w, "not signed in", http.StatusUnauthorized)
+		return
+	}
+	if _, ok := SessionStateFromContext(r.Context()); !ok || sessionCookieFromContext(r.Context()) == "" {
+		http.Error(w, "browser session required to mint an API token", http.StatusForbidden)
 		return
 	}
 	if !s.requireStepUp(w, r, me, false) {

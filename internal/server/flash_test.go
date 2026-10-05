@@ -247,7 +247,10 @@ func TestTokenCreateRevokesCredentialWhenOneTimeDeliveryFails(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/tokens", strings.NewReader("name=automation"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req = req.WithContext(withUser(req.Context(), auth.User{ID: "user_1", Role: auth.RoleAdmin}))
+	ctx := withUser(req.Context(), auth.User{ID: "user_1", Role: auth.RoleAdmin})
+	ctx = withSessionState(ctx, auth.SessionState{IDHash: "test-session"})
+	ctx = withSessionCookie(ctx, "test-session-cookie")
+	req = req.WithContext(ctx)
 	rec := httptest.NewRecorder()
 
 	s.tokensCreate(rec, req)

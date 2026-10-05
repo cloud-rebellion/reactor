@@ -249,3 +249,45 @@ func TestSecurityMutationRequiresStepUp(t *testing.T) {
 		t.Fatal("TOTP still enabled after authorized disable")
 	}
 }
+
+func TestTokenMintWithBrowserSessionStillRequiresMFAStepUp(t *testing.T) {
+	base, store, userID, secret, cleanup := newMFAServer(t)
+	defer cleanup()
+	client := noRedirectClient()
+	ctx := context.Background()
+
+	rawSession, err := store.CreateSession(ctx, userID, "test", "127.0.0.1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: SessionCookieName, Value: rawSession}
+	form := url.Values{"name": {"browser-mfa"}, "ttl_days": {"1"}}
+	resp := formPost(t, client, base, "/tokens", cookie, form)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("mint before step-up status = %d, want 403", resp.StatusCode)
+	}
+	tokens, err := store.ListAPITokens(ctx, userID)
+	if err != nil || len(tokens) != 0 {
+		t.Fatalf("tokens before step-up = %d, err = %v; want 0", len(tokens), err)
+	}
+
+	code, err := totp.GenerateCodeCustom(secret, time.Now(), totpOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = formPost(t, client, base, "/security/stepup/totp", cookie, url.Values{"code": {code}})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("step-up status = %d, want 303", resp.StatusCode)
+	}
+	resp = formPost(t, client, base, "/tokens", cookie, form)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/tokens" {
+		t.Fatalf("mint after step-up status = %d, location = %q; want 303 /tokens", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	tokens, err = store.ListAPITokens(ctx, userID)
+	if err != nil || len(tokens) != 1 {
+		t.Fatalf("tokens after step-up = %d, err = %v; want 1", len(tokens), err)
+	}
+}

@@ -142,10 +142,11 @@ Token minted. Copy it now; it will not be shown again. Use it as:
 Authorization: Bearer rtr_YOUR_TOKEN_HERE
 ```
 
-Tokens have the same role/permissions as the issuing user. Minting a token
-requires a fresh MFA step-up when the account has a factor enrolled. Tokens
-expire at the selected deadline; `POST /tokens/{id}/revoke` marks the row
-revoked and the audit trail survives.
+Tokens have the same role/permissions as the issuing user. Minting requires
+an authenticated browser session; an API bearer or HTTP Basic credential cannot
+mint another token. A fresh MFA step-up is required when the account has a
+factor enrolled. Tokens expire at the selected deadline;
+`POST /tokens/{id}/revoke` marks the row revoked and the audit trail survives.
 
 For Bearer use, see the [REST API reference](/docs/api).
 
