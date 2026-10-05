@@ -150,17 +150,23 @@ func TestParseServeFlagsRequiresTLSCertificateAndKeyTogether(t *testing.T) {
 
 func TestServeRequiresPrivateStateRoot(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Chmod(root, 0o700); err != nil {
+	if err := os.Chmod(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := validatePrivateStateRoot(root); err != nil {
-		t.Fatalf("secure temp root rejected: %v", err)
+		t.Fatalf("owned legacy state root rejected: %v", err)
 	}
-	if err := os.Chmod(root, 0o750); err != nil {
+	if info, err := os.Stat(root); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("legacy state root mode after startup = %v, %v; want 0700", info, err)
+	}
+	if err := os.Chmod(root, 0o770); err != nil {
 		t.Fatal(err)
 	}
-	if err := validatePrivateStateRoot(root); err == nil || !strings.Contains(err.Error(), "group or other") {
-		t.Fatalf("shared state root error = %v, want permission refusal", err)
+	if err := validatePrivateStateRoot(root); err == nil || !strings.Contains(err.Error(), "writable by group or other") {
+		t.Fatalf("writable state root error = %v, want permission refusal", err)
+	}
+	if info, err := os.Stat(root); err != nil || info.Mode().Perm() != 0o770 {
+		t.Fatalf("writable state root mode = %v, %v; want unchanged 0770", info, err)
 	}
 
 	target := filepath.Join(t.TempDir(), "real-root")

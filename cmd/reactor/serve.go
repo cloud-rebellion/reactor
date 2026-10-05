@@ -52,6 +52,7 @@ import (
 	"github.com/bright-interaction/reactor/internal/server"
 	"github.com/bright-interaction/reactor/internal/vault"
 	"github.com/bright-interaction/reactor/internal/workflowproof"
+	"golang.org/x/sys/unix"
 )
 
 // cmdServe is the daemon entrypoint. Boots every component the runtime
@@ -2452,8 +2453,36 @@ func validatePrivateStateRoot(root string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("root must be a real directory, not a symlink or file")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("root is readable by group or other (mode %04o); chmod 0700", info.Mode().Perm())
+	if info.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	// Older Reactor images left the state volume at 0755. Tighten an owned,
+	// non-writable legacy directory before opening the vault or HTTP listener.
+	// A directory writable by another account may already contain replaced
+	// state, so it still requires operator review instead of automatic repair.
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("root is writable by group or other (mode %04o); chmod 0700 after reviewing its contents", info.Mode().Perm())
+	}
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open private root without following links: %w", err)
+	}
+	dir := os.NewFile(uintptr(fd), root)
+	defer dir.Close()
+	opened, err := dir.Stat()
+	if err != nil || !opened.IsDir() || !os.SameFile(info, opened) {
+		return errors.New("state root changed during permission tightening")
+	}
+	owner, ok := opened.Sys().(*syscall.Stat_t)
+	if !ok || owner.Uid != uint32(os.Geteuid()) || opened.Mode().Perm()&0o022 != 0 {
+		return errors.New("shared state root is not safely owned by the daemon")
+	}
+	if err := dir.Chmod(0o700); err != nil {
+		return fmt.Errorf("tighten state root permissions: %w", err)
+	}
+	current, err := os.Lstat(root)
+	if err != nil || !current.IsDir() || !os.SameFile(opened, current) || current.Mode().Perm() != 0o700 {
+		return errors.New("state root permission tightening could not be verified")
 	}
 	return nil
 }
