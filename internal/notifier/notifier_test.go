@@ -43,7 +43,7 @@ func (f *fakeLookup) GetNotificationChannel(_ context.Context, id string) (journ
 type countingSender struct {
 	kind  string
 	calls atomic.Int32
-	last  Event
+	last  atomic.Pointer[Event]
 	fail  error
 }
 
@@ -143,7 +143,7 @@ func TestNotifierCapacityTimeoutKeepsSendsRetryable(t *testing.T) {
 func (c *countingSender) Kind() string { return c.kind }
 func (c *countingSender) Send(_ context.Context, _ json.RawMessage, ev Event) error {
 	c.calls.Add(1)
-	c.last = ev
+	c.last.Store(&ev)
 	return c.fail
 }
 
@@ -164,10 +164,14 @@ func TestNotifyFiresEverySender(t *testing.T) {
 	if got := hookS.calls.Load(); got != 1 {
 		t.Fatalf("hook calls = %d, want 1", got)
 	}
-	if slackS.last.DashboardURL != "https://reactor.example.com/runs/r1" {
-		t.Fatalf("DashboardURL = %q", slackS.last.DashboardURL)
+	lastSlack, lastHook := slackS.last.Load(), hookS.last.Load()
+	if lastSlack == nil || lastHook == nil {
+		t.Fatal("sender did not record a delivered event")
 	}
-	if slackS.last.ErrorText != "" || hookS.last.ErrorText != "" {
+	if lastSlack.DashboardURL != "https://reactor.example.com/runs/r1" {
+		t.Fatalf("DashboardURL = %q", lastSlack.DashboardURL)
+	}
+	if lastSlack.ErrorText != "" || lastHook.ErrorText != "" {
 		t.Fatal("raw step error passed through the notifier dispatch boundary")
 	}
 }
@@ -230,8 +234,9 @@ func TestTestChannelDeliversToSender(t *testing.T) {
 	if got := s.calls.Load(); got != 1 {
 		t.Fatalf("calls = %d, want 1", got)
 	}
-	if s.last.Status != "test" {
-		t.Fatalf("event status = %q, want test", s.last.Status)
+	last := s.last.Load()
+	if last == nil || last.Status != "test" {
+		t.Fatalf("event status = %v, want test", last)
 	}
 }
 
