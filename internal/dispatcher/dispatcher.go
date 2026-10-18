@@ -36,6 +36,7 @@ import (
 	"github.com/bright-interaction/reactor/internal/runtime/cancelreg"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/supervisor"
+	"github.com/bright-interaction/reactor/internal/runtime/webhookpolicy"
 )
 
 // BinaryLookup maps a workflow slug to the mutable compatibility path. It is
@@ -559,7 +560,38 @@ func terminalChainIdempotencyKey(t journal.Trigger, payload []byte) string {
 // Keep Dispatch for cron/chain callers whose interface intentionally returns
 // only an error; adding this method avoids a broad API break.
 func (d *Dispatcher) DispatchWebhook(ctx context.Context, t journal.Trigger, payload []byte) (string, error) {
-	runID, err := d.dispatch(ctx, t, payload, "live")
+	var runID string
+	var err error
+	if t.Provider == "flare-v1" {
+		if t.Kind != journal.TriggerWebhook || t.ID == "" || t.WorkflowID == "" {
+			return "", errors.New("dispatcher: invalid Flare webhook binding")
+		}
+		// The receiver's claim and this durable run are separate writes. Bind
+		// Flare's exact authenticated body to the trigger in the runs table too,
+		// so a crash after enqueue but before receipt completion cannot create
+		// another run when the delivery lease expires.
+		h := sha256.New()
+		for _, value := range []string{t.ID, t.WorkflowID, t.Provider} {
+			h.Write([]byte(value))
+			h.Write([]byte{0})
+		}
+		h.Write(payload)
+		key := "flare-webhook-" + hex.EncodeToString(h.Sum(nil))
+		runID, err = d.dispatchWithIdempotency(ctx, t, payload, "live", false, key)
+		if err == nil && runID != "" {
+			// A caller-chosen manual/MCP key must not let a manual run stand in
+			// for authenticated webhook provenance, even if its input matches.
+			run, readErr := d.Journal.GetRun(ctx, runID)
+			if readErr != nil {
+				return "", readErr
+			}
+			if run.WorkflowID != t.WorkflowID || run.TriggerKind != string(journal.TriggerWebhook) {
+				return "", journal.ErrMCPDispatchIdempotencyConflict
+			}
+		}
+	} else {
+		runID, err = d.dispatch(ctx, t, payload, "live")
+	}
 	if err == nil && runID == "" {
 		// Automatic dispatch historically treats a disabled workflow as a
 		// successful no-op. A webhook receipt must not call that completed: no
@@ -722,7 +754,13 @@ func (d *Dispatcher) dispatchWithIdempotency(ctx context.Context, t journal.Trig
 	if err != nil {
 		return "", fmt.Errorf("dispatcher: resolve workflow: %w", err)
 	}
-	version, binary, err := d.resolveCurrentBinary(ctx, t.WorkflowID, slug)
+	var version journal.WorkflowVersion
+	var binary string
+	if t.Kind == journal.TriggerWebhook {
+		version, binary, err = d.resolveCurrentWebhookBinary(ctx, t.WorkflowID, slug, t.Provider)
+	} else {
+		version, binary, err = d.resolveCurrentBinary(ctx, t.WorkflowID, slug)
+	}
 	if err != nil {
 		return "", fmt.Errorf("dispatcher: workflow artifact unavailable: %w", err)
 	}
@@ -1108,9 +1146,29 @@ func (d *Dispatcher) ExecuteRun(ctx context.Context, runID, leaseOwner string) e
 }
 
 func (d *Dispatcher) resolveCurrentBinary(ctx context.Context, workflowID, slug string) (journal.WorkflowVersion, string, error) {
-	v, err := d.Journal.CurrentWorkflowVersionRecord(ctx, workflowID)
+	return d.resolveCurrentBinaryWithPolicy(ctx, workflowID, slug, nil)
+}
+
+func (d *Dispatcher) resolveCurrentWebhookBinary(ctx context.Context, workflowID, slug, provider string) (journal.WorkflowVersion, string, error) {
+	return d.resolveCurrentBinaryWithPolicy(ctx, workflowID, slug, &provider)
+}
+
+func (d *Dispatcher) resolveCurrentBinaryWithPolicy(ctx context.Context, workflowID, slug string, provider *string) (journal.WorkflowVersion, string, error) {
+	var v journal.WorkflowVersion
+	var err error
+	if provider == nil {
+		v, err = d.Journal.CurrentWorkflowVersionRecord(ctx, workflowID)
+	} else {
+		v, err = d.Journal.CurrentWorkflowVersionRecordBounded(ctx, workflowID, webhookpolicy.MaxDAGBytes)
+	}
 	if err != nil {
 		return journal.WorkflowVersion{}, "", err
+	}
+	// Validate the immutable version actually selected for this run. A newer
+	// publication racing the receiver cannot inherit its earlier verifier check.
+	// Existing queued runs continue resolving their original version separately.
+	if provider != nil && (v.DAGTruncated || webhookpolicy.Require(v.DAG, *provider) != nil) {
+		return journal.WorkflowVersion{}, "", webhookpolicy.ErrPolicy
 	}
 	run := journal.RunInfo{
 		WorkflowID: workflowID, WorkflowVersion: v.Version, WorkflowArtifactSHA256: v.ArtifactSHA256,

@@ -55,6 +55,7 @@ import (
 
 	"github.com/bright-interaction/reactor/internal/dispatcher"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
+	"github.com/bright-interaction/reactor/internal/runtime/webhookpolicy"
 	"github.com/bright-interaction/reactor/internal/runtime/wire"
 	"github.com/bright-interaction/reactor/internal/vault"
 	hashesign "github.com/bright-interaction/reactor/sdk/esign/hash"
@@ -93,6 +94,10 @@ const stripeSkew = 5 * time.Minute
 // existing trigger's verification contract.
 const ProviderAutomationV1 = "automation-v1"
 
+// ProviderFlareV1 verifies Flare's timestamp + raw-body HMAC and requires one
+// configured Flare project. It is supported only by workflow webhook ingress.
+const ProviderFlareV1 = "flare-v1"
+
 // ProviderHashV1 authenticates lifecycle callbacks emitted by Hash. It is
 // intentionally separate from Stripe's similar-looking envelope: Hash accepts
 // exactly one canonical t=...,v1=... signature and derives delivery identity
@@ -111,12 +116,7 @@ const hashSkew = 5 * time.Minute
 // contract. Callers that create triggers use this to reject typos instead of
 // accidentally falling back to the generic verifier.
 func IsSupportedProvider(provider string) bool {
-	switch provider {
-	case ProviderAutomationV1, ProviderHashV1, "generic", "github", "stripe":
-		return true
-	default:
-		return false
-	}
+	return webhookpolicy.IsSupportedProvider(provider)
 }
 
 // VaultReader is the slice of the vault interface this package needs.
@@ -181,10 +181,12 @@ type Receiver struct {
 // Mount registers the receiver's routes:
 //
 //	POST /webhook/{token_id}         HMAC-verified trigger payload
+//	POST /webhook/flare/{token_id}   project-bound signed Flare notices only
 //	GET  /webhook/{token_id}/status  signed automation-v1 reconciliation
 //	POST /signal/{token}             AwaitSignal external delivery
 func (r *Receiver) Mount(router chi.Router) {
 	router.Post("/webhook/{token_id}", r.handle)
+	router.Post("/webhook/flare/{token_id}", r.handleFlare)
 	router.Get("/webhook/{token_id}/status", r.handleDeliveryStatus)
 	router.Post("/signal/{token}", r.handleSignal)
 }
@@ -198,6 +200,14 @@ func (r *Receiver) Handler() http.HandlerFunc { return r.handle }
 func (r *Receiver) SignalHandler() http.HandlerFunc { return r.handleSignal }
 
 func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
+	r.handleProvider(w, req, "")
+}
+
+func (r *Receiver) handleFlare(w http.ResponseWriter, req *http.Request) {
+	r.handleProvider(w, req, ProviderFlareV1)
+}
+
+func (r *Receiver) handleProvider(w http.ResponseWriter, req *http.Request, requiredProvider string) {
 	setNoStoreResponseHeaders(w)
 	if r.Log == nil {
 		r.Log = slog.Default()
@@ -208,7 +218,11 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, MaxBodyBytes))
+	bodyLimit := int64(MaxBodyBytes)
+	if requiredProvider == ProviderFlareV1 {
+		bodyLimit = maxFlareV1BodyBytes
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, bodyLimit))
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -228,17 +242,30 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if requiredProvider != "" && trig.Provider != requiredProvider || requiredProvider == "" && trig.Provider == ProviderFlareV1 {
+		// A valid token for another provider is indistinguishable from an
+		// unknown token, before secret lookup, claim or dispatch.
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 
 	provider := trig.Provider
 	if provider == "" {
 		provider = "generic"
 	}
-	if provider == ProviderAutomationV1 {
+	// A trigger can predate publication of a stricter workflow. Authoring-time
+	// checks cannot authorize its old verifier against the current stored DAG.
+	dag, _, truncated, policyErr := r.Journal.WorkflowDAGBounded(ctx, trig.WorkflowID, webhookpolicy.MaxDAGBytes)
+	if policyErr != nil || truncated || webhookpolicy.Require(dag, provider) != nil {
+		http.Error(w, "webhook provider policy unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if provider == ProviderAutomationV1 || provider == ProviderFlareV1 {
 		if err := requireAutomationJSONContentType(req.Header.Values("Content-Type")); err != nil {
-			// Content-Type is part of automation-v1's canonical ingress contract.
+			// Content-Type is part of both signed JSON ingress contracts.
 			// Keep the public response fixed because the supplied header is
 			// unauthenticated until the HMAC check below.
-			r.Log.Warn("webhook: invalid automation-v1 content type",
+			r.Log.Warn("webhook: invalid signed JSON content type",
 				"trigger_id", trig.ID, "provider", provider, "err", err)
 			http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 			return
@@ -258,6 +285,21 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	dispatchBody := body
+	if provider == ProviderFlareV1 {
+		if err := validateFlareV1Notice(body, req.Header, trig.Config); err != nil {
+			r.Log.Warn("webhook: invalid Flare notice", "trigger_id", trig.ID, "err", err)
+			_ = r.Journal.MarkTriggerError(ctx, trig.ID, "flare-v1: invalid signed notice")
+			http.Error(w, "invalid Flare notice", http.StatusBadRequest)
+			return
+		}
+		var notice flareV1Notice
+		_ = json.Unmarshal(body, &notice) // Strictly validated above.
+		if notice.Event == "test" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true, "test": true, "dispatched": false})
+			return
+		}
+	}
 	if provider == ProviderAutomationV1 {
 		if err := validateAutomationEventID(body, req.Header.Get("X-Webhook-Delivery")); err != nil {
 			// The envelope was authenticated, but it is not a valid automation-v1
@@ -373,13 +415,13 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 
 	// Synchronous trigger: run the workflow and return its result to the
 	// caller (request/response API), instead of fire-and-forget.
-	// automation-v1 and hash-v1 are deliberately receipt-based and asynchronous.
+	// automation-v1, flare-v1 and hash-v1 are receipt-based and asynchronous.
 	// Their 202/200 contract means the producer can durably reconcile run_id
 	// without holding its request open (Hash has a 10-second sender timeout), and
 	// prevents a legacy trigger checkbox from silently changing either signed
 	// integration protocol.
 	if sc := parseSyncConfig(trig.Config); sc.Sync &&
-		provider != ProviderAutomationV1 && provider != ProviderHashV1 {
+		provider != ProviderAutomationV1 && provider != ProviderFlareV1 && provider != ProviderHashV1 {
 		runID, status, output, derr := r.Disp.DispatchSync(ctx, trig, dispatchBody, time.Duration(sc.TimeoutSeconds)*time.Second)
 		if derr != nil {
 			if errors.Is(derr, dispatcher.ErrWorkflowDisabled) {
@@ -863,6 +905,8 @@ func (r *Receiver) verifyHMAC(ctx context.Context, trig journal.Trigger, provide
 	switch provider {
 	case ProviderAutomationV1:
 		return verifyAutomationV1(h, body, key, r.now())
+	case ProviderFlareV1:
+		return verifyFlareV1(h, body, key, r.now())
 	case ProviderHashV1:
 		return verifyHashV1(h, body, key, r.now())
 	case "stripe":
@@ -1340,6 +1384,10 @@ func verifyGeneric(header string, body, key []byte) error {
 // that supply one in headers win; otherwise the SHA-256 of the body is used.
 func pickDeliveryID(provider string, h http.Header, body []byte) string {
 	switch provider {
+	case ProviderFlareV1:
+		// Only authenticated bytes define Flare delivery identity. Re-signing
+		// unchanged retry bytes never starts another workflow run.
+		return sha256Hex(body)
 	case ProviderHashV1:
 		if id, err := hashEventID(body); err == nil {
 			return id

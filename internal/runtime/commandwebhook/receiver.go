@@ -93,6 +93,12 @@ func (r *Receiver) handle(w http.ResponseWriter, req *http.Request) {
 	if provider == "" {
 		provider = "generic"
 	}
+	if provider == webhook.ProviderFlareV1 {
+		// Flare requires workflow-specific project/schema policy. A restored
+		// or forged command trigger must not bypass that boundary or read a key.
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	if provider == webhook.ProviderAutomationV1 {
 		if err := webhook.RequireAutomationJSONContentType(req.Header.Values("Content-Type")); err != nil {
 			http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)

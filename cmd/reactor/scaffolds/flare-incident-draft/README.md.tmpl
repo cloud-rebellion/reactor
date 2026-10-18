@@ -1,0 +1,51 @@
+# {{.Slug}}: Flare incident evidence draft
+
+Generated {{.Date}}. This workflow turns a signed, project-bound `flare-v1`
+notice into a small review draft. It checks the issue's project, requests fresh
+triage, and confirms the exact succeeded AI receipt and evidence digest. Issue
+text, stack traces, model output and member credentials stay out of Reactor's
+step outputs. The authenticated run page shows the bounded draft and a link to
+Flare for inspection.
+
+## Configure and review
+
+1. Set `trustedFlareBaseURL` to the reviewed HTTPS origin (no path, query or
+   nonstandard port), and `trustedFlareProjectID` to the expected project ID in
+   `main.go`. These are operator-owned source configuration; webhook input and
+   model output cannot select them.
+2. Store a Flare member credential in Reactor's vault as
+   `flare-member-{{.Slug}}`. Grant only this workflow and its tenant access to
+   that credential using the existing vault ACL. Never paste the bearer into
+   source, CLI arguments, input, or a journaled step result. This version uses
+   Flare's existing member authorization; its project check is an additional
+   boundary, not a replacement for the credential's permissions.
+3. Build locally with `reactor workflow build --src . --slug {{.Slug}}` and
+   review the generated source, DAG and exact artifact before any explicit
+   registration or activation. `reactor new` and this template do neither.
+4. Provision a dedicated project-bound `flare-v1` trigger through the reviewed
+   Reactor operator flow. Use its `/webhook/flare/{token}` URL and signing
+   secret for the Flare automation channel. The generic webhook path does not
+   accept this provider. See Reactor's `docs/flare-automation.md` for ingress
+   configuration and delivery acceptance.
+
+A signed channel `test` is a no-op. Notices without an issue do not call AI.
+Manual workflow input is validated again against the same six-field schema and
+project before any credential is resolved.
+
+## Retry and review boundaries
+
+`flare-fresh-triage` has one automatic attempt. Its successful output journals
+only the fresh receipt ID and digest. `flare-confirm-draft` separately retries
+pending receipt reads up to four attempts; cached, failed, foreign or mismatched
+evidence cannot produce a draft. Completed replay reads both outputs without
+fetching live vault credentials. The replay identity also binds the trusted
+origin, project, notice and exact fresh receipt/digest.
+
+An interruption after Flare accepted triage but before Reactor journaled the
+result is ambiguous. Inspect Flare's receipt history before any manual redrive;
+this workflow cannot promise exactly one external provider call across that
+window. Never enable automatic redrive of the triage step.
+
+The workflow stops at `status: draft`. A draft is not human approval, a patch,
+a passed CI run, a merge, a deployment or a synthetic acceptance receipt. Those
+later actions need a separate reviewed protocol and explicit human approval.

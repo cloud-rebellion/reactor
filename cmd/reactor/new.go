@@ -28,6 +28,7 @@ var availableTemplates = []string{
 	"scheduled-rotation",
 	"approval-flow",
 	"stripe-webhook",
+	"flare-incident-draft",
 	"hash-esign-bridge",
 	"hash-esign-lifecycle",
 	"github-pr-reviewer",

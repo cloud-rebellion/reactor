@@ -89,7 +89,7 @@ process for a production Hash bridge.
 
 Native `.deb`/`.rpm` releases include the exact release's workflow SDK source
 at `/usr/lib/reactor-sdk`; the packaged unit pins `REACTOR_SDK_REPLACE` to that
-root-owned, read-only module. Install Go 1.26.5 or newer for the host
+root-owned, read-only module. Install Go 1.26.9 or newer for the host
 architecture at `/usr/local/go/bin/go` or `/usr/bin/go` before starting MCP or
 dashboard authoring. Reactor's workflow compiler sets `GOPROXY=off` and
 `GOTOOLCHAIN=local`, so it cannot fetch a missing SDK or toolchain at request

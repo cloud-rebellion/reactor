@@ -226,7 +226,8 @@ func (s *Server) registerTriggerTools() {
 					"slug":              map[string]any{"type": "string"},
 					"trigger_id":        map[string]any{"type": "string"},
 					"credential_id":     map[string]any{"type": "string"},
-					"provider":          map[string]any{"type": "string", "description": "generic, github, stripe, automation-v1, or hash-v1; omitted preserves the current provider"},
+					"provider":          map[string]any{"type": "string", "description": "generic, github, stripe, automation-v1, flare-v1, or hash-v1; omitted preserves the current provider"},
+					"flare_project_id":  map[string]any{"type": "string", "minLength": 1, "maxLength": 128, "description": "Required project binding for flare-v1; omitted on update preserves an existing flare-v1 binding"},
 					"sync":              map[string]any{"type": "boolean", "description": "optional; omitted preserves the current mode"},
 					"timeout_seconds":   map[string]any{"type": "integer", "minimum": 1, "maximum": 120, "description": "optional synchronous timeout; omit to preserve the current value"},
 					"expected_revision": map[string]any{"type": "integer", "minimum": 1, "description": "revision from reactor_list_triggers; stale revisions are rejected"},
@@ -239,6 +240,7 @@ func (s *Server) registerTriggerTools() {
 				TriggerID        string `json:"trigger_id"`
 				CredentialID     string `json:"credential_id"`
 				Provider         string `json:"provider"`
+				FlareProjectID   string `json:"flare_project_id"`
 				Sync             *bool  `json:"sync"`
 				TimeoutSeconds   *int   `json:"timeout_seconds"`
 				ExpectedRevision int64  `json:"expected_revision"`
@@ -318,8 +320,26 @@ func (s *Server) registerTriggerTools() {
 			if cfg == nil {
 				cfg = map[string]json.RawMessage{}
 			}
+			projectID, projectProvided, err := optionalMCPFlareProjectID(args)
+			if err != nil {
+				return nil, err
+			}
+			if provider == webhook.ProviderFlareV1 {
+				if !projectProvided {
+					if trigger.Provider != webhook.ProviderFlareV1 || json.Unmarshal(cfg["flare_project_id"], &projectID) != nil || !webhook.ValidFlareProjectID(projectID) {
+						return nil, fmt.Errorf("%w: flare-v1 requires flare_project_id", errInvalidParamsErr)
+					}
+				}
+				encoded, _ := json.Marshal(projectID)
+				cfg["flare_project_id"] = encoded
+			} else {
+				if projectProvided {
+					return nil, fmt.Errorf("%w: flare_project_id requires flare-v1", errInvalidParamsErr)
+				}
+				delete(cfg, "flare_project_id")
+			}
 			if a.Sync != nil {
-				if (provider == webhook.ProviderAutomationV1 || provider == webhook.ProviderHashV1) && *a.Sync {
+				if (provider == webhook.ProviderAutomationV1 || provider == webhook.ProviderFlareV1 || provider == webhook.ProviderHashV1) && *a.Sync {
 					return nil, fmt.Errorf("%w: %s webhooks must be asynchronous", errInvalidParamsErr, provider)
 				}
 				if *a.Sync {
@@ -330,7 +350,7 @@ func (s *Server) registerTriggerTools() {
 				}
 			} else if raw := cfg["sync"]; len(raw) > 0 {
 				var syncMode bool
-				if json.Unmarshal(raw, &syncMode) == nil && (provider == webhook.ProviderAutomationV1 || provider == webhook.ProviderHashV1) && syncMode {
+				if json.Unmarshal(raw, &syncMode) == nil && (provider == webhook.ProviderAutomationV1 || provider == webhook.ProviderFlareV1 || provider == webhook.ProviderHashV1) && syncMode {
 					return nil, fmt.Errorf("%w: %s webhooks must be asynchronous", errInvalidParamsErr, provider)
 				}
 			}
@@ -411,17 +431,18 @@ func (s *Server) registerTriggerTools() {
 	s.tools["reactor_create_webhook_trigger"] = toolDef{
 		tool: Tool{
 			Name:        "reactor_create_webhook_trigger",
-			Description: "Bind a workflow to an existing tenant credential and return a public webhook token. The credential value stays in the vault; automation-v1 and hash-v1 are always asynchronous. Requires the triggers MCP scope (--mcp-allow-triggers on reactor serve; --allow-triggers on the explicit stdio compatibility command).",
+			Description: "Bind a workflow to an existing tenant credential and return a public webhook token. The credential value stays in the vault; automation-v1, flare-v1 and hash-v1 are always asynchronous. Requires the triggers MCP scope (--mcp-allow-triggers on reactor serve; --allow-triggers on the explicit stdio compatibility command).",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"slug", "credential_id"},
 				"properties": map[string]any{
-					"slug":            map[string]any{"type": "string"},
-					"credential_id":   map[string]any{"type": "string"},
-					"provider":        map[string]any{"type": "string", "description": "generic, github, stripe, automation-v1, or hash-v1"},
-					"sync":            map[string]any{"type": "boolean"},
-					"timeout_seconds": map[string]any{"type": "integer", "minimum": 1, "maximum": 120},
-					"idempotency_key": map[string]any{"type": "string", "minLength": 1, "maxLength": 200, "description": "Stable retry key; same key with different binding is rejected"},
+					"slug":             map[string]any{"type": "string"},
+					"credential_id":    map[string]any{"type": "string"},
+					"provider":         map[string]any{"type": "string", "description": "generic, github, stripe, automation-v1, flare-v1, or hash-v1"},
+					"flare_project_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 128, "description": "Required project binding for flare-v1; omitted on update preserves an existing flare-v1 binding"},
+					"sync":             map[string]any{"type": "boolean"},
+					"timeout_seconds":  map[string]any{"type": "integer", "minimum": 1, "maximum": 120},
+					"idempotency_key":  map[string]any{"type": "string", "minLength": 1, "maxLength": 200, "description": "Stable retry key; same key with different binding is rejected"},
 				},
 			},
 		},
@@ -430,6 +451,7 @@ func (s *Server) registerTriggerTools() {
 				Slug           string `json:"slug"`
 				CredentialID   string `json:"credential_id"`
 				Provider       string `json:"provider"`
+				FlareProjectID string `json:"flare_project_id"`
 				Sync           bool   `json:"sync"`
 				TimeoutSeconds *int   `json:"timeout_seconds"`
 				IdempotencyKey string `json:"idempotency_key"`
@@ -488,7 +510,7 @@ func (s *Server) registerTriggerTools() {
 			if !webhook.IsSupportedProvider(a.Provider) {
 				return nil, fmt.Errorf("%w: unsupported webhook provider", errInvalidParamsErr)
 			}
-			if (a.Provider == webhook.ProviderAutomationV1 || a.Provider == webhook.ProviderHashV1) && a.Sync {
+			if (a.Provider == webhook.ProviderAutomationV1 || a.Provider == webhook.ProviderFlareV1 || a.Provider == webhook.ProviderHashV1) && a.Sync {
 				return nil, fmt.Errorf("%w: %s webhooks must be asynchronous", errInvalidParamsErr, a.Provider)
 			}
 			if timeoutPresent && !a.Sync {
@@ -504,11 +526,24 @@ func (s *Server) registerTriggerTools() {
 			if credential.Service != "reactor-webhook" || credential.Provider != "shared-secret" {
 				return nil, fmt.Errorf("%w: credential must be a dedicated reactor-webhook shared-secret", errInvalidParamsErr)
 			}
+			projectID, projectProvided, err := optionalMCPFlareProjectID(args)
+			if err != nil {
+				return nil, err
+			}
+			if a.Provider == webhook.ProviderFlareV1 && !projectProvided {
+				return nil, fmt.Errorf("%w: flare-v1 requires flare_project_id", errInvalidParamsErr)
+			}
+			if a.Provider != webhook.ProviderFlareV1 && projectProvided {
+				return nil, fmt.Errorf("%w: flare_project_id requires flare-v1", errInvalidParamsErr)
+			}
 			token, err := journal.NewTokenID()
 			if err != nil {
 				return nil, err
 			}
 			cfg := map[string]any{}
+			if a.Provider == webhook.ProviderFlareV1 {
+				cfg["flare_project_id"] = projectID
+			}
 			if a.Sync {
 				cfg["sync"] = true
 			}
@@ -532,7 +567,11 @@ func (s *Server) registerTriggerTools() {
 			// generated tokens always satisfy this shape.
 			if validMCPWorkflowWebhookToken(token) {
 				result["token"] = token
-				result["endpoint_path"] = "/webhook/" + token
+				path := "/webhook/"
+				if a.Provider == webhook.ProviderFlareV1 {
+					path += "flare/"
+				}
+				result["endpoint_path"] = path + token
 			} else {
 				result["token_status"] = "write_response_invalid"
 			}
@@ -746,6 +785,14 @@ func mcpTriggerView(t journal.Trigger) map[string]any {
 				safe[key] = value
 			}
 		}
+		if t.Kind == journal.TriggerWebhook && t.Provider == webhook.ProviderFlareV1 {
+			var projectID string
+			if raw := cfg["flare_project_id"]; json.Unmarshal(raw, &projectID) == nil && webhook.ValidFlareProjectID(projectID) {
+				safe["flare_project_id"] = raw
+			} else {
+				safe["flare_project_id_status"] = json.RawMessage(`"invalid"`)
+			}
+		}
 		out["config"] = safe
 	}
 	return out
@@ -881,4 +928,22 @@ func (s *Server) triggerSnapshotForMutation(ctx context.Context, triggerID, work
 		return journal.Trigger{}, 0, fmt.Errorf("%w: trigger has no valid revision", errInvalidParamsErr)
 	}
 	return trigger, trigger.Revision, nil
+}
+
+// optionalMCPFlareProjectID preserves omission on update but refuses null,
+// empty values and free text before they reach a trigger's verifier policy.
+func optionalMCPFlareProjectID(args json.RawMessage) (string, bool, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(args, &fields); err != nil {
+		return "", false, err
+	}
+	raw, present := fields["flare_project_id"]
+	if !present {
+		return "", false, nil
+	}
+	var projectID string
+	if json.Unmarshal(raw, &projectID) != nil || !webhook.ValidFlareProjectID(projectID) {
+		return "", true, fmt.Errorf("%w: flare_project_id must be a bounded project identifier", errInvalidParamsErr)
+	}
+	return projectID, true, nil
 }

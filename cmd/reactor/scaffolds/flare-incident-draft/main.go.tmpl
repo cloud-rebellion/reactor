@@ -1,0 +1,52 @@
+// {{.Slug}} turns a signed Flare incident notice into a payload-free review
+// handoff. Configure the trusted origin and project before building this source.
+// It has no repository, Stage, patch, CI, merge, or deploy capability.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	reactor "github.com/bright-interaction/reactor/sdk"
+	"github.com/bright-interaction/reactor/sdk/flare"
+	"github.com/bright-interaction/reactor/sdk/runtime"
+	"github.com/bright-interaction/reactor/sdk/vault"
+)
+
+const (
+	trustedFlareBaseURL = ""
+	trustedFlareProjectID = ""
+	flareMemberCredentialID = "flare-member-{{.Slug}}"
+)
+
+var (
+	Workflow = reactor.Workflow{Slug: "{{.Slug}}", Version: "0.1.0"}
+	Trigger = reactor.WebhookTrigger{Provider: "flare-v1"}
+)
+
+func Run(ctx context.Context, flow reactor.Flow, raw json.RawMessage) error {
+	if trustedFlareBaseURL == "" || trustedFlareProjectID == "" {
+		return reactor.Permanent(errors.New("configure the trusted Flare origin and project before enabling this workflow"))
+	}
+	notice, err := flare.DecodeNotice(raw, trustedFlareProjectID)
+	if err != nil {
+		return reactor.Permanent(err)
+	}
+	if notice.Event == "test" || notice.IssueID == "" {
+		return nil // no issue exists to triage; the signed channel test is also a no-op at ingress
+	}
+	config := flare.DraftConfig{BaseURL: trustedFlareBaseURL, ProjectID: trustedFlareProjectID}
+	_, err = flare.PrepareDraft(ctx, flow, config, notice, func(stepCtx context.Context) (*flare.Client, error) {
+		// Resolve inside executing steps: completed replay needs no live secret,
+		// and the credential is never included in a journaled step output.
+		credential, err := vault.Get(stepCtx, flareMemberCredentialID)
+		if err != nil {
+			return nil, errors.New("scoped Flare member credential is unavailable")
+		}
+		return flare.NewClient(trustedFlareBaseURL, trustedFlareProjectID, string(credential.Reveal()), nil)
+	})
+	return err // the bounded draft is retained as the flare-confirm-draft step output
+}
+
+func main() { runtime.Serve(Workflow, Trigger, Run) }

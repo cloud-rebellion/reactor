@@ -37,7 +37,7 @@ func TestQueuedRunExecutesPinnedV1AfterV2Activation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := j.CreateWorkflowWithArtifact(ctx, "wf_signing", "signing", "source-v1", "0.1.0", v1.Digest, json.RawMessage(`{"version":1}`)); err != nil {
+	if err := j.CreateWorkflowWithArtifact(ctx, "wf_signing", "signing", "source-v1", "0.1.0", v1.Digest, json.RawMessage(`{"version":1,"triggers":[{"kind":"webhook","provider":"generic"}]}`)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.ActivateArtifact("signing", v1.Digest); err != nil {
@@ -59,7 +59,7 @@ func TestQueuedRunExecutesPinnedV1AfterV2Activation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := j.RecordWorkflowVersionWithArtifact(ctx, "wf_signing", "0.1.0", "source-v2", v2.Digest, json.RawMessage(`{"version":2}`)); err != nil {
+	if _, err := j.RecordWorkflowVersionWithArtifact(ctx, "wf_signing", "0.1.0", "source-v2", v2.Digest, json.RawMessage(`{"version":2,"triggers":[{"kind":"webhook","provider":"flare-v1"}]}`)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reg.ActivateArtifact("signing", v2.Digest); err != nil {

@@ -39,7 +39,7 @@ jobs:
           # Keep the CI stdlib aligned with the Docker and release pins.
           # go-version-file reads the `go` language directive and may select
           # the older 1.25.x minimum instead of the security-patched toolchain.
-          go-version: "1.26.6"
+          go-version: "1.26.9"
           cache: true
 
       - name: All checks (build, vet, test, gofmt, licenses, secrets, vulnerabilities)
@@ -67,7 +67,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.6"
+          go-version: "1.26.9"
           cache: true
 
       - name: PostgreSQL migrations, journal contracts, HTTP MCP worker, and bounded queue probe

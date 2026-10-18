@@ -127,7 +127,7 @@ func (s *Server) registerCommandAutomationWebhookTools() {
 		if !commandautomations.ValidName(a.Name) || a.Version < 1 || a.CredentialID == "" {
 			return nil, fmt.Errorf("%w: valid name, version, and credential_id are required", errInvalidParamsErr)
 		}
-		if len(a.Provider) > maxMCPCommandAutomationWebhookProvider || !webhook.IsSupportedProvider(a.Provider) {
+		if a.Provider == webhook.ProviderFlareV1 || len(a.Provider) > maxMCPCommandAutomationWebhookProvider || !webhook.IsSupportedProvider(a.Provider) {
 			return nil, fmt.Errorf("%w: unsupported webhook provider", errInvalidParamsErr)
 		}
 		if len(a.ReceiptID) == 0 || len(a.ReceiptID) > maxMCPRunIdentityBytes || len(a.GateDigest) != 64 {
@@ -229,7 +229,7 @@ func (s *Server) registerCommandAutomationWebhookTools() {
 		if a.Provider == "" {
 			a.Provider = current.Provider
 		}
-		if len(a.Provider) > maxMCPCommandAutomationWebhookProvider || !webhook.IsSupportedProvider(a.Provider) {
+		if a.Provider == webhook.ProviderFlareV1 || len(a.Provider) > maxMCPCommandAutomationWebhookProvider || !webhook.IsSupportedProvider(a.Provider) {
 			return nil, fmt.Errorf("%w: unsupported webhook provider", errInvalidParamsErr)
 		}
 		if s.Credentials == nil {

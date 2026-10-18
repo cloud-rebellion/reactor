@@ -59,6 +59,19 @@ func TestMCPCommandAutomationWebhookCreateListHidesBearerAndSecret(t *testing.T)
 	if decodedCreate.Webhook.ID == "" || decodedCreate.Webhook.Token == "" {
 		t.Fatalf("create webhook receipt = %s", created)
 	}
+	// A fully configured command plan and credential still cannot use the
+	// workflow-only Flare provider. Assert the specific refusal, not a missing
+	// plan or receipt error that would also make an invalid fixture pass.
+	for name, args := range map[string]map[string]any{
+		"reactor_create_command_automation_webhook": {"name": "webhook-check", "version": plan.CurrentVersion, "credential_id": "cred-command-webhook", "provider": "flare-v1", "receipt_id": binding.ReceiptID, "gate_digest": binding.GateDigest},
+		"reactor_update_command_automation_webhook": {"webhook_id": decodedCreate.Webhook.ID, "credential_id": "cred-command-webhook", "provider": "flare-v1", "receipt_id": binding.ReceiptID, "gate_digest": binding.GateDigest, "expected_revision": 1},
+	} {
+		body, _ := json.Marshal(args)
+		_, err := srv.tools[name].handler(context.Background(), body)
+		if err == nil || !strings.Contains(err.Error(), "unsupported webhook provider") {
+			t.Fatalf("%s Flare refusal=%v", name, err)
+		}
+	}
 	listed := callOperationalTool(t, srv, "reactor_list_command_automation_webhooks", map[string]any{}, false)
 	listText := string(listed)
 	if strings.Contains(listText, decodedCreate.Webhook.Token) || strings.Contains(listText, "cred-command-webhook") || strings.Contains(listText, "cmd-webhook-key") {

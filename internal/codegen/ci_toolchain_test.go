@@ -9,8 +9,10 @@ import (
 )
 
 var (
-	dockerGoRe = regexp.MustCompile(`FROM[^\n]*golang:([0-9]+\.[0-9]+\.[0-9]+)-alpine`)
-	ciGoRe     = regexp.MustCompile(`go-version:\s*"([^"]+)"`)
+	dockerGoRe   = regexp.MustCompile(`FROM[^\n]*golang:([0-9]+\.[0-9]+\.[0-9]+)-alpine`)
+	ciGoRe       = regexp.MustCompile(`go-version:\s*"([^"]+)"`)
+	toolchainRe  = regexp.MustCompile(`(?m)^toolchain go([0-9]+\.[0-9]+\.[0-9]+)$`)
+	sdkMinimumRe = regexp.MustCompile(`(?m)^go ([0-9]+\.[0-9]+\.[0-9]+)$`)
 )
 
 // TestCIGoVersionMatchesDockerfile turns a two-file invariant into a test.
@@ -39,10 +41,26 @@ func TestCIGoVersionMatchesDockerfile(t *testing.T) {
 		t.Fatalf("read Dockerfile: %v", err)
 	}
 	matches := dockerGoRe.FindAllStringSubmatch(string(raw), -1)
-	if len(matches) == 0 {
-		t.Fatal("no golang:X.Y.Z-alpine FROM found in the Dockerfile; update this guard if the base image changed")
+	if len(matches) != 2 {
+		t.Fatal("Dockerfile must contain both the daemon and workflow compiler stages")
 	}
 	want := matches[0][1]
+	for _, pin := range []struct {
+		path    string
+		pattern *regexp.Regexp
+	}{
+		{"go.mod", toolchainRe},
+		{"packaging/sdk-module.mod", sdkMinimumRe},
+	} {
+		body, err := os.ReadFile(filepath.Join(root, pin.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pins := pin.pattern.FindAllStringSubmatch(string(body), -1)
+		if len(pins) != 1 || pins[0][1] != want {
+			t.Fatalf("%s must pin the Docker compiler %s", pin.path, want)
+		}
+	}
 	for _, m := range matches[1:] {
 		if m[1] != want {
 			t.Fatalf("the Dockerfile's own stages disagree: %s vs %s (the runtime stage compiles user workflows; both must carry the patched stdlib)", want, m[1])
@@ -56,22 +74,24 @@ func TestCIGoVersionMatchesDockerfile(t *testing.T) {
 	if len(workflows) == 0 {
 		t.Fatal("no workflow files found; update this guard if CI moved")
 	}
-	checked := 0
 	for _, wf := range workflows {
 		body, rerr := os.ReadFile(wf)
 		if rerr != nil {
 			t.Fatalf("read %s: %v", wf, rerr)
 		}
-		for _, m := range ciGoRe.FindAllStringSubmatch(string(body), -1) {
-			checked++
+		pins := ciGoRe.FindAllStringSubmatch(string(body), -1)
+		if len(pins) == 0 {
+			t.Fatalf("%s has no explicit Go provisioning; a sibling workflow's pin cannot cover it", filepath.Base(wf))
+		}
+		if strings.Contains(string(body), "go-version-file:") || strings.Contains(string(body), "GOTOOLCHAIN:") || strings.Contains(string(body), "GOTOOLCHAIN=") || strings.Contains(string(body), "container:") {
+			t.Fatalf("%s introduces another Go provisioning or override path; review this guard before using it", filepath.Base(wf))
+		}
+		for _, m := range pins {
 			if m[1] != want {
 				t.Fatalf("%s pins go-version %q but the Dockerfile pins %q; release artifacts would ship a different stdlib than the image, and an OLDER CI toolchain fails silently green",
 					filepath.Base(wf), m[1], want)
 			}
 		}
-	}
-	if checked == 0 {
-		t.Fatal("no go-version pin found in any workflow; this guard would pass vacuously")
 	}
 }
 

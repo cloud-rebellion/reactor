@@ -67,6 +67,11 @@ func newTestReceiver(t *testing.T, secretValue string) (*Receiver, *captureDispa
 }
 
 func newTestReceiverForProvider(t *testing.T, secretValue, provider string) (*Receiver, *captureDispatcher, *journal.Journal, string) {
+	r, d, j, token, _, _ := newTestReceiverForProviderWithDB(t, secretValue, provider)
+	return r, d, j, token
+}
+
+func newTestReceiverForProviderWithDB(t *testing.T, secretValue, provider string) (*Receiver, *captureDispatcher, *journal.Journal, string, *sql.DB, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -118,7 +123,7 @@ func newTestReceiverForProvider(t *testing.T, secretValue, provider string) (*Re
 		Log:     silent,
 		Now:     func() time.Time { return time.Unix(1_700_000_000, 0) },
 	}
-	return r, disp, j, tokenID
+	return r, disp, j, tokenID, db, dbPath
 }
 
 func bytesN(n int, b byte) []byte {
@@ -935,7 +940,7 @@ func TestAutomationDeliveryStatusRejectsAmbiguityAndUnboundRuns(t *testing.T) {
 
 func TestSupportedWebhookProvidersAreExplicit(t *testing.T) {
 	t.Parallel()
-	for _, provider := range []string{ProviderAutomationV1, ProviderHashV1, "generic", "github", "stripe"} {
+	for _, provider := range []string{ProviderAutomationV1, ProviderFlareV1, ProviderHashV1, "generic", "github", "stripe"} {
 		if !IsSupportedProvider(provider) {
 			t.Errorf("provider %q should be supported", provider)
 		}

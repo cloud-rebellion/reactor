@@ -35,7 +35,7 @@ Reactor upgraded. The vendor unit and release-matched SDK module were updated.
 Check systemctl is-enabled reactor and systemctl is-active reactor. If this is
 the first upgrade from an older package, its old removal hook may have stopped
 and disabled the unit; restore its previous intended state manually.
-Go 1.26.6+ must remain available at /usr/local/go/bin/go or /usr/bin/go for
+Go 1.26.9+ must remain available at /usr/local/go/bin/go or /usr/bin/go for
 MCP/dashboard workflow authoring. See /usr/share/doc/reactor/DEPLOY.md.
 EOF
     exit 0
@@ -54,7 +54,7 @@ REACTOR_BASIC_AUTH_PASSWORD_SHA256. Then start the unit:
   sudo systemctl enable --now reactor
 
 See /usr/share/doc/reactor/DEPLOY.md for the full walkthrough.
-MCP/dashboard workflow authoring also needs Go 1.26.6+ installed at
+MCP/dashboard workflow authoring also needs Go 1.26.9+ installed at
 /usr/local/go/bin/go or /usr/bin/go. The matching SDK module is included at
 /usr/lib/reactor-sdk; workflow builds will not fetch missing tools online.
 EOF

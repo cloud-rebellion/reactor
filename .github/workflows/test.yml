@@ -17,7 +17,7 @@ jobs:
           # specific stdlib CVE fix, and a CI toolchain older than it builds
           # green against a stdlib the shipped artifacts do not have.
           # Guarded by TestCIGoVersionMatchesDockerfile.
-          go-version: "1.26.6"
+          go-version: "1.26.9"
           cache: true
 
       - name: go vet

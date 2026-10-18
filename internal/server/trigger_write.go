@@ -132,6 +132,15 @@ func (s *Server) createWebhookTrigger(w http.ResponseWriter, r *http.Request, sl
 		http.Error(w, "unsupported webhook provider", http.StatusBadRequest)
 		return
 	}
+	projectID := strings.TrimSpace(r.PostFormValue("flare_project_id"))
+	if provider == webhook.ProviderFlareV1 && !webhook.ValidFlareProjectID(projectID) {
+		http.Error(w, "flare-v1 requires a valid Flare project ID", http.StatusBadRequest)
+		return
+	}
+	if provider != webhook.ProviderFlareV1 && projectID != "" {
+		http.Error(w, "Flare project ID requires flare-v1", http.StatusBadRequest)
+		return
+	}
 	syncRequested := r.PostFormValue("sync") == "on"
 	if err := validateWebhookTriggerMode(provider, syncRequested); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -177,6 +186,9 @@ func (s *Server) createWebhookTrigger(w http.ResponseWriter, r *http.Request, sl
 	}
 
 	cfgMap := map[string]any{"created_by": "dashboard"}
+	if provider == webhook.ProviderFlareV1 {
+		cfgMap["flare_project_id"] = projectID
+	}
 	if syncRequested {
 		// Synchronous: the webhook waits for the run + returns its output.
 		cfgMap["sync"] = true
@@ -256,7 +268,7 @@ func withRollbackError(cause, rollbackErr error) error {
 }
 
 func validateWebhookTriggerMode(provider string, synchronous bool) error {
-	if (provider == webhook.ProviderAutomationV1 || provider == webhook.ProviderHashV1) && synchronous {
+	if (provider == webhook.ProviderAutomationV1 || provider == webhook.ProviderFlareV1 || provider == webhook.ProviderHashV1) && synchronous {
 		return fmt.Errorf("%s webhooks must be asynchronous so producers receive a quick durable run receipt", provider)
 	}
 	return nil
@@ -330,6 +342,10 @@ curl -X POST http://127.0.0.1:7777/webhook/$TOKEN \
 				template.HTMLEscapeString(d.NewWebhookSecret),
 				template.HTMLEscapeString(d.NewWebhookToken),
 			)
+		} else if d.NewWebhookProvider == webhook.ProviderFlareV1 {
+			b.WriteString(`<p><strong>Flare handoff:</strong> Add an <code>automation_webhook</code> channel in Flare for this trigger's bound project. Use the exact provider-bound public HTTPS URL and this one-time signing secret verbatim. A signed <code>test</code> confirms the connection without starting a workflow.</p>`)
+			fmt.Fprintf(&b, `<pre>{"type":"automation_webhook","config":{"url":"https://YOUR_REACTOR_HOST/webhook/flare/%s","signing_secret":"%s"}}</pre>`,
+				template.HTMLEscapeString(d.NewWebhookToken), template.HTMLEscapeString(d.NewWebhookSecret))
 		} else if d.NewWebhookProvider == webhook.ProviderHashV1 {
 			b.WriteString(`<p><strong>Hash handoff:</strong> Reactor's generated <code>SECRET</code> below is temporary; Hash does not adopt it. Register this trigger's <code>/webhook/TOKEN</code> URL in Hash, capture Hash's one-time endpoint <code>secret</code>, then open the backing credential link above and use <strong>Manual update</strong> to replace the value with those exact 64 ASCII-hex bytes. Do not decode the value or put it in a URL, source file, or log. Send a Hash test event after the update.</p>`)
 			fmt.Fprintf(&b, `<pre>SECRET=%s
@@ -453,8 +469,9 @@ func renderAddTriggerSection(sl, actionQuery string) string {
 	// Webhook panel.
 	fmt.Fprintf(&b, `<div class="trig-panel" id="panel-webhook"><form method="POST" action="/workflows/%s/triggers%s" class="form">
   <input type="hidden" name="kind" value="webhook">
-  <label>Provider <select name="provider"><option value="generic">generic (X-Webhook-Signature sha256=hex)</option><option value="automation-v1">automation-v1 (timestamp + delivery + body)</option><option value="hash-v1">hash-v1 (Hash lifecycle callbacks)</option><option value="github">github (X-Hub-Signature-256)</option><option value="stripe">stripe (Stripe-Signature t=...,v1=...)</option></select></label>
-  <label class="form-inline"><input type="checkbox" name="sync"> Synchronous: wait for the run and return its result to the caller (not available for automation-v1 or hash-v1)</label>
+  <label>Provider <select name="provider"><option value="generic">generic (X-Webhook-Signature sha256=hex)</option><option value="automation-v1">automation-v1 (timestamp + delivery + body)</option><option value="flare-v1">flare-v1 (signed Flare notice)</option><option value="hash-v1">hash-v1 (Hash lifecycle callbacks)</option><option value="github">github (X-Hub-Signature-256)</option><option value="stripe">stripe (Stripe-Signature t=...,v1=...)</option></select></label>
+  <label>Flare project ID (required for flare-v1) <input type="text" name="flare_project_id" maxlength="128" autocomplete="off"></label>
+  <label class="form-inline"><input type="checkbox" name="sync"> Synchronous: wait for the run and return its result to the caller (not available for automation-v1, flare-v1, or hash-v1)</label>
   <label>Sync timeout <input type="number" name="sync_timeout" min="1" max="120" value="30"> seconds (max 120)</label>
   <p class="muted">Generates a public token + an actual 64-character HMAC key (use it verbatim; do not hex-decode it). Both land in the vault as a new credential the rotation engine can roll later. Synchronous responses return JSON {run_id, status, output} where output is the last step's data.</p>
   <button type="submit" class="btn-primary">Create webhook trigger</button>
@@ -539,7 +556,19 @@ func cronBuilderMarkup() string {
 func triggerDetailCell(t journal.Trigger) string {
 	switch t.Kind {
 	case journal.TriggerWebhook:
-		return `<code>POST /webhook/` + template.HTMLEscapeString(t.TokenID) + `</code>`
+		path := "/webhook/"
+		if t.Provider == webhook.ProviderFlareV1 {
+			path += "flare/"
+		}
+		out := `<code>POST ` + path + template.HTMLEscapeString(t.TokenID) + `</code>`
+		if t.Provider == webhook.ProviderFlareV1 {
+			var cfg struct {
+				ProjectID string `json:"flare_project_id"`
+			}
+			_ = json.Unmarshal(t.Config, &cfg)
+			out += ` <span class="muted">Flare project: </span><code>` + template.HTMLEscapeString(cfg.ProjectID) + `</code>`
+		}
+		return out
 	case journal.TriggerCron:
 		var cfg struct {
 			Spec     string `json:"spec"`

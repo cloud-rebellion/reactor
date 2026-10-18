@@ -1,0 +1,9 @@
+{
+  "slug": "{{.Slug}}",
+  "version": "0.1.0",
+  "triggers": [{"kind": "webhook", "provider": "flare-v1"}],
+  "steps": [
+    {"name": "flare-fresh-triage", "kind": "step", "idempotency_key": "notice.delivery_key", "timeout_seconds": 65},
+    {"name": "flare-confirm-draft", "kind": "step", "depends_on": ["flare-fresh-triage"], "idempotency_key": "notice.delivery_key", "timeout_seconds": 10, "retry": {"base_ms": 250, "max_ms": 1000, "attempts": 4}}
+  ]
+}

@@ -17,7 +17,12 @@ build a Docker image or sign/attest release artifacts; verify the exact image
 and release provenance separately before promotion. The Homebrew wrapper pins
 `REACTOR_SDK_REPLACE` to its installed SDK module and adds its Go dependency to
 `PATH`, so MCP authoring can compile offline. Native Linux packages still
-require an operator-installed Go 1.26.5+ toolchain.
+require an operator-installed Go 1.26.9+ toolchain.
+The daemon build and Docker workflow compiler use the same immutable Go 1.26.9
+Alpine image. Stage selects its scanner from the exact committed module and
+complete Docker recipe. The 2026-10-18 Linux/amd64 source scan found 11 reachable
+standard-library advisories with Go 1.26.6 and none with Go 1.26.9; exact managed
+CI, the built image and deployment still need their own release evidence.
 The release attaches the rendered Homebrew formula, but tap publication and
 automatic formula upgrades are not configured yet.
 

@@ -14,6 +14,7 @@ Reactor ships every doc with the binary. The dashboard renders them at `/docs`; 
 - **[Notifications](/docs/notifications)** - Slack + generic JSON webhook + SMTP email senders, per-workflow routing, per-channel test button.
 - **[Workflow chaining](/docs/chaining)** - fire workflow B when workflow A terminates; payload shape; fanout + diamond patterns.
 - **[Hash e-signature bridge](/docs/hash-esign-bridge)** - standalone and CRM webhook architecture, canonical event, Google Apps Script edge adapter, and launch requirements.
+- **[Flare incident delivery](/docs/flare-automation)** - signed project binding, trigger setup, asynchronous receipts, replay and release acceptance.
 - **[Teams, users, sessions, API tokens](/docs/teams)** - auth schema, password hashing, session middleware, RBAC, mint/revoke flow.
 
 ## Operating reactor
