@@ -1,0 +1,142 @@
+name: public nFPM qualification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - packaging/nfpm.yaml
+      - .github/workflows/public-nfpm-qualification.yml
+
+permissions:
+  contents: read
+
+jobs:
+  public-nfpm-packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+      PUBLIC_BASE: 47551a302ddc02b882c337de673325d8631d5293
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove public source and exact two-path qualification delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git merge-base "$PUBLIC_BASE" HEAD)" = "$PUBLIC_BASE"
+          python3 - <<'PY'
+          import os, subprocess
+          changed=set(subprocess.check_output(['git','diff','--name-only',os.environ['PUBLIC_BASE'],'HEAD'],text=True).splitlines())
+          assert changed=={'packaging/nfpm.yaml','.github/workflows/public-nfpm-qualification.yml'},changed
+          PY
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.10'
+          cache: true
+
+      - name: Build the actual public binaries and original public offline SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          mkdir -p dist "$RUNNER_TEMP/nfpm-qualification"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags '-s -w -X main.Version=qualification' -o "dist/reactor-qualification-linux-$arch" ./cmd/reactor
+          done
+          for script in packaging/scripts/stage-sdk-module.sh packaging/scripts/verify-sdk-module.sh packaging/scripts/postinstall.sh packaging/scripts/preremove.sh packaging/scripts/preremove_test.sh; do
+            sh -n "$script"
+          done
+          packaging/scripts/preremove_test.sh
+          packaging/scripts/stage-sdk-module.sh dist/reactor-sdk
+          packaging/scripts/verify-sdk-module.sh dist/reactor-sdk
+
+      - name: Install the exact release packager and package inspection tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/nfpm-bin"
+          GOBIN="$RUNNER_TEMP/nfpm-bin" go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.39.0
+          "$RUNNER_TEMP/nfpm-bin/nfpm" --version
+          sudo apt-get update -qq
+          sudo apt-get install -y rpm cpio
+
+      - name: Reproduce both original package configuration defects
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show "$PUBLIC_BASE:packaging/nfpm.yaml" > "$RUNNER_TEMP/nfpm-qualification/original.yaml"
+          if REACTOR_VERSION=0.0.0-qualification REACTOR_ARCH=amd64 REACTOR_BINARY=dist/reactor-qualification-linux-amd64 \
+            "$RUNNER_TEMP/nfpm-bin/nfpm" pkg --packager deb --config "$RUNNER_TEMP/nfpm-qualification/original.yaml" --target "$RUNNER_TEMP/nfpm-qualification/original.deb" \
+            > "$RUNNER_TEMP/nfpm-qualification/original.log" 2>&1; then
+            echo 'Original unexpanded source unexpectedly packaged' >&2
+            exit 1
+          fi
+          grep -F '${REACTOR_BINARY}' "$RUNNER_TEMP/nfpm-qualification/original.log"
+          python3 - <<'PY'
+          import os,pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'nfpm-qualification'
+          text=(root/'original.yaml').read_text()
+          assert text.count('  - src: ${REACTOR_BINARY}\n')==1
+          (root/'expand-only.yaml').write_text(text.replace('  - src: ${REACTOR_BINARY}\n','  - src: ${REACTOR_BINARY}\n    expand: true\n'))
+          PY
+          REACTOR_VERSION=0.0.0-qualification REACTOR_ARCH=arm64 REACTOR_BINARY=dist/reactor-qualification-linux-arm64 \
+            "$RUNNER_TEMP/nfpm-bin/nfpm" pkg --packager deb --config "$RUNNER_TEMP/nfpm-qualification/expand-only.yaml" --target "$RUNNER_TEMP/nfpm-qualification/expand-only.deb"
+          test "$(dpkg-deb --field "$RUNNER_TEMP/nfpm-qualification/expand-only.deb" Architecture)" = amd64
+          mkdir "$RUNNER_TEMP/nfpm-qualification/expand-only-extract"
+          dpkg-deb --extract "$RUNNER_TEMP/nfpm-qualification/expand-only.deb" "$RUNNER_TEMP/nfpm-qualification/expand-only-extract"
+          cmp dist/reactor-qualification-linux-arm64 "$RUNNER_TEMP/nfpm-qualification/expand-only-extract/usr/bin/reactor"
+          echo 'Baseline reproduced: explicit arm64 binary was mislabeled amd64 by shell-style architecture interpolation.'
+
+      - name: Build and inspect corrected deb and rpm for both real architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            mkdir -p "$RUNNER_TEMP/nfpm-qualification/$arch"
+            for fmt in deb rpm; do
+              REACTOR_VERSION=0.0.0-qualification REACTOR_ARCH="$arch" REACTOR_BINARY="dist/reactor-qualification-linux-$arch" \
+                "$RUNNER_TEMP/nfpm-bin/nfpm" pkg --packager "$fmt" --config packaging/nfpm.yaml --target "$RUNNER_TEMP/nfpm-qualification/$arch/package.$fmt"
+            done
+            mkdir "$RUNNER_TEMP/nfpm-qualification/$arch/deb-extract" "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract"
+            dpkg-deb --extract "$RUNNER_TEMP/nfpm-qualification/$arch/package.deb" "$RUNNER_TEMP/nfpm-qualification/$arch/deb-extract"
+            (cd "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract" && rpm2cpio "../package.rpm" | cpio --extract --make-directories --quiet --no-absolute-filenames)
+            for fmt in deb rpm; do
+              extracted="$RUNNER_TEMP/nfpm-qualification/$arch/$fmt-extract"
+              test -x "$extracted/usr/bin/reactor"
+              cmp "dist/reactor-qualification-linux-$arch" "$extracted/usr/bin/reactor"
+              packaging/scripts/verify-sdk-module.sh "$extracted/usr/lib/reactor-sdk"
+              cmp deploy/reactor.service "$extracted/lib/systemd/system/reactor.service"
+            done
+          done
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,struct,subprocess
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'nfpm-qualification'
+          results=[]
+          for arch,rpmarch,machine in [('amd64','x86_64',62),('arm64','aarch64',183)]:
+              for fmt in ['deb','rpm']:
+                  package=root/arch/('package.'+fmt)
+                  command=['dpkg-deb','--field',str(package),'Architecture'] if fmt=='deb' else ['rpm','-qp','--queryformat','%{ARCH}',str(package)]
+                  observed=subprocess.check_output(command,text=True).strip()
+                  assert observed==(arch if fmt=='deb' else rpmarch),(arch,fmt,observed)
+                  binary=root/arch/(fmt+'-extract')/'usr/bin/reactor'
+                  data=binary.read_bytes()
+                  assert data[:6]==b'\x7fELF\x02\x01' and struct.unpack('<H',data[18:20])[0]==machine
+                  results.append({'architecture':arch,'format':fmt,'package_architecture':observed,'elf_machine':machine,'binary_sha256':hashlib.sha256(data).hexdigest(),'package_bytes':package.stat().st_size,'package_sha256':hashlib.sha256(package.read_bytes()).hexdigest()})
+          report={'public_base':os.environ['PUBLIC_BASE'],'qualification_head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'go_version':subprocess.check_output(['go','version'],text=True).strip(),'nfpm_version':'2.39.0','original_src_refusal_reproduced':True,'original_arm64_mislabeled_amd64_reproduced':True,'config_sha256':hashlib.sha256(pathlib.Path('packaging/nfpm.yaml').read_bytes()).hexdigest(),'packages':results,'release_or_installation':False,'private_source_export':False}
+          target=root/'PACKAGE-QUALIFICATION.json';target.write_text(json.dumps(report,indent=2)+'\n')
+          assert target.stat().st_size<65536
+          print(target.read_text())
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-nfpm-qualification-report
+          path: ${{ runner.temp }}/nfpm-qualification/PACKAGE-QUALIFICATION.json
+          if-no-files-found: error
+          retention-days: 3
