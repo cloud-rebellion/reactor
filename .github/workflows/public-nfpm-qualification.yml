@@ -65,6 +65,7 @@ jobs:
           "$RUNNER_TEMP/nfpm-bin/nfpm" --version
           sudo apt-get update -qq
           sudo apt-get install -y rpm cpio
+          command -v rpm2archive
 
       - name: Reproduce both original package configuration defects
         shell: bash
@@ -109,22 +110,28 @@ jobs:
             done
             mkdir "$RUNNER_TEMP/nfpm-qualification/$arch/deb-extract" "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract"
             dpkg-deb --extract "$RUNNER_TEMP/nfpm-qualification/$arch/package.deb" "$RUNNER_TEMP/nfpm-qualification/$arch/deb-extract"
-            if rpm2cpio "$RUNNER_TEMP/nfpm-qualification/$arch/package.rpm" > "$RUNNER_TEMP/nfpm-qualification/$arch/package.cpio"; then
-              producer_status=0
-            else
-              producer_status=$?
-            fi
-            if (cd "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract" && cpio --extract --make-directories --quiet --no-absolute-filenames < "../package.cpio"); then
-              consumer_status=0
-            else
-              consumer_status=$?
-            fi
-            printf 'RPM extraction producer=%s consumer=%s archive_bytes=%s\n' "$producer_status" "$consumer_status" "$(stat -c %s "$RUNNER_TEMP/nfpm-qualification/$arch/package.cpio")"
-            if test -f "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract/usr/bin/reactor"; then
-              stat -c '%a %s %n' "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract/usr/bin/reactor"
-            fi
-            test "$producer_status" -eq 0
-            test "$consumer_status" -eq 0
+            rpm -qp --queryformat 'RPM architecture=%{ARCH} payload_size=%{LONGARCHIVESIZE}\n' "$RUNNER_TEMP/nfpm-qualification/$arch/package.rpm"
+            rpm2archive --nocompression - < "$RUNNER_TEMP/nfpm-qualification/$arch/package.rpm" > "$RUNNER_TEMP/nfpm-qualification/$arch/package.tar"
+            QUAL_RPM_ARCHIVE="$RUNNER_TEMP/nfpm-qualification/$arch/package.tar" QUAL_RPM_ROOT="$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract" python3 - <<'PY'
+          import os,pathlib,tarfile
+          archive=pathlib.Path(os.environ['QUAL_RPM_ARCHIVE'])
+          target=pathlib.Path(os.environ['QUAL_RPM_ROOT'])
+          assert target.is_dir() and not target.is_symlink() and not list(target.iterdir())
+          assert archive.stat().st_size<=128*1024*1024
+          with tarfile.open(archive,mode='r:') as source:
+              members=source.getmembers()
+              assert all(0<=m.size<=128*1024*1024 for m in members)
+              assert 0<len(members)<=10000 and sum(m.size for m in members)<=128*1024*1024
+              names=set()
+              for member in members:
+                  path=pathlib.PurePosixPath(member.name)
+                  assert not path.is_absolute() and '..' not in path.parts
+                  assert member.isfile() or member.isdir()
+                  assert str(path) not in names
+                  names.add(str(path))
+              source.extractall(target,members=members,filter='data')
+          print('Strict RPM archive extraction passed:',len(members),'members')
+          PY
             for fmt in deb rpm; do
               extracted="$RUNNER_TEMP/nfpm-qualification/$arch/$fmt-extract"
               stat -c '%a %s %n' "$extracted/usr/bin/reactor"
