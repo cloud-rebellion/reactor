@@ -109,7 +109,22 @@ jobs:
             done
             mkdir "$RUNNER_TEMP/nfpm-qualification/$arch/deb-extract" "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract"
             dpkg-deb --extract "$RUNNER_TEMP/nfpm-qualification/$arch/package.deb" "$RUNNER_TEMP/nfpm-qualification/$arch/deb-extract"
-            (cd "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract" && rpm2cpio "../package.rpm" | cpio --extract --make-directories --quiet --no-absolute-filenames)
+            if rpm2cpio "$RUNNER_TEMP/nfpm-qualification/$arch/package.rpm" > "$RUNNER_TEMP/nfpm-qualification/$arch/package.cpio"; then
+              producer_status=0
+            else
+              producer_status=$?
+            fi
+            if (cd "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract" && cpio --extract --make-directories --quiet --no-absolute-filenames < "../package.cpio"); then
+              consumer_status=0
+            else
+              consumer_status=$?
+            fi
+            printf 'RPM extraction producer=%s consumer=%s archive_bytes=%s\n' "$producer_status" "$consumer_status" "$(stat -c %s "$RUNNER_TEMP/nfpm-qualification/$arch/package.cpio")"
+            if test -f "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract/usr/bin/reactor"; then
+              stat -c '%a %s %n' "$RUNNER_TEMP/nfpm-qualification/$arch/rpm-extract/usr/bin/reactor"
+            fi
+            test "$producer_status" -eq 0
+            test "$consumer_status" -eq 0
             for fmt in deb rpm; do
               extracted="$RUNNER_TEMP/nfpm-qualification/$arch/$fmt-extract"
               stat -c '%a %s %n' "$extracted/usr/bin/reactor"
