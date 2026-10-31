@@ -7,7 +7,7 @@ go 1.25.10
 // commit; GOTOOLCHAIN=local makes the actual image/compiler pin authoritative.
 // A 2026-10-18 Linux/amd64 source scan found 11 reachable stdlib advisories with
 // Go 1.26.6 and none with Go 1.26.9. Keep public release and packaged SDK pins aligned.
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc
@@ -22,6 +22,7 @@ require (
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
+	gopkg.in/yaml.v3 v3.0.1 // test-only package manifest parsing; existing transitive module
 	modernc.org/sqlite v1.50.0
 )
 

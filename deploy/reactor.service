@@ -29,7 +29,7 @@ EnvironmentFile=-/etc/reactor/reactor.env
 EnvironmentFile=-/var/lib/reactor/reactor.env
 # Native packages bundle the SDK module used by MCP/dashboard workflow builds.
 # The state env file is writable by the reactor user, so pin the module path
-# in ExecStart after that file is loaded. Go 1.26.9+ must be installed on PATH.
+# in ExecStart after that file is loaded. Go 1.26.10+ must be installed on PATH.
 # nfpm installs the release binary at /usr/bin/reactor. Keep the manual
 # walkthrough on the same canonical path so package installs can start the
 # exact unit they ship.

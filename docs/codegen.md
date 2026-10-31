@@ -56,7 +56,7 @@ the same lens + validator + retry chain.
    > `/usr/lib/reactor-sdk`, and their systemd unit pins
    > `REACTOR_SDK_REPLACE` to that directory. Manual binary or development
    > installs need `REACTOR_SDK_REPLACE=/path/to/reactor` pointing at matching
-   > source. Go 1.26.9+ must be on the daemon's PATH. Builds use
+   > source. Go 1.26.10+ must be on the daemon's PATH. Builds use
    > `GOPROXY=off` and `GOTOOLCHAIN=local`; a missing local SDK or toolchain
    > cannot be downloaded during authoring.
 6. **Retry on failure.** Up to MaxRetries (default 3) more rounds with

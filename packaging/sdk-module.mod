@@ -1,3 +1,3 @@
 module github.com/bright-interaction/reactor
 
-go 1.26.9
+go 1.26.10

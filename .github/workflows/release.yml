@@ -31,7 +31,7 @@ jobs:
           # specific stdlib CVE fix, and a CI toolchain older than it builds
           # green against a stdlib the shipped artifacts do not have.
           # Guarded by TestCIGoVersionMatchesDockerfile.
-          go-version: "1.26.9"
+          go-version: "1.26.10"
           cache: true
 
       - name: build
@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.9"
+          go-version: "1.26.10"
           cache: true
       - uses: actions/download-artifact@v4
         with:
@@ -120,10 +120,31 @@ jobs:
           done
           for rpm_pkg in dist/*.rpm; do
             extracted=$(mktemp -d)
-            (cd "$extracted" && rpm2cpio "$GITHUB_WORKSPACE/$rpm_pkg" | cpio --extract --make-directories --quiet)
+            archive=$(mktemp)
+            rpm2archive --nocompression - < "$GITHUB_WORKSPACE/$rpm_pkg" > "$archive"
+            QUAL_RPM_ARCHIVE="$archive" QUAL_RPM_ROOT="$extracted" python3 - <<'PYSDK'
+          import os,pathlib,tarfile
+          archive=pathlib.Path(os.environ['QUAL_RPM_ARCHIVE'])
+          target=pathlib.Path(os.environ['QUAL_RPM_ROOT'])
+          assert target.is_dir() and not target.is_symlink() and not list(target.iterdir())
+          assert archive.stat().st_size<=128*1024*1024
+          with tarfile.open(archive,mode='r:') as source:
+              members=source.getmembers()
+              assert all(0<=m.size<=128*1024*1024 for m in members)
+              assert 0<len(members)<=10000 and sum(m.size for m in members)<=128*1024*1024
+              names=set()
+              for member in members:
+                  path=pathlib.PurePosixPath(member.name)
+                  assert not path.is_absolute() and '..' not in path.parts
+                  assert member.isfile() or member.isdir()
+                  assert str(path) not in names
+                  names.add(str(path))
+              source.extractall(target,members=members,filter='data')
+          PYSDK
             test -x "$extracted/usr/bin/reactor"
             packaging/scripts/verify-sdk-module.sh "$extracted/usr/lib/reactor-sdk"
             chmod -R u+w "$extracted"
+            rm -f -- "$archive"
             rm -rf -- "$extracted"
           done
 

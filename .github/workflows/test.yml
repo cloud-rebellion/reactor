@@ -5,29 +5,41 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           # Must match the Dockerfile FROM tag: that pin exists to pick up a
           # specific stdlib CVE fix, and a CI toolchain older than it builds
           # green against a stdlib the shipped artifacts do not have.
           # Guarded by TestCIGoVersionMatchesDockerfile.
-          go-version: "1.26.9"
+          go-version: "1.26.10"
           cache: true
 
-      - name: go vet
-        run: go vet ./...
-
-      - name: go test
-        run: go test -race -count=1 -timeout=180s ./...
-
-      - name: go build
-        run: go build -o bin/reactor ./cmd/reactor
+      - name: Original Go vet, executed race tests, and binary build under isolated CI UID
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test_ci_uid.py
+          mkdir -p "$(go env GOCACHE)" "$(go env GOPATH)"
+          bun_args=(--bun-absent)
+          if bun=$(command -v bun); then bun_args=(--bun "$bun"); fi
+          sudo -n /usr/bin/python3 scripts/ci-uid.py --execute --mode legacy \
+            --workspace "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --runner-temp "$RUNNER_TEMP" --go-cache "$(go env GOCACHE)" \
+            --gopath "$(go env GOPATH)" --go "$(command -v go)" \
+            --tool-path "$PATH" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            "${bun_args[@]}"
 
       # The Dockerfile pins its Go version to pick up specific stdlib CVE
       # fixes. Without this step nothing in the public CI ever checks whether
