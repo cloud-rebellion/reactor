@@ -279,10 +279,9 @@ func newTestServer(t *testing.T, withDispatch bool) (*Server, *journal.Journal, 
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "m.db")
-	url := "sqlite://" + dbPath
 	silent := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := migrate.Up(context.Background(), silent, url); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := writePristineTestSQLite(dbPath); err != nil {
+		t.Fatalf("pristine migrated fixture: %v", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {

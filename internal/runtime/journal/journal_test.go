@@ -5,11 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"path/filepath"
 	"testing"
 
-	"github.com/bright-interaction/reactor/internal/migrate"
 	_ "modernc.org/sqlite"
 )
 
@@ -17,11 +15,8 @@ func newTestJournal(t *testing.T) (*Journal, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "j.db")
-	url := "sqlite://" + dbPath
-
-	log := slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	if err := migrate.Up(context.Background(), log, url); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := writePristineTestSQLite(dbPath); err != nil {
+		t.Fatalf("pristine migrated fixture: %v", err)
 	}
 
 	db, err := sql.Open("sqlite", dbPath)
