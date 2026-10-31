@@ -299,4 +299,142 @@ class UIDControllerTests(unittest.TestCase):
         with mock.patch.object(s.subprocess,'run',return_value=result):
             with self.assertRaisesRegex(RuntimeError,'^fixed_command_failed:fixed:exit=10$'):s.command(['/unrecognized/private/tool','private argument'])
 
+    def test_observer_records_sampled_peak_without_a_new_limit(self):
+        sampled=s.threading.Event();values=iter((3,80,7))
+        def sample(uid):
+            self.assertEqual(uid,s.UID)
+            value=next(values,7)
+            if value==7:sampled.set()
+            return value
+        with mock.patch.object(s,'tasks_for_uid',side_effect=sample),mock.patch.object(s.UIDThreadObservation,'INTERVAL_SECONDS',0.001):
+            observation=s.UIDThreadObservation();observation.start()
+            try:self.assertTrue(sampled.wait(1))
+            finally:proof=observation.stop()
+        self.assertTrue(proof['observer_joined']);self.assertGreaterEqual(proof['successful_samples'],3)
+        self.assertEqual(proof['sampled_peak_uid_threads'],80)
+        self.assertTrue(proof['complete_sample_window']);self.assertTrue(proof['sampled_estimate_only'])
+        self.assertFalse(proof['enforcement_or_admission_changed'])
+        self.assertEqual(observation.stop(),proof)
+
+    def test_observer_read_error_is_explicit_and_exposes_no_process_details(self):
+        observed=s.threading.Event()
+        def unreadable(uid):
+            observed.set();raise PermissionError('private process detail must not escape')
+        with mock.patch.object(s,'tasks_for_uid',side_effect=unreadable):
+            observation=s.UIDThreadObservation();observation.start()
+            try:self.assertTrue(observed.wait(1))
+            finally:proof=observation.stop()
+        self.assertTrue(proof['observer_joined']);self.assertFalse(proof['complete_sample_window'])
+        self.assertGreaterEqual(proof['read_errors'],1);self.assertEqual(proof['last_error_class'],'PermissionError')
+        self.assertNotIn('private',str(proof));self.assertIsNone(proof['sampled_peak_uid_threads'])
+
+    def test_unjoined_observer_never_reads_mutable_counters_or_claims_a_peak(self):
+        entered=s.threading.Event();release=s.threading.Event()
+        def stubborn(uid):
+            entered.set();release.wait(2);return 123
+        with mock.patch.object(s,'tasks_for_uid',side_effect=stubborn),mock.patch.object(s.UIDThreadObservation,'JOIN_SECONDS',0.001):
+            observation=s.UIDThreadObservation();observation.start()
+            try:
+                self.assertTrue(entered.wait(1));proof=observation.stop()
+                self.assertFalse(proof['observer_joined']);self.assertFalse(proof['complete_sample_window'])
+                for key in ('successful_samples','read_errors','last_error_class','sampled_peak_uid_threads'):self.assertIsNone(proof[key])
+            finally:
+                release.set();observation._thread.join(timeout=1)
+            self.assertFalse(observation._thread.is_alive())
+            self.assertEqual(observation.stop(),proof)
+
+    def test_observer_start_failure_cannot_prevent_the_fixed_ci_command(self):
+        result=types.SimpleNamespace(returncode=17)
+        with mock.patch.object(s.threading.Thread,'start',side_effect=RuntimeError('private startup detail')),mock.patch.object(s.subprocess,'run',return_value=result) as run,mock.patch.object(s,'save') as save,mock.patch('sys.stdout',new_callable=io.StringIO) as output:
+            self.assertIs(s.observed_unit_wait(['/fixed/systemd-run'],123,self.root,'legacy'),result)
+        self.assertEqual(run.call_count,1)
+        proof=save.call_args.args[1]
+        self.assertFalse(proof['complete_sample_window']);self.assertEqual(proof['observer_start_error_class'],'RuntimeError')
+        self.assertNotIn('private startup detail',output.getvalue())
+
+    def test_observation_preserves_exact_command_status_timeout_and_clean_environment(self):
+        result=types.SimpleNamespace(returncode=23)
+        with mock.patch.object(s,'tasks_for_uid',return_value=81),mock.patch.object(s.subprocess,'run',return_value=result) as run,mock.patch.object(s,'save') as save,mock.patch('sys.stdout',new_callable=io.StringIO):
+            self.assertIs(s.observed_unit_wait(['/fixed/systemd-run','fixed-arg'],456,self.root,'postgres'),result)
+        self.assertEqual(run.call_args.args[0],['/fixed/systemd-run','fixed-arg'])
+        self.assertEqual(run.call_args.kwargs,{'stdin':s.subprocess.DEVNULL,'timeout':456,'env':{'PATH':s.SYSTEM_PATH,'LC_ALL':'C'}})
+        self.assertEqual(save.call_args.args[0],self.root/'uid-thread-observation.json')
+        self.assertTrue(save.call_args.args[1]['native_unit_closure_still_required'])
+
+    def test_client_exception_is_not_swallowed_by_observation_or_proof_write_error(self):
+        failure=s.subprocess.TimeoutExpired(['/private/argument'],1)
+        with mock.patch.object(s,'tasks_for_uid',return_value=2),mock.patch.object(s.subprocess,'run',side_effect=failure),mock.patch.object(s,'save',side_effect=PermissionError('private write detail')),mock.patch('sys.stdout',new_callable=io.StringIO) as output:
+            with self.assertRaises(s.subprocess.TimeoutExpired) as raised:s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'all-checks')
+        self.assertIs(raised.exception,failure)
+        self.assertIn('PermissionError',output.getvalue());self.assertNotIn('private write detail',output.getvalue())
+        self.assertNotIn('/private/argument',output.getvalue())
+
+    def test_observation_write_failure_does_not_change_the_original_ci_status(self):
+        result=types.SimpleNamespace(returncode=0)
+        with mock.patch.object(s,'tasks_for_uid',return_value=2),mock.patch.object(s.subprocess,'run',return_value=result),mock.patch.object(s,'save',side_effect=OSError('private disk detail')),mock.patch('sys.stdout',new_callable=io.StringIO) as output:
+            self.assertIs(s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'all-checks'),result)
+        self.assertIn('"private_observation_saved": false',output.getvalue())
+        self.assertNotIn('private disk detail',output.getvalue())
+
+    def test_observer_rejects_invalid_samples_without_claiming_a_zero_peak(self):
+        observed=s.threading.Event()
+        def invalid(uid):
+            observed.set();return -1
+        with mock.patch.object(s,'tasks_for_uid',side_effect=invalid):
+            observation=s.UIDThreadObservation();observation.start()
+            try:self.assertTrue(observed.wait(1))
+            finally:proof=observation.stop()
+        self.assertFalse(proof['complete_sample_window']);self.assertEqual(proof['successful_samples'],0)
+        self.assertIsNone(proof['sampled_peak_uid_threads']);self.assertEqual(proof['last_error_class'],'RuntimeError')
+
+    def test_observer_constructor_and_start_exceptions_preserve_result_or_client_exception(self):
+        for phase in ('constructor','start'):
+            for timeout in (False,True):
+                with self.subTest(phase=phase,timeout=timeout),contextlib.ExitStack() as stack:
+                    result=types.SimpleNamespace(returncode=19)
+                    failure=s.subprocess.TimeoutExpired(['/private/argument'],1)
+                    if phase=='constructor':stack.enter_context(mock.patch.object(s,'UIDThreadObservation',side_effect=RuntimeError('private observer failure')))
+                    else:
+                        stack.enter_context(mock.patch.object(s.UIDThreadObservation,'start',side_effect=RuntimeError('private observer failure')))
+                        stack.enter_context(mock.patch.object(s.UIDThreadObservation,'stop',return_value=s.unavailable_observation('start','RuntimeError')))
+                    run=stack.enter_context(mock.patch.object(s.subprocess,'run',side_effect=failure if timeout else None,return_value=result))
+                    save=stack.enter_context(mock.patch.object(s,'save'))
+                    output=stack.enter_context(mock.patch('sys.stdout',new_callable=io.StringIO))
+                    if timeout:
+                        with self.assertRaises(s.subprocess.TimeoutExpired) as raised:s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy')
+                        self.assertIs(raised.exception,failure)
+                    else:self.assertIs(s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy'),result)
+                    self.assertEqual(run.call_count,1)
+                    self.assertFalse(save.call_args.args[1]['complete_sample_window'])
+                    self.assertNotIn('private observer failure',output.getvalue())
+
+    def test_observer_stop_exception_preserves_result_or_client_exception(self):
+        for timeout in (False,True):
+            with self.subTest(timeout=timeout):
+                result=types.SimpleNamespace(returncode=21);failure=s.subprocess.TimeoutExpired(['/private/argument'],1)
+                with mock.patch.object(s.UIDThreadObservation,'start'),mock.patch.object(s.UIDThreadObservation,'stop',side_effect=RuntimeError('private stop failure')),mock.patch.object(s.subprocess,'run',side_effect=failure if timeout else None,return_value=result),mock.patch.object(s,'save') as save,mock.patch('sys.stdout',new_callable=io.StringIO) as output:
+                    if timeout:
+                        with self.assertRaises(s.subprocess.TimeoutExpired) as raised:s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy')
+                        self.assertIs(raised.exception,failure)
+                    else:self.assertIs(s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy'),result)
+                self.assertEqual(save.call_args.args[1]['observation_error_phase'],'stop')
+                self.assertEqual(save.call_args.args[1]['observation_error_class'],'RuntimeError')
+                self.assertNotIn('private stop failure',output.getvalue())
+
+    def test_observer_serialization_or_output_exception_preserves_result_or_client_exception(self):
+        for phase in ('serialization','output'):
+            for timeout in (False,True):
+                with self.subTest(phase=phase,timeout=timeout),contextlib.ExitStack() as stack:
+                    result=types.SimpleNamespace(returncode=22);failure=s.subprocess.TimeoutExpired(['/private/argument'],1)
+                    stack.enter_context(mock.patch.object(s.UIDThreadObservation,'start'))
+                    stack.enter_context(mock.patch.object(s.UIDThreadObservation,'stop',return_value=s.unavailable_observation('synthetic','RuntimeError')))
+                    stack.enter_context(mock.patch.object(s.subprocess,'run',side_effect=failure if timeout else None,return_value=result))
+                    stack.enter_context(mock.patch.object(s,'save'))
+                    if phase=='serialization':stack.enter_context(mock.patch.object(s.json,'dumps',side_effect=TypeError('private serialization failure')))
+                    else:stack.enter_context(mock.patch('builtins.print',side_effect=BrokenPipeError('private output failure')))
+                    if timeout:
+                        with self.assertRaises(s.subprocess.TimeoutExpired) as raised:s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy')
+                        self.assertIs(raised.exception,failure)
+                    else:self.assertIs(s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy'),result)
+
 if __name__ == '__main__':unittest.main(verbosity=2)

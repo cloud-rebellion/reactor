@@ -21,6 +21,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 P = pathlib.Path
@@ -312,6 +313,139 @@ def inside(config_path):
     print(json.dumps({'result': 'isolated_ci_preflight_passed', 'mode': cfg['mode'], 'uid': UID, 'initial_uid_threads': initial_threads, 'caps_zero': True, 'source_sha': cfg['source_sha'], 'same_existing_cache_objects': True, 'bun_present': bool(cfg['bun'])}), flush=True)
     return subprocess.run(['/bin/bash', MODES[cfg['mode']][0]], stdin=subprocess.DEVNULL, env=env).returncode
 
+class UIDThreadObservation:
+    """Sample the existing fresh UID without imposing a new execution limit.
+
+    Peaks are non-atomic sampled estimates, not NPROC or cgroup enforcement.
+    Only this observer thread mutates counters; an unjoined observer never has
+    its mutable state read by the caller. No process details are retained.
+    """
+    INTERVAL_SECONDS = 1.0
+    JOIN_SECONDS = 2.0
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, name='reactor-ci-uid-observer', daemon=True)
+        self._samples = 0
+        self._errors = 0
+        self._peak = None
+        self._last_error = None
+        self._proof = None
+        self._started = time.monotonic()
+
+    def start(self):
+        try:
+            self._thread.start()
+        except Exception as error:
+            self._stop.set()
+            self._proof = {
+                'schema': 'reactor-ci-sampled-uid-threads-v1', 'uid': UID,
+                'window': 'systemd_run_wait_client',
+                'sample_interval_seconds': self.INTERVAL_SECONDS,
+                'observer_joined': False, 'successful_samples': None,
+                'read_errors': None, 'last_error_class': None,
+                'sampled_peak_uid_threads': None,
+                'complete_sample_window': False,
+                'observer_start_error_class': type(error).__name__,
+                'sampled_estimate_only': True, 'proc_scan_not_atomic': True,
+                'enforcement_or_admission_changed': False,
+                'native_unit_closure_still_required': True,
+            }
+
+    def _watch(self):
+        while not self._stop.is_set():
+            try:
+                count = tasks_for_uid(UID)
+                need(type(count) is int and count >= 0, 'invalid_uid_thread_sample')
+            except Exception as error:
+                self._errors += 1
+                self._last_error = type(error).__name__
+            else:
+                self._samples += 1
+                self._peak = count if self._peak is None else max(self._peak, count)
+            if self._stop.wait(self.INTERVAL_SECONDS):
+                return
+
+    def stop(self):
+        if self._proof is not None:
+            return dict(self._proof)
+        self._stop.set()
+        self._thread.join(timeout=self.JOIN_SECONDS)
+        joined = not self._thread.is_alive()
+        # Never copy worker-owned counters until the worker has actually joined.
+        self._proof = {
+            'schema': 'reactor-ci-sampled-uid-threads-v1',
+            'uid': UID,
+            'window': 'systemd_run_wait_client',
+            'sample_interval_seconds': self.INTERVAL_SECONDS,
+            'elapsed_seconds': round(time.monotonic() - self._started, 3),
+            'observer_joined': joined,
+            'successful_samples': self._samples if joined else None,
+            'read_errors': self._errors if joined else None,
+            'last_error_class': self._last_error if joined else None,
+            'sampled_peak_uid_threads': self._peak if joined else None,
+            'complete_sample_window': joined and self._samples > 0 and self._errors == 0,
+            'sampled_estimate_only': True, 'proc_scan_not_atomic': True,
+            'enforcement_or_admission_changed': False,
+            'native_unit_closure_still_required': True,
+        }
+        return dict(self._proof)
+
+
+def unavailable_observation(phase, error_class):
+    return {
+        'schema': 'reactor-ci-sampled-uid-threads-v1', 'uid': UID,
+        'window': 'systemd_run_wait_client', 'observer_joined': False,
+        'successful_samples': None, 'read_errors': None,
+        'sampled_peak_uid_threads': None, 'complete_sample_window': False,
+        'observation_error_phase': phase,
+        'observation_error_class': error_class,
+        'sampled_estimate_only': True, 'proc_scan_not_atomic': True,
+        'enforcement_or_admission_changed': False,
+        'native_unit_closure_still_required': True,
+    }
+
+
+def finish_uid_observation(observer, startup_error, control, mode):
+    if observer is None:
+        proof = unavailable_observation('start', startup_error)
+    else:
+        try:
+            proof = observer.stop()
+        except Exception as error:
+            proof = unavailable_observation('stop', type(error).__name__)
+        if startup_error:
+            proof = dict(proof, complete_sample_window=False, observer_start_error_class=startup_error)
+    try:
+        save(control / 'uid-thread-observation.json', proof)
+    except Exception as error:
+        proof = dict(proof, private_observation_saved=False, observation_write_error_class=type(error).__name__)
+    else:
+        proof = dict(proof, private_observation_saved=True)
+    print(json.dumps({'result': 'isolated_ci_uid_thread_observation', 'mode': mode, **proof}), flush=True)
+
+
+def observed_unit_wait(args, timeout, control, mode):
+    # Observation is best-effort around, never inside, the fixed command's
+    # result/exception contract. It cannot skip tests or suppress cancellation.
+    observer, startup_error = None, None
+    try:
+        observer = UIDThreadObservation()
+        observer.start()
+    except Exception as error:
+        startup_error = type(error).__name__
+    try:
+        return subprocess.run(args, stdin=subprocess.DEVNULL, timeout=timeout, env={'PATH': SYSTEM_PATH, 'LC_ALL': 'C'})
+    finally:
+        try:
+            finish_uid_observation(observer, startup_error, control, mode)
+        except Exception:
+            # In particular, serialization/output errors must not replace the
+            # original fixed command's result or TimeoutExpired. BaseException
+            # (human interrupt/process exit) is deliberately not swallowed.
+            pass
+
+
 def execute(prepared):
     cfg = prepared; marker = 'reactor-ci-' + cfg['mode'] + '-' + cfg['run_id'] + '-' + cfg['attempt']
     state = P('/var/tmp') / marker
@@ -352,7 +486,7 @@ def execute(prepared):
     if cfg['mode'] == 'postgres': env['REACTOR_TEST_POSTGRES_URL'] = FIXTURE
     args += ['/usr/bin/env', '-i'] + [k + '=' + v for k, v in env.items()] + ['/usr/bin/python3', aliases[0]['alias'] + '/scripts/ci-uid.py', '--inside', str(state / 'inside.json')]
     save(control / 'unit-launch-intent.json', {'unit': cfg['unit'], 'description': description, 'environment_names_only': sorted(env), 'same_existing_object_aliases': aliases})
-    result = subprocess.run(args, stdin=subprocess.DEVNULL, timeout=maximum + 60, env={'PATH': SYSTEM_PATH, 'LC_ALL': 'C'})
+    result = observed_unit_wait(args, maximum + 60, control, cfg['mode'])
     save(control / 'unit-client-result.json', {'exit_code': result.returncode})
     proof = unit_closed(cfg['unit'], description, result.returncode)
     save(control / 'unit-closed.json', proof)

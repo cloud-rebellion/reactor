@@ -168,7 +168,7 @@ step "gofmt"  gofmt_check
 # inherit the runner UID: unbounded package fan-out exhausted fork/thread headroom.
 # This retains every package/test and race instrumentation; individual lifecycle
 # deadlines and the workflow's own task/resource limits remain unchanged.
-step "test suite (compiled AND run, race detector on)" env GOMAXPROCS=2 GOFLAGS=-p=1 go test ./... -race -count=1 -timeout=15m -p=1 -parallel=1
+step "test suite (compiled AND run, race detector on)" env GOMAXPROCS=2 GOFLAGS=-p=1 go test ./... -race -count=1 -timeout=15m -p=1 -parallel=2
 step "cli smoke test (init, migrate, ps against a throwaway sqlite db)" cli_smoke
 step "no retired FF_/ARACHNE_ env reads" legacy_env_prefixes
 # In the mirror, every published commit is this project's, so scanning the full history
