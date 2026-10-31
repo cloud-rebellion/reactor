@@ -87,7 +87,11 @@ def command(argv, timeout=15, user=None, env=None, accepted=(0,)):
     if user:
         args = [ROOT_TOOLS['setpriv'], '--reuid=' + str(user[0]), '--regid=' + str(user[1]), '--clear-groups', '--no-new-privs', '--'] + args
     result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, env=env or {'PATH': SYSTEM_PATH, 'LC_ALL': 'C'})
-    need(len(result.stdout) <= 1048576 and len(result.stderr) <= 65536 and result.returncode in accepted, 'fixed_command_failed')
+    need(len(result.stdout) <= 1048576 and len(result.stderr) <= 65536, 'fixed_command_output_bound')
+    # Only fixed tool names and native integer status may cross this boundary;
+    # command arguments, output and inherited data never become diagnostics.
+    label = next((name for name, path in ROOT_TOOLS.items() if args[0] == path), 'fixed')
+    need(result.returncode in accepted, 'fixed_command_failed:' + label + ':exit=' + str(result.returncode))
     return result.stdout
 
 def tasks_for_uid(uid):
@@ -107,6 +111,34 @@ def account_absent():
         except KeyError: continue
         raise RuntimeError('fixed_ci_identity_already_exists')
     need(tasks_for_uid(UID) == 0, 'fresh_ci_uid_has_processes')
+
+def optional_identity(lookup, key):
+    try: return lookup(key)
+    except KeyError: return None
+
+def remove_owned_account(home):
+    # The caller has restored ownership and proved exact unit closure. Check
+    # both lookup directions so replacement names/numeric IDs are never removed.
+    user, by_uid = pwd.getpwnam(ACCOUNT), pwd.getpwuid(UID)
+    group, by_gid = grp.getgrnam(ACCOUNT), grp.getgrgid(GID)
+    need(user == by_uid and user.pw_name == ACCOUNT and user.pw_uid == UID and user.pw_gid == GID and user.pw_shell == '/usr/sbin/nologin' and user.pw_dir == str(home), 'account_changed_do_not_remove')
+    need(group == by_gid and group.gr_name == ACCOUNT and group.gr_gid == GID and not group.gr_mem, 'group_changed_do_not_remove')
+    need(not any(other.pw_gid == GID and other.pw_name != ACCOUNT for other in pwd.getpwall()), 'foreign_primary_group_user_do_not_remove')
+    need(tasks_for_uid(UID) == 0, 'ci_uid_still_has_tasks')
+    command([ROOT_TOOLS['userdel'], ACCOUNT])
+    need(optional_identity(pwd.getpwnam, ACCOUNT) is None and optional_identity(pwd.getpwuid, UID) is None, 'account_remains_after_owned_userdel')
+    need(tasks_for_uid(UID) == 0, 'ci_uid_still_has_tasks')
+    named = optional_identity(grp.getgrnam, ACCOUNT)
+    numbered = optional_identity(grp.getgrgid, GID)
+    need(not any(other.pw_gid == GID for other in pwd.getpwall()), 'foreign_primary_group_user_do_not_remove')
+    # shadow userdel may remove an empty same-name private group itself. This
+    # is accepted only after our successful deletion and exact two-key absence.
+    if named is None and numbered is None:
+        return 'removed_by_owned_userdel'
+    need(named == group and numbered == group, 'group_changed_after_owned_userdel_do_not_remove')
+    command([ROOT_TOOLS['groupdel'], ACCOUNT])
+    need(optional_identity(grp.getgrnam, ACCOUNT) is None and optional_identity(grp.getgrgid, GID) is None, 'group_remains_after_owned_groupdel')
+    return 'removed_by_owned_groupdel'
 
 def local_git_config(raw):
     for row in raw.split(b'\0'):
@@ -335,11 +367,9 @@ def execute(prepared):
     restored = [snapshot(v['root'], tuple(cfg['runner'])) for v in cfg['views']]
     save(control / 'restored.json', {'original_roots': len(restored), 'existing_and_new_entry_count': sum(len(v['entries']) for v in restored), 'source_or_cache_deleted_by_controller': False, 'modes_changed_by_controller': False})
     unit_closed(cfg['unit'], description, result.returncode)
-    user, group = pwd.getpwnam(ACCOUNT), grp.getgrnam(ACCOUNT)
-    need(user.pw_uid == UID and user.pw_gid == GID and user.pw_shell == '/usr/sbin/nologin' and user.pw_dir == str(state / 'home') and group.gr_gid == GID and not group.gr_mem, 'account_or_group_changed_do_not_remove')
-    command([ROOT_TOOLS['userdel'], ACCOUNT]); command([ROOT_TOOLS['groupdel'], ACCOUNT])
+    group_removal = remove_owned_account(state / 'home')
     account_absent()
-    save(control / 'finished.json', {'unit_exit_code': result.returncode, 'ownership_restored': True, 'fresh_account_removed': True})
+    save(control / 'finished.json', {'unit_exit_code': result.returncode, 'ownership_restored': True, 'fresh_account_removed': True, 'group_removal': group_removal})
     print(json.dumps({'result': 'isolated_ci_finished', 'mode': cfg['mode'], 'exit_code': result.returncode, 'ownership_restored': True, 'account_removed': True, 'private_receipt': str(control), 'runtime_nproc_policy_changed': False}), flush=True)
     return result.returncode
 
