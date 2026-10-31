@@ -17,7 +17,7 @@ build a Docker image or sign/attest release artifacts; verify the exact image
 and release provenance separately before promotion. The Homebrew wrapper pins
 `REACTOR_SDK_REPLACE` to its installed SDK module and adds its Go dependency to
 `PATH`, so MCP authoring can compile offline. Native Linux packages still
-require an operator-installed Go 1.26.5+ toolchain.
+require an operator-installed Go 1.26.10+ toolchain.
 The release attaches the rendered Homebrew formula, but tap publication and
 automatic formula upgrades are not configured yet.
 

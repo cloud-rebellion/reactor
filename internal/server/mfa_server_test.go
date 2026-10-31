@@ -19,7 +19,6 @@ import (
 
 	"github.com/bright-interaction/reactor/internal/auth"
 	"github.com/bright-interaction/reactor/internal/credentials"
-	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	_ "modernc.org/sqlite"
@@ -34,10 +33,9 @@ func newMFAServer(t *testing.T) (string, *auth.Store, string, string, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "s.db")
-	dbURL := "sqlite://" + dbPath
 	silent := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := migrate.Up(context.Background(), silent, dbURL); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := writePristineTestSQLite(dbPath); err != nil {
+		t.Fatalf("pristine SQLite fixture: %v", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {

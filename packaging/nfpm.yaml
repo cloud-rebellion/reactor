@@ -13,7 +13,7 @@
 # are required, everything else has a default below.
 
 name: reactor
-arch: ${REACTOR_ARCH:-amd64}
+arch: ${REACTOR_ARCH}
 platform: linux
 version: ${REACTOR_VERSION}
 section: utils
@@ -31,6 +31,7 @@ license: Reactor Sustainable Use License (fair-code)
 
 contents:
   - src: ${REACTOR_BINARY}
+    expand: true
     dst: /usr/bin/reactor
     file_info:
       mode: 0755

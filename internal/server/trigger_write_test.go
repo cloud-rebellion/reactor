@@ -17,7 +17,6 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/bright-interaction/reactor/internal/credentials"
-	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/registry"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/webhook"
@@ -178,10 +177,9 @@ type triggerTestEnv struct {
 func newTriggerTestEnv(t *testing.T) triggerTestEnv {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "trigger.db")
-	dbURL := "sqlite://" + dbPath
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := migrate.Up(context.Background(), log, dbURL); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := writePristineTestSQLite(dbPath); err != nil {
+		t.Fatalf("pristine SQLite fixture: %v", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {

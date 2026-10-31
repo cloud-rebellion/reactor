@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/wire"
 	"github.com/bright-interaction/reactor/internal/vault"
@@ -26,11 +25,9 @@ func newACLEnv(t *testing.T) (*journal.Journal, *vault.Store, *sql.DB) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "acl.db")
-	url := "sqlite://" + dbPath
 
-	silent := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := migrate.Up(context.Background(), silent, url); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := writePristineTestSQLite(dbPath); err != nil {
+		t.Fatalf("pristine SQLite fixture: %v", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {

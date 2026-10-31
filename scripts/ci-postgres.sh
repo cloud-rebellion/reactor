@@ -20,11 +20,11 @@ echo 'Applying every embedded PostgreSQL migration to the dedicated test databas
 go run ./cmd/reactor migrate --db "$REACTOR_TEST_POSTGRES_URL"
 
 echo 'Running PostgreSQL journal, queue, admission, and tenant-cap contracts'
-go test ./internal/runtime/journal -run Postgres -count=1 -timeout=5m -v
+env GOMAXPROCS=2 GOFLAGS=-p=1 go test -p=1 -parallel=2 ./internal/runtime/journal -run Postgres -count=1 -timeout=5m -v
 
 echo 'Running authenticated HTTP MCP to separate distributed worker acceptance'
-go test -p 2 ./cmd/reactor -run '^TestPostgresHTTPMCPDistributedWorkerLifecycle$' -count=1 -timeout=3m -v
+env GOMAXPROCS=2 GOFLAGS=-p=1 go test -p=1 -parallel=2 ./cmd/reactor -run '^TestPostgresHTTPMCPDistributedWorkerLifecycle$' -count=1 -timeout=3m -v
 
 echo 'Running the fixed-size PostgreSQL queue plan and lease probe on the idle test queue'
 REACTOR_TEST_POSTGRES_QUEUE_PROBE=1 \
-  go test ./internal/runtime/journal -run '^TestPostgresQueueClaimBoundedProbe$' -count=1 -timeout=3m -v
+  env GOMAXPROCS=2 GOFLAGS=-p=1 go test -p=1 -parallel=2 ./internal/runtime/journal -run '^TestPostgresQueueClaimBoundedProbe$' -count=1 -timeout=3m -v

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bright-interaction/reactor/internal/migrate"
 	"github.com/bright-interaction/reactor/internal/oauth"
 	"github.com/bright-interaction/reactor/internal/runtime/journal"
 	"github.com/bright-interaction/reactor/internal/runtime/wire"
@@ -119,8 +118,7 @@ func oauthACLFixture(t *testing.T, wfTenant, connTenant string) (*journal.Journa
 	t.Helper()
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "oauth.db")
-	silent := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := migrate.Up(ctx, silent, "sqlite://"+dbPath); err != nil {
+	if err := writePristineTestSQLite(dbPath); err != nil {
 		t.Fatal(err)
 	}
 	db, err := sql.Open("sqlite", dbPath)

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,17 +14,14 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
-
-	"github.com/bright-interaction/reactor/internal/migrate"
 )
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "o.db")
-	silent := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	if err := migrate.Up(context.Background(), silent, "sqlite://"+dbPath); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if err := writePristineTestSQLite(dbPath); err != nil {
+		t.Fatalf("pristine SQLite fixture: %v", err)
 	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {

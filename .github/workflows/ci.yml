@@ -18,6 +18,7 @@
 name: ci
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -28,25 +29,39 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0 # the secret scan reads full history, not just the tip
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           # Keep the CI stdlib aligned with the Docker and release pins.
           # go-version-file reads the `go` language directive and may select
           # the older 1.25.x minimum instead of the security-patched toolchain.
-          go-version: "1.26.6"
+          go-version: "1.26.10"
           cache: true
 
       - name: All checks (build, vet, test, gofmt, licenses, secrets, vulnerabilities)
-        run: bash scripts/ci.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test_ci_uid.py
+          mkdir -p "$(go env GOCACHE)" "$(go env GOPATH)"
+          bun_args=(--bun-absent)
+          if bun=$(command -v bun); then bun_args=(--bun "$bun"); fi
+          sudo -n /usr/bin/python3 scripts/ci-uid.py --execute --mode all-checks \
+            --workspace "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --runner-temp "$RUNNER_TEMP" --go-cache "$(go env GOCACHE)" \
+            --gopath "$(go env GOPATH)" --go "$(command -v go)" \
+            --tool-path "$PATH" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            "${bun_args[@]}"
 
   postgres-contract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -63,14 +78,28 @@ jobs:
           --health-timeout 2s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: "1.26.6"
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.10"
           cache: true
 
       - name: PostgreSQL migrations, journal contracts, HTTP MCP worker, and bounded queue probe
         env:
           REACTOR_TEST_POSTGRES_URL: postgres://reactor_test:reactor_test@127.0.0.1:5432/reactor_ci_test?sslmode=disable
-        run: bash scripts/ci-postgres.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/test_ci_uid.py
+          mkdir -p "$(go env GOCACHE)" "$(go env GOPATH)"
+          bun_args=(--bun-absent)
+          if bun=$(command -v bun); then bun_args=(--bun "$bun"); fi
+          sudo -n /usr/bin/python3 scripts/ci-uid.py --execute --mode postgres \
+            --workspace "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --runner-temp "$RUNNER_TEMP" --go-cache "$(go env GOCACHE)" \
+            --gopath "$(go env GOPATH)" --go "$(command -v go)" \
+            --tool-path "$PATH" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            "${bun_args[@]}"

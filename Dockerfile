@@ -45,7 +45,7 @@
 # The runtime stage below is also golang-alpine (the daemon compiles user
 # workflows at runtime); it does NOT build this binary, and mistaking it for the
 # builder is exactly how the drift stayed invisible.
-FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -76,7 +76,7 @@ RUN mkdir -p /wfcache /wfwarm \
 # Runtime: golang-alpine so the daemon has a Go toolchain to compile
 # workflows. Slightly larger than distroless, but the alternative is a
 # product whose core feature cannot run in production.
-FROM golang:1.26.6-alpine
+FROM golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca
 RUN apk add --no-cache ca-certificates git \
     && adduser -D -u 65532 reactor
 COPY --from=build /out/reactor /usr/local/bin/reactor
