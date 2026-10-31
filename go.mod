@@ -8,7 +8,7 @@ go 1.25.10
 // HTTP/2 check, encoding/xml and encoding/asn1 decode recursion, x/net/idna
 // Punycode label rejection) as reachable. The pin makes the
 // version that keeps this safe a guarantee rather than a property of the base image.
-toolchain go1.26.6
+toolchain go1.26.10
 
 require (
 	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc

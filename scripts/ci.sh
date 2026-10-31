@@ -163,10 +163,12 @@ step "gofmt"  gofmt_check
 # are concurrent; a data race there is a corrupted run journal, not a flake.
 #
 # -timeout=15m because the supervisor package really does compile a workflow binary and
-# spawn it as a child process per test. The Makefile's 120s and the retired test.yml's
-# 180s are both under its real runtime on a cold build cache, so they failed for reasons
-# that had nothing to do with the code.
-step "test suite (compiled AND run, race detector on)" go test ./... -race -count=1 -timeout=15m
+# spawn it as a child process per test. Keep the legacy test.yml wrapper on this
+# same package budget. Package and test concurrency are bounded because workflows
+# inherit the runner UID: unbounded package fan-out exhausted fork/thread headroom.
+# This retains every package/test and race instrumentation; individual lifecycle
+# deadlines and the workflow's own task/resource limits remain unchanged.
+step "test suite (compiled AND run, race detector on)" env GOMAXPROCS=2 GOFLAGS=-p=1 go test ./... -race -count=1 -timeout=15m -p=1 -parallel=1
 step "cli smoke test (init, migrate, ps against a throwaway sqlite db)" cli_smoke
 step "no retired FF_/ARACHNE_ env reads" legacy_env_prefixes
 # In the mirror, every published commit is this project's, so scanning the full history

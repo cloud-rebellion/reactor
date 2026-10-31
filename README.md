@@ -34,7 +34,7 @@ boundaries before using customer data.
 
 ## Prerequisites
 
-- Go 1.26.5+ on `PATH` for any path that builds workflows (the daemon and MCP authoring path spawn `go build`; the Homebrew formula and Docker image supply it, while native Linux packages require a host installation)
+- Go 1.26.10+ on `PATH` for any path that builds workflows (the daemon and MCP authoring path spawn `go build`; the Homebrew formula and Docker image supply it, while native Linux packages require a host installation)
 - SQLite (bundled) or PostgreSQL 14+
 
 ## Quickstart (one-command setup)
