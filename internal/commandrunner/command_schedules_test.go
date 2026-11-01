@@ -26,7 +26,7 @@ func TestCommandScheduleDriverRejectsInvalidTimezoneBeforeStart(t *testing.T) {
 	if err := migrate.Up(ctx, log, "sqlite://"+dbPath); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", dbPath)
+	db, _, err := migrate.Open("sqlite://" + dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,13 +222,19 @@ func TestCommandScheduleDriverCapturesSlotBeforeSlowAdmission(t *testing.T) {
 
 func newCommandScheduleDriverFixture(t *testing.T, timezone string) (*CommandScheduleDriver, journal.CommandAutomationSchedule) {
 	t.Helper()
+	driver, schedule, _ := newCommandScheduleDriverFixtureWithDB(t, timezone)
+	return driver, schedule
+}
+
+func newCommandScheduleDriverFixtureWithDB(t *testing.T, timezone string) (*CommandScheduleDriver, journal.CommandAutomationSchedule, *sql.DB) {
+	t.Helper()
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "command-schedule-driver-repeat.db")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if err := migrate.Up(ctx, log, "sqlite://"+dbPath); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", dbPath)
+	db, _, err := migrate.Open("sqlite://" + dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +295,7 @@ func newCommandScheduleDriverFixture(t *testing.T, timezone string) (*CommandSch
 		defer cancel()
 		_ = queue.Stop(stopCtx)
 	})
-	return &CommandScheduleDriver{Journal: j, Runner: runner, Queue: queue, TenantID: "acme"}, schedule
+	return &CommandScheduleDriver{Journal: j, Runner: runner, Queue: queue, TenantID: "acme"}, schedule, db
 }
 
 func findCommandScheduleRun(ctx context.Context, j *journal.Journal, tenantID, automationID string) (journal.CommandRun, error) {
@@ -301,4 +307,89 @@ func findCommandScheduleRun(ctx context.Context, j *journal.Journal, tenantID, a
 		return journal.CommandRun{}, journal.ErrNotFound
 	}
 	return runs[0], nil
+}
+
+// This fixture runs the real asynchronous command queue, so every pooled SQLite
+// connection must use the same writer-wait and durability policy as serve.
+// A bare sql.Open loses those connection-local settings after migrate.Up closes
+// its own handle, letting queue execution race the schedule acknowledgement.
+func TestCommandScheduleDriverFixtureWaitsForSQLiteWriter(t *testing.T) {
+	driver, schedule, db := newCommandScheduleDriverFixtureWithDB(t, "UTC")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if got := db.Stats().MaxOpenConnections; got != 4 {
+		t.Fatalf("fixture pool = %d, want production pool 4", got)
+	}
+	var connections []*sql.Conn
+	t.Cleanup(func() {
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	})
+	for i := 0; i < 4; i++ {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, conn)
+		for pragma, want := range map[string]int{"busy_timeout": 5000, "foreign_keys": 1, "synchronous": 1} {
+			var got int
+			if err := conn.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&got); err != nil || got != want {
+				t.Fatalf("pooled connection %d %s = %d, want %d: %v", i, pragma, got, want, err)
+			}
+		}
+		var mode string
+		if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
+			t.Fatalf("pooled connection %d journal_mode = %q, want wal: %v", i, mode, err)
+		}
+	}
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+	connections = nil
+
+	lock, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.ExecContext(ctx, "UPDATE command_automation_schedules SET revision=revision WHERE id=?", schedule.ID); err != nil {
+		_ = lock.Rollback()
+		t.Fatal(err)
+	}
+	result, started, joined := make(chan error, 1), make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		_ = lock.Rollback()
+		select {
+		case <-joined:
+		case <-time.After(3 * time.Second):
+			t.Error("owned schedule acknowledgement did not join")
+		}
+	})
+	go func() {
+		defer close(joined)
+		close(started)
+		result <- markScheduleFiredWithRetry(ctx, driver.Journal, schedule.TenantID, schedule.ID)
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("acknowledgement returned while the writer was held: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("acknowledgement did not resume after writer release")
+	}
+	marked, err := driver.Journal.GetCommandAutomationScheduleForTenant(ctx, schedule.TenantID, schedule.ID)
+	if err != nil || marked.Revision != schedule.Revision+1 || marked.LastFiredAt == nil || marked.LastError != "" {
+		t.Fatalf("acknowledgement = %+v err=%v, want exactly one fired revision", marked, err)
+	}
 }
