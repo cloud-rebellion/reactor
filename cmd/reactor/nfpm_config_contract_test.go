@@ -140,7 +140,7 @@ func TestNFPMPackageWorkflowConsumesItsUploadedTaggedBinaries(t *testing.T) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "/bin/bash", "-e", "-c", script)
+		cmd := exec.CommandContext(ctx, "/bin/sh", "-e", "-c", script)
 		cmd.Dir = dir
 		cmd.Env = append([]string{"PATH=/usr/bin:/bin", "GITHUB_REF_NAME=" + tag}, env...)
 		cmd.WaitDelay = time.Second
