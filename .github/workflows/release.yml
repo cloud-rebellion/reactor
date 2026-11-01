@@ -102,7 +102,7 @@ jobs:
             for fmt in deb rpm; do
               REACTOR_ARCH="$arch" \
               REACTOR_VERSION="$VER" \
-              REACTOR_BINARY="dist/reactor-${REACTOR_VERSION}-linux-${arch}" \
+              REACTOR_BINARY="dist/reactor-${GITHUB_REF_NAME}-linux-${arch}" \
                 nfpm pkg --packager "$fmt" --config packaging/nfpm.yaml --target dist/
             done
           done

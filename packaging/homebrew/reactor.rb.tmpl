@@ -10,7 +10,7 @@
 
 class Reactor < Formula
   desc "AI-built workflow automation. Self-hosted. Single Go binary."
-  homepage "https://github.com/bright-interaction/reactor"
+  homepage "https://github.com/cloud-rebellion/reactor"
   version "VERSION_PLACEHOLDER"
   # Fair-code (Reactor Sustainable Use License); not an SPDX/OSI license.
   license :cannot_represent
@@ -18,28 +18,28 @@ class Reactor < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-arm64.tar.gz"
+      url "https://github.com/cloud-rebellion/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-arm64.tar.gz"
       sha256 "DARWIN_ARM64_SHA256_PLACEHOLDER"
     end
     on_intel do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-amd64.tar.gz"
+      url "https://github.com/cloud-rebellion/reactor/releases/download/v#{version}/reactor-v#{version}-darwin-amd64.tar.gz"
       sha256 "DARWIN_AMD64_SHA256_PLACEHOLDER"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-linux-arm64.tar.gz"
+      url "https://github.com/cloud-rebellion/reactor/releases/download/v#{version}/reactor-v#{version}-linux-arm64.tar.gz"
       sha256 "LINUX_ARM64_SHA256_PLACEHOLDER"
     end
     on_intel do
-      url "https://github.com/bright-interaction/reactor/releases/download/v#{version}/reactor-v#{version}-linux-amd64.tar.gz"
+      url "https://github.com/cloud-rebellion/reactor/releases/download/v#{version}/reactor-v#{version}-linux-amd64.tar.gz"
       sha256 "LINUX_AMD64_SHA256_PLACEHOLDER"
     end
   end
 
   resource "sdk" do
-    url "https://github.com/bright-interaction/reactor/releases/download/vVERSION_PLACEHOLDER/reactor-sdk-vVERSION_PLACEHOLDER.tar.gz"
+    url "https://github.com/cloud-rebellion/reactor/releases/download/vVERSION_PLACEHOLDER/reactor-sdk-vVERSION_PLACEHOLDER.tar.gz"
     sha256 "SDK_SHA256_PLACEHOLDER"
   end
 

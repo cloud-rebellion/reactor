@@ -26,7 +26,7 @@ description: |
   with zero-downtime rotation, dashboard with codegen prompt bar,
   stdio + Streamable HTTP MCP transports.
 vendor: Bright Interaction
-homepage: https://github.com/bright-interaction/reactor
+homepage: https://github.com/cloud-rebellion/reactor
 license: Reactor Sustainable Use License (fair-code)
 
 contents:
