@@ -4,6 +4,7 @@ The actual Linux UID/systemd/cache loan remains the separate hosted-CI proof.
 Fixtures use their own bounded scratch. No production path is created or read.
 """
 import argparse
+import ast
 import copy
 import contextlib
 import errno
@@ -436,5 +437,46 @@ class UIDControllerTests(unittest.TestCase):
                         with self.assertRaises(s.subprocess.TimeoutExpired) as raised:s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy')
                         self.assertIs(raised.exception,failure)
                     else:self.assertIs(s.observed_unit_wait(['/fixed/systemd-run'],1,self.root,'legacy'),result)
+
+class HostedPathContractTests(unittest.TestCase):
+    def prefix(self, **changes):
+        class HostPath(pathlib.PurePosixPath):
+            def is_dir(path):
+                return str(path) in directories
+        home=HostPath('/home/runner')
+        directories={str(HostPath('/opt/hostedtoolcache')),str(home / 'work')}
+        directories.difference_update(changes.pop('missing_directories', ()))
+        values={'platform':'linux','euid':0,'uid':1001,'gid':1001,'home':home,
+                'workspace':home / 'work' / 'reactor' / 'reactor',
+                'runner_temp':home / 'work' / '_temp',
+                'go_cache':home / '.cache' / 'go-build','gopath':home / 'go'}
+        values.update(changes)
+        tree=ast.parse(SOURCE.read_bytes())
+        prepare=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prepare')
+        stop=next(i for i,node in enumerate(prepare.body) if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=='env' for target in node.targets))
+        prepare.body=prepare.body[:stop]+[ast.Return(value=ast.Tuple(elts=[ast.Name(id=name,ctx=ast.Load()) for name in ('home','workspace','temporary','cache','gopath')],ctx=ast.Load()))]
+        module=ast.fix_missing_locations(ast.Module(body=[prepare],type_ignores=[]))
+        namespace={'P':HostPath,'sys':types.SimpleNamespace(platform=values['platform']),
+                   'os':types.SimpleNamespace(geteuid=lambda:values['euid'],environ={'SUDO_UID':str(values['uid']),'SUDO_GID':str(values['gid'])}),
+                   'physical':lambda path:HostPath(path),
+                   'pwd':types.SimpleNamespace(getpwuid=lambda uid:types.SimpleNamespace(pw_dir=str(values['home']))),
+                   'UID':s.UID,'GID':s.GID,'need':s.need,'re':s.re}
+        exec(compile(module,'<owned-hosted-path-prefix>','exec'),namespace)
+        args=types.SimpleNamespace(**{name:values[name] for name in ('workspace','runner_temp','go_cache','gopath')},source_sha='a'*40,run_id='1',attempt='1',tool_path='/usr/bin:/bin')
+        return namespace['prepare'](args)
+
+    def test_passwd_home_derivation_preserves_closed_host_uid_and_path_refusals(self):
+        home=pathlib.PurePosixPath('/home/runner')
+        got=self.prefix()
+        self.assertEqual(tuple(map(str,got)),tuple(map(str,(home,home/'work'/'reactor'/'reactor',home/'work'/'_temp',home/'.cache'/'go-build',home/'go'))))
+        cases=[{'platform':'darwin'},{'euid':501},{'uid':0},{'uid':s.UID},{'gid':0},{'gid':s.GID},
+               {'home':pathlib.PurePosixPath('/home/foreign')},
+               {'missing_directories':[str(home/'work')]},
+               {'missing_directories':['/opt/hostedtoolcache']},
+               {'workspace':home/'work'/'foreign'/'reactor'},
+               {'runner_temp':home/'work'/'foreign-temp'},
+               {'go_cache':home/'foreign-cache'},{'gopath':home/'foreign-gopath'}]
+        for values in cases:
+            with self.subTest(values=values),self.assertRaises(RuntimeError):self.prefix(**values)
 
 if __name__ == '__main__':unittest.main(verbosity=2)
